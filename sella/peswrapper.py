@@ -400,7 +400,22 @@ class InternalPES(PES):
         self.bad_int = None
         self.iterative_stepper = iterative_stepper
 
+        # Cache for Jacobian pseudo-inverse
+        self._pinv_cache = dict(jac_id=None, pinv=None)
+
     dpos = property(lambda self: self.dummies.positions.copy())
+
+    def _get_Binv(self):
+        """Get cached pseudo-inverse of internal Jacobian."""
+        B = self.int.jacobian()
+        # Use id of the cached Jacobian array to detect changes
+        jac_id = id(self.int._cache.get('jacobian'))
+        if self._pinv_cache['jac_id'] == jac_id and self._pinv_cache['pinv'] is not None:
+            return self._pinv_cache['pinv']
+        Binv = np.linalg.pinv(B)
+        self._pinv_cache['jac_id'] = jac_id
+        self._pinv_cache['pinv'] = Binv
+        return Binv
 
     def _set_x_iterative(self, target, max_iter=20):
         """Fast iterative stepper for internal coordinate updates.
@@ -558,8 +573,7 @@ class InternalPES(PES):
     # Hessian of the constraints
     def get_Hc(self):
         D_cons = self.cons.hessian().ldot(self.curr['L'])
-        B_int = self.int.jacobian()
-        Binv_int = np.linalg.pinv(B_int)
+        Binv_int = self._get_Binv()
         B_cons = self.cons.jacobian()
         L_int = self.curr['L'] @ B_cons @ Binv_int
         D_int = self.int.hessian().ldot(L_int)
@@ -568,7 +582,7 @@ class InternalPES(PES):
 
     def get_drdx(self):
         # dr/dq = dr/dx dx/dq
-        return PES.get_drdx(self) @ np.linalg.pinv(self.int.jacobian())
+        return PES.get_drdx(self) @ self._get_Binv()
 
     def _calc_basis(self, internal=None, cons=None):
         # If custom internal/cons provided, bypass cache
@@ -620,7 +634,7 @@ class InternalPES(PES):
 
     def eval(self):
         f, g_cart = PES.eval(self)
-        Binv = np.linalg.pinv(self.int.jacobian())
+        Binv = self._get_Binv()
         return f, g_cart @ Binv[:len(g_cart)]
 
     def update_internals(self, dx):
