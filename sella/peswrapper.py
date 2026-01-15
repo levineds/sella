@@ -500,15 +500,14 @@ class InternalPES(PES):
                 self.bad_int = None
                 return None
 
-        else:
-            # Loop completed without convergence
-            # Check if we made reasonable progress
-            final_rms = np.linalg.norm(self.wrap_dx(target - self.get_x())) / np.sqrt(len(dx_initial))
-            if final_rms > initial_rms * 0.3:
-                # Didn't converge well enough, fall back to ODE
-                self.atoms.positions = pos0
-                self.dummies.positions = dpos0
-                return None
+        # After loop, verify we actually converged well enough
+        final_residual = self.wrap_dx(target - self.get_x())
+        final_rms = np.linalg.norm(final_residual) / np.sqrt(len(dx_initial))
+        if final_rms > 1e-6:
+            # Didn't converge well enough, fall back to ODE
+            self.atoms.positions = pos0
+            self.dummies.positions = dpos0
+            return None
 
         dx_final = self.get_x() - x0
         g_final = self.int.jacobian() @ g0
