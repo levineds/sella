@@ -605,6 +605,7 @@ class BaseInternals:
 
         self._lastpos = None
         self._cache = dict()
+        self._cache_version = 0
 
         if dummies is None:
             if dinds is not None:
@@ -699,6 +700,7 @@ class BaseInternals:
         ):
             self._cache = dict()
             self._lastpos = self.all_atoms.positions.copy()
+            self._cache_version += 1
 
     def _build_batched_arrays(self) -> None:
         """Build batched index arrays for vectorized computation."""

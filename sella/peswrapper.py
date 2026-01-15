@@ -359,7 +359,7 @@ class InternalPES(PES):
         internals: Internals,
         *args,
         H0: np.ndarray = None,
-        iterative_stepper: int = 1,  # Default to iterative with ODE fallback
+        iterative_stepper: int = 0,
         auto_find_internals: bool = True,
         **kwargs
     ):
@@ -401,20 +401,19 @@ class InternalPES(PES):
         self.iterative_stepper = iterative_stepper
 
         # Cache for Jacobian pseudo-inverse
-        self._pinv_cache = dict(jac_id=None, pinv=None)
+        self._pinv_cache = dict(version=None, pinv=None)
 
     dpos = property(lambda self: self.dummies.positions.copy())
 
     def _get_Binv(self):
         """Get cached pseudo-inverse of internal Jacobian."""
         B = self.int.jacobian()
-        # Use id of cached positions to detect changes (more robust than
-        # using id of jacobian cache entry, which could be a singleton)
-        pos_id = id(self.int._lastpos)
-        if self._pinv_cache['jac_id'] == pos_id and self._pinv_cache['pinv'] is not None:
+        # Use cache version counter to detect changes
+        version = self.int._cache_version
+        if self._pinv_cache['version'] == version and self._pinv_cache['pinv'] is not None:
             return self._pinv_cache['pinv']
         Binv = np.linalg.pinv(B)
-        self._pinv_cache['jac_id'] = pos_id
+        self._pinv_cache['version'] = version
         self._pinv_cache['pinv'] = Binv
         return Binv
 
