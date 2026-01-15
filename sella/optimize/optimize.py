@@ -21,7 +21,7 @@ _default_kwargs = dict(
         sigma_dec=0.90,
         rho_inc=1.035,
         rho_dec=100,
-        method='rfo',
+        method='qn',  # QuasiNewton is faster than RFO for minimization
         eig=False
     ),
     saddle=dict(

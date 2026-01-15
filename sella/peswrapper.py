@@ -92,6 +92,9 @@ class PES:
 
         self.hessian_function = hessian_function
 
+        # Cache for _calc_basis to avoid redundant SVD computations
+        self._basis_cache = dict(pos_hash=None, result=None)
+
     apos = property(lambda self: self.atoms.positions.copy())
     dpos = property(lambda self: None)
 
@@ -140,13 +143,23 @@ class PES:
         return self.cons.jacobian()
 
     def _calc_basis(self):
+        # Check if cached result is valid
+        pos_hash = self.atoms.positions.tobytes()
+        if self._basis_cache['pos_hash'] == pos_hash:
+            return self._basis_cache['result']
+
         drdx = self.get_drdx()
         U, S, VT = np.linalg.svd(drdx)
         ncons = np.sum(S > 1e-6)
         Ucons = VT[:ncons].T
         Ufree = VT[ncons:].T
         Unred = np.eye(self.dim)
-        return drdx, Ucons, Unred, Ufree
+        result = (drdx, Ucons, Unred, Ufree)
+
+        # Cache the result
+        self._basis_cache['pos_hash'] = pos_hash
+        self._basis_cache['result'] = result
+        return result
 
     def write_traj(self):
         if self.traj is not None:
@@ -346,7 +359,7 @@ class InternalPES(PES):
         internals: Internals,
         *args,
         H0: np.ndarray = None,
-        iterative_stepper: int = 0,
+        iterative_stepper: int = 1,  # Default to iterative with ODE fallback
         auto_find_internals: bool = True,
         **kwargs
     ):
@@ -389,51 +402,110 @@ class InternalPES(PES):
 
     dpos = property(lambda self: self.dummies.positions.copy())
 
-    def _set_x_iterative(self, target):
+    def _set_x_iterative(self, target, max_iter=20):
+        """Fast iterative stepper for internal coordinate updates.
+
+        Uses Newton-Raphson iteration to update Cartesian positions to match
+        target internal coordinates. Returns None if convergence fails.
+        """
         pos0 = self.atoms.positions.copy()
         dpos0 = self.dummies.positions.copy()
-        pos1 = None
-        dpos1 = None
         x0 = self.get_x()
         dx_initial = target - x0
+
+        # Get initial gradient in Cartesian space
         g0 = np.linalg.lstsq(
             self.int.jacobian(),
             self.curr.get('g', np.zeros_like(dx_initial)),
             rcond=None,
         )[0]
-        for _ in range(10):
-            dx = np.linalg.lstsq(
-                self.int.jacobian(),
-                self.wrap_dx(target - self.get_x()),
-                rcond=None,
-            )[0].reshape((-1, 3))
-            if np.sqrt((dx**2).sum() / len(dx)) < 1e-6:
+
+        rms_prev = np.inf
+        initial_rms = None
+        pos_first = None
+        dpos_first = None
+        stagnation_count = 0
+
+        for iteration in range(max_iter):
+            residual = self.wrap_dx(target - self.get_x())
+            rms = np.linalg.norm(residual) / np.sqrt(len(residual))
+
+            if initial_rms is None:
+                initial_rms = rms
+
+            # Converged
+            if rms < 1e-8:
                 break
-            self.atoms.positions += dx[:len(self.atoms)]
-            self.dummies.positions += dx[len(self.atoms):]
-            if pos1 is None:
-                pos1 = self.atoms.positions.copy()
-                dpos1 = self.dummies.positions.copy()
-        else:
-            print('Iterative stepper failed!')
-            if self.iterative_stepper == 2:
+
+            # Check for divergence (getting significantly worse)
+            if rms > initial_rms * 2.0:
+                # Diverging, restore and fall back
                 self.atoms.positions = pos0
                 self.dummies.positions = dpos0
-                return
-            self.atoms.positions = pos1
-            self.dummies.positions = dpos1
+                return None
+
+            # Check for stagnation (after first few iterations)
+            if iteration > 3:
+                if rms > rms_prev * 0.95:
+                    stagnation_count += 1
+                    if stagnation_count >= 3:
+                        # Stagnating, give up if we haven't made progress
+                        if rms > initial_rms * 0.5:
+                            self.atoms.positions = pos0
+                            self.dummies.positions = dpos0
+                            return None
+                        break  # Accept partial convergence
+                else:
+                    stagnation_count = 0
+
+            rms_prev = rms
+
+            # Newton step
+            dx = np.linalg.lstsq(
+                self.int.jacobian(),
+                residual,
+                rcond=None,
+            )[0].reshape((-1, 3))
+
+            # Update positions
+            self.atoms.positions += dx[:len(self.atoms)]
+            self.dummies.positions += dx[len(self.atoms):]
+
+            # Save first iteration result as fallback
+            if pos_first is None:
+                pos_first = self.atoms.positions.copy()
+                dpos_first = self.dummies.positions.copy()
+
+            # Check for bad internals during iteration
+            self.bad_int = self.int.check_for_bad_internals()
+            if self.bad_int is not None:
+                # Restore and return None to trigger ODE fallback
+                self.atoms.positions = pos0
+                self.dummies.positions = dpos0
+                self.bad_int = None
+                return None
+
+        else:
+            # Loop completed without convergence
+            # Check if we made reasonable progress
+            final_rms = np.linalg.norm(self.wrap_dx(target - self.get_x())) / np.sqrt(len(dx_initial))
+            if final_rms > initial_rms * 0.3:
+                # Didn't converge well enough, fall back to ODE
+                self.atoms.positions = pos0
+                self.dummies.positions = dpos0
+                return None
+
         dx_final = self.get_x() - x0
         g_final = self.int.jacobian() @ g0
         return dx_initial, dx_final, g_final
 
-    # Position getter/setter
-    def set_x(self, target):
-        if self.iterative_stepper:
-            res = self._set_x_iterative(target)
-            if res is not None:
-                return res
-        dx = target - self.get_x()
+    def _set_x_ode(self, target):
+        """ODE-based stepper for internal coordinate updates.
 
+        Uses LSODA to integrate the geodesic equation for reliable convergence
+        on large or ill-conditioned steps.
+        """
+        dx = target - self.get_x()
         t0 = 0.
         Binv = np.linalg.pinv(self.int.jacobian())
         y0 = np.hstack((self.apos.ravel(), self.dpos.ravel(),
@@ -447,7 +519,6 @@ class InternalPES(PES):
             t0 = ode.t
             self.bad_int = self.int.check_for_bad_internals()
             if self.bad_int is not None:
-                print('Bad internals found!')
                 break
             if ode.nfev > 1000:
                 view(self.atoms + self.dummies)
@@ -468,6 +539,19 @@ class InternalPES(PES):
         dx_initial = t0 * dx
         return dx_initial, dx_final, g_final
 
+    # Position getter/setter
+    def set_x(self, target):
+        """Update internal coordinates to target values.
+
+        Uses fast iterative stepper by default, with ODE fallback for robustness.
+        """
+        if self.iterative_stepper:
+            res = self._set_x_iterative(target)
+            if res is not None:
+                return res
+        # Fall back to ODE solver
+        return self._set_x_ode(target)
+
     def get_x(self):
         return self.int.calc()
 
@@ -487,10 +571,34 @@ class InternalPES(PES):
         return PES.get_drdx(self) @ np.linalg.pinv(self.int.jacobian())
 
     def _calc_basis(self, internal=None, cons=None):
-        if internal is None:
-            internal = self.int
-        if cons is None:
-            cons = self.cons
+        # If custom internal/cons provided, bypass cache
+        if internal is not None or cons is not None:
+            if internal is None:
+                internal = self.int
+            if cons is None:
+                cons = self.cons
+            B = internal.jacobian()
+            Ui, Si, VTi = np.linalg.svd(B)
+            nnred = np.sum(Si > 1e-6)
+            Unred = Ui[:, :nnred]
+            Vnred = VTi[:nnred].T
+            Siinv = np.diag(1 / Si[:nnred])
+            drdxnred = cons.jacobian() @ Vnred @ Siinv
+            drdx = drdxnred @ Unred.T
+            Uc, Sc, VTc = np.linalg.svd(drdxnred)
+            ncons = np.sum(Sc > 1e-6)
+            Ucons = Unred @ VTc[:ncons].T
+            Ufree = Unred @ VTc[ncons:].T
+            return drdx, Ucons, Unred, Ufree
+
+        # Check if cached result is valid
+        pos_hash = (self.atoms.positions.tobytes() +
+                    self.dummies.positions.tobytes())
+        if self._basis_cache['pos_hash'] == pos_hash:
+            return self._basis_cache['result']
+
+        internal = self.int
+        cons = self.cons
         B = internal.jacobian()
         Ui, Si, VTi = np.linalg.svd(B)
         nnred = np.sum(Si > 1e-6)
@@ -503,7 +611,12 @@ class InternalPES(PES):
         ncons = np.sum(Sc > 1e-6)
         Ucons = Unred @ VTc[:ncons].T
         Ufree = Unred @ VTc[ncons:].T
-        return drdx, Ucons, Unred, Ufree
+        result = (drdx, Ucons, Unred, Ufree)
+
+        # Cache the result
+        self._basis_cache['pos_hash'] = pos_hash
+        self._basis_cache['result'] = result
+        return result
 
     def eval(self):
         f, g_cart = PES.eval(self)
