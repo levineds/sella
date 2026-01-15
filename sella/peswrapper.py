@@ -408,12 +408,13 @@ class InternalPES(PES):
     def _get_Binv(self):
         """Get cached pseudo-inverse of internal Jacobian."""
         B = self.int.jacobian()
-        # Use id of the cached Jacobian array to detect changes
-        jac_id = id(self.int._cache.get('jacobian'))
-        if self._pinv_cache['jac_id'] == jac_id and self._pinv_cache['pinv'] is not None:
+        # Use id of cached positions to detect changes (more robust than
+        # using id of jacobian cache entry, which could be a singleton)
+        pos_id = id(self.int._lastpos)
+        if self._pinv_cache['jac_id'] == pos_id and self._pinv_cache['pinv'] is not None:
             return self._pinv_cache['pinv']
         Binv = np.linalg.pinv(B)
-        self._pinv_cache['jac_id'] = jac_id
+        self._pinv_cache['jac_id'] = pos_id
         self._pinv_cache['pinv'] = Binv
         return Binv
 

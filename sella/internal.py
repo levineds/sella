@@ -906,58 +906,103 @@ class BaseInternals:
             # Use vectorized computation for bonds, angles, dihedrals
             batched_grads = self._compute_batched_gradients(positions, cell)
 
-            # Build jacobian data in coordinate order
-            all_indices = []
-            all_jacs = []
+            # Cache batched data for direct assembly
+            trans_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
+                          for coord in self.internals['translations']]
+            other_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
+                          for coord in self.internals['other']]
+            rot_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
+                        for coord in self.internals['rotations']]
 
-            # Translations
-            for coord in self.internals['translations']:
-                all_indices.append(coord.indices)
-                all_jacs.append(np.array(coord.calc_gradient(atoms)))
+            self._cache['jacobian_batched'] = batched_grads
+            self._cache['jacobian_nonbatched'] = (trans_data, other_data, rot_data)
+            # Store a unique object (not a singleton) for cache identity
+            self._cache['jacobian'] = object()
 
-            # Bonds (batched)
-            bond_indices, bond_grads = batched_grads['bonds']
-            for i in range(len(bond_indices)):
-                all_indices.append(bond_indices[i])
-                all_jacs.append(bond_grads[i])
+        # Get cached data
+        batched = self._cache['jacobian_batched']
+        trans_data, other_data, rot_data = self._cache['jacobian_nonbatched']
 
-            # Angles (batched)
-            angle_indices, angle_grads = batched_grads['angles']
-            for i in range(len(angle_indices)):
-                all_indices.append(angle_indices[i])
-                all_jacs.append(angle_grads[i])
+        # Get counts for each type
+        n_trans = len(trans_data)
+        n_bonds = len(self.internals['bonds'])
+        n_angles = len(self.internals['angles'])
+        n_dihedrals = len(self.internals['dihedrals'])
+        n_other = len(other_data)
+        n_rot = len(rot_data)
 
-            # Dihedrals (batched)
-            dihedral_indices, dihedral_grads = batched_grads['dihedrals']
-            for i in range(len(dihedral_indices)):
-                all_indices.append(dihedral_indices[i])
-                all_jacs.append(dihedral_grads[i])
+        # Build active masks per type
+        active_mask = self._active_mask
+        start = 0
+        trans_active = active_mask[start:start+n_trans]
+        start += n_trans
+        bonds_active = active_mask[start:start+n_bonds]
+        start += n_bonds
+        angles_active = active_mask[start:start+n_angles]
+        start += n_angles
+        dihedrals_active = active_mask[start:start+n_dihedrals]
+        start += n_dihedrals
+        other_active = active_mask[start:start+n_other]
+        start += n_other
+        rot_active = active_mask[start:start+n_rot]
 
-            # Other
-            for coord in self.internals['other']:
-                all_indices.append(coord.indices)
-                all_jacs.append(np.array(coord.calc_gradient(atoms)))
+        n_active = sum(active_mask)
+        n_atoms = self.natoms + self.ndummies
+        B = np.zeros((n_active, n_atoms, 3))
+        row = 0
 
-            # Rotations
-            for coord in self.internals['rotations']:
-                all_indices.append(coord.indices)
-                all_jacs.append(np.array(coord.calc_gradient(atoms)))
+        # Translations (not batched)
+        for i, (idx, jac) in enumerate(trans_data):
+            if trans_active[i]:
+                np.add.at(B, (row, idx), jac)
+                row += 1
 
-            self._cache['jacobian'] = list(zip(all_indices, all_jacs))
+        # Bonds (batched) - vectorized assembly
+        bond_indices, bond_grads = batched['bonds']
+        bonds_active_arr = np.array(bonds_active, dtype=bool)
+        n_active_bonds = bonds_active_arr.sum()
+        if n_active_bonds > 0:
+            active_bond_idx = bond_indices[bonds_active_arr]
+            active_bond_grads = bond_grads[bonds_active_arr]
+            for i in range(n_active_bonds):
+                np.add.at(B, (row + i, active_bond_idx[i]), active_bond_grads[i])
+            row += n_active_bonds
 
-        # Filter by active mask and build sparse jacobian
-        indices = []
-        jacs = []
-        for (idx, jac), active in zip(self._cache['jacobian'], self._active_mask):
-            if active:
-                indices.append(np.array(idx))
-                jacs.append(jac)
+        # Angles (batched) - vectorized assembly
+        angle_indices, angle_grads = batched['angles']
+        angles_active_arr = np.array(angles_active, dtype=bool)
+        n_active_angles = angles_active_arr.sum()
+        if n_active_angles > 0:
+            active_angle_idx = angle_indices[angles_active_arr]
+            active_angle_grads = angle_grads[angles_active_arr]
+            for i in range(n_active_angles):
+                np.add.at(B, (row + i, active_angle_idx[i]), active_angle_grads[i])
+            row += n_active_angles
 
-        return SparseInternalJacobian(
-            self.natoms + self.ndummies,
-            indices,
-            jacs,
-        ).asarray()
+        # Dihedrals (batched) - vectorized assembly
+        dihedral_indices, dihedral_grads = batched['dihedrals']
+        dihedrals_active_arr = np.array(dihedrals_active, dtype=bool)
+        n_active_dihedrals = dihedrals_active_arr.sum()
+        if n_active_dihedrals > 0:
+            active_dih_idx = dihedral_indices[dihedrals_active_arr]
+            active_dih_grads = dihedral_grads[dihedrals_active_arr]
+            for i in range(n_active_dihedrals):
+                np.add.at(B, (row + i, active_dih_idx[i]), active_dih_grads[i])
+            row += n_active_dihedrals
+
+        # Other (not batched)
+        for i, (idx, jac) in enumerate(other_data):
+            if other_active[i]:
+                np.add.at(B, (row, idx), jac)
+                row += 1
+
+        # Rotations (not batched)
+        for i, (idx, jac) in enumerate(rot_data):
+            if rot_active[i]:
+                np.add.at(B, (row, idx), jac)
+                row += 1
+
+        return B.reshape((n_active, 3 * n_atoms))
 
     def hessian(self) -> np.ndarray:
         """Calculates the Hessian matrix for each internal coordinate using vectorized operations."""
@@ -970,53 +1015,91 @@ class BaseInternals:
             # Use vectorized computation for bonds, angles, dihedrals
             batched_hess = self._compute_batched_hessians(positions, cell)
 
-            # Build hessian data in coordinate order
-            all_indices = []
-            all_hess = []
+            # Cache batched data for direct assembly
+            trans_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
+                          for coord in self.internals['translations']]
+            other_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
+                          for coord in self.internals['other']]
+            rot_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
+                        for coord in self.internals['rotations']]
 
-            # Translations
-            for coord in self.internals['translations']:
-                all_indices.append(coord.indices)
-                all_hess.append(np.array(coord.calc_hessian(atoms)))
+            self._cache['hessian_batched'] = batched_hess
+            self._cache['hessian_nonbatched'] = (trans_data, other_data, rot_data)
+            # Store a unique object (not a singleton) for cache identity
+            self._cache['hessian'] = object()
 
-            # Bonds (batched)
-            bond_indices, bond_hess = batched_hess['bonds']
-            for i in range(len(bond_indices)):
-                all_indices.append(bond_indices[i])
-                all_hess.append(bond_hess[i])
+        # Get cached data
+        batched = self._cache['hessian_batched']
+        trans_data, other_data, rot_data = self._cache['hessian_nonbatched']
 
-            # Angles (batched)
-            angle_indices, angle_hess = batched_hess['angles']
-            for i in range(len(angle_indices)):
-                all_indices.append(angle_indices[i])
-                all_hess.append(angle_hess[i])
+        # Get counts for each type
+        n_trans = len(trans_data)
+        n_bonds = len(self.internals['bonds'])
+        n_angles = len(self.internals['angles'])
+        n_dihedrals = len(self.internals['dihedrals'])
+        n_other = len(other_data)
+        n_rot = len(rot_data)
 
-            # Dihedrals (batched)
-            dihedral_indices, dihedral_hess = batched_hess['dihedrals']
-            for i in range(len(dihedral_indices)):
-                all_indices.append(dihedral_indices[i])
-                all_hess.append(dihedral_hess[i])
+        # Build active masks per type
+        active_mask = self._active_mask
+        start = 0
+        trans_active = active_mask[start:start+n_trans]
+        start += n_trans
+        bonds_active = active_mask[start:start+n_bonds]
+        start += n_bonds
+        angles_active = active_mask[start:start+n_angles]
+        start += n_angles
+        dihedrals_active = active_mask[start:start+n_dihedrals]
+        start += n_dihedrals
+        other_active = active_mask[start:start+n_other]
+        start += n_other
+        rot_active = active_mask[start:start+n_rot]
 
-            # Other
-            for coord in self.internals['other']:
-                all_indices.append(coord.indices)
-                all_hess.append(np.array(coord.calc_hessian(atoms)))
-
-            # Rotations
-            for coord in self.internals['rotations']:
-                all_indices.append(coord.indices)
-                all_hess.append(np.array(coord.calc_hessian(atoms)))
-
-            self._cache['hessian'] = list(zip(all_indices, all_hess))
-
-        # Filter by active mask and build sparse hessians
+        n_atoms = self.natoms + self.ndummies
         hessians = []
-        for (idx, vals), active in zip(self._cache['hessian'], self._active_mask):
-            if not active:
-                continue
-            hessians.append(SparseInternalHessian(
-                self.natoms + self.ndummies, np.array(idx), vals.copy()
-            ))
+
+        # Translations (not batched)
+        for i, (idx, hess) in enumerate(trans_data):
+            if trans_active[i]:
+                hessians.append(SparseInternalHessian(n_atoms, np.array(idx), hess.copy()))
+
+        # Bonds (batched)
+        bond_indices, bond_hess = batched['bonds']
+        bonds_active_arr = np.array(bonds_active, dtype=bool)
+        if bonds_active_arr.any():
+            active_bond_idx = bond_indices[bonds_active_arr]
+            active_bond_hess = bond_hess[bonds_active_arr]
+            for i in range(len(active_bond_idx)):
+                hessians.append(SparseInternalHessian(n_atoms, active_bond_idx[i], active_bond_hess[i].copy()))
+
+        # Angles (batched)
+        angle_indices, angle_hess = batched['angles']
+        angles_active_arr = np.array(angles_active, dtype=bool)
+        if angles_active_arr.any():
+            active_angle_idx = angle_indices[angles_active_arr]
+            active_angle_hess = angle_hess[angles_active_arr]
+            for i in range(len(active_angle_idx)):
+                hessians.append(SparseInternalHessian(n_atoms, active_angle_idx[i], active_angle_hess[i].copy()))
+
+        # Dihedrals (batched)
+        dihedral_indices, dihedral_hess = batched['dihedrals']
+        dihedrals_active_arr = np.array(dihedrals_active, dtype=bool)
+        if dihedrals_active_arr.any():
+            active_dih_idx = dihedral_indices[dihedrals_active_arr]
+            active_dih_hess = dihedral_hess[dihedrals_active_arr]
+            for i in range(len(active_dih_idx)):
+                hessians.append(SparseInternalHessian(n_atoms, active_dih_idx[i], active_dih_hess[i].copy()))
+
+        # Other (not batched)
+        for i, (idx, hess) in enumerate(other_data):
+            if other_active[i]:
+                hessians.append(SparseInternalHessian(n_atoms, np.array(idx), hess.copy()))
+
+        # Rotations (not batched)
+        for i, (idx, hess) in enumerate(rot_data):
+            if rot_active[i]:
+                hessians.append(SparseInternalHessian(n_atoms, np.array(idx), hess.copy()))
+
         return SparseInternalHessians(hessians, self.ndof)
 
     def wrap(self, vec: np.ndarray) -> np.ndarray:
