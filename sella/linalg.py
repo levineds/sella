@@ -151,14 +151,47 @@ class ApproximateHessian(LinearOperator):
         self.update_method = update_method
         self.symm = symm
         self.initialized = initialized
+        # Lazy eigendecomposition: only compute when needed
+        self._evals = None
+        self._evecs = None
+        self._eigen_computed = False
 
         self.set_B(B0)
+
+    @property
+    def evals(self):
+        """Lazily compute eigenvalues on first access."""
+        if not self._eigen_computed and self.B is not None:
+            self._evals, self._evecs = eigh(self.B)
+            self._eigen_computed = True
+        return self._evals
+
+    @evals.setter
+    def evals(self, value):
+        self._evals = value
+        if value is None:
+            self._eigen_computed = False
+
+    @property
+    def evecs(self):
+        """Lazily compute eigenvectors on first access."""
+        if not self._eigen_computed and self.B is not None:
+            self._evals, self._evecs = eigh(self.B)
+            self._eigen_computed = True
+        return self._evecs
+
+    @evecs.setter
+    def evecs(self, value):
+        self._evecs = value
+        if value is None:
+            self._eigen_computed = False
 
     def set_B(self, target):
         if target is None:
             self.B = None
-            self.evals = None
-            self.evecs = None
+            self._evals = None
+            self._evecs = None
+            self._eigen_computed = False
             self.initialized = False
             return
         elif np.isscalar(target):
@@ -167,7 +200,8 @@ class ApproximateHessian(LinearOperator):
             self.initialized = True
         assert target.shape == self.shape
         self.B = target
-        self.evals, self.evecs = eigh(self.B)
+        # Mark eigendecomposition as stale - will recompute on next access
+        self._eigen_computed = False
 
     def update(self, dx, dg):
         """Perform a quasi-Newton update on B"""
