@@ -2044,9 +2044,9 @@ class Internals(BaseInternals):
         if len(self._angle_indices) > 0:
             positions = self.all_positions
             cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+            tvecs = self._get_cached_tvecs(cell)
             angle_pos = positions[self._angle_indices]
-            angle_tvecs = self._angle_ncvecs @ cell
-            angle_vals = np.asarray(_angle_value_batched(angle_pos, angle_tvecs))
+            angle_vals = np.asarray(_angle_value_batched(angle_pos, tvecs['angles']))
 
             # Find bad angles
             bad_mask = ~((self.atol < angle_vals) & (angle_vals < np.pi - self.atol))

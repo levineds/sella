@@ -746,7 +746,7 @@ class InternalPES(PES):
         self.dummies.positions = x[nxa:].reshape((-1, 3)).copy()
 
         D = self.int.hessian()
-        Binv = np.linalg.pinv(self.int.jacobian())
+        Binv = self._get_Binv()  # Use cached pinv instead of recomputing
         D_tmp = -Binv @ D.rdot(dxdt)
         dydt[1] = D_tmp @ dxdt
         dydt[2] = D_tmp @ g
