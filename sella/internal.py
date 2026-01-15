@@ -1044,6 +1044,11 @@ class BaseInternals:
     def hessian(self) -> np.ndarray:
         """Calculates the Hessian matrix for each internal coordinate using vectorized operations."""
         self._cache_check()
+
+        # Return cached SparseInternalHessians object if available
+        if 'hessian_result' in self._cache:
+            return self._cache['hessian_result']
+
         if 'hessian' not in self._cache:
             positions = self.all_positions
             cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
@@ -1137,7 +1142,9 @@ class BaseInternals:
             if rot_active[i]:
                 hessians.append(SparseInternalHessian(n_atoms, np.array(idx), hess.copy()))
 
-        return SparseInternalHessians(hessians, self.ndof)
+        result = SparseInternalHessians(hessians, self.ndof)
+        self._cache['hessian_result'] = result
+        return result
 
     def wrap(self, vec: np.ndarray) -> np.ndarray:
         """Wraps an internal coord. displacement vector into a valid domain."""

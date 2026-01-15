@@ -723,7 +723,11 @@ class InternalPES(PES):
         """Returns Nx3 array of atomic forces orthogonal to constraints."""
         g = self.get_g()
         Ufree = self.get_Ufree()
-        B = self.int.jacobian()
+        # Use cached jacobian from curr if available
+        if 'B' in self.curr and self.curr['B'] is not None:
+            B = self.curr['B']
+        else:
+            B = self.int.jacobian()
         return -((Ufree @ Ufree.T) @ g @ B).reshape((-1, 3))
 
     def wrap_dx(self, dx):
@@ -774,7 +778,7 @@ class InternalPES(PES):
             return
 
         B = self.int.jacobian()
-        Binv = np.linalg.pinv(B)
+        Binv = self._get_Binv()  # Use cached version instead of recomputing
         self.curr.update(B=B, Binv=Binv)
         return True
 
