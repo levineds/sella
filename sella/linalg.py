@@ -256,24 +256,28 @@ class SparseInternalJacobian(LinearOperator):
 
     def asarray(self) -> np.ndarray:
         B = np.zeros((self.nints, self.natoms, 3))
-        for Bi, idx, vals in zip(B, self.indices, self.vals):
-            for j, v in zip(idx, vals):
-                Bi[j] += v
+        # Vectorized scatter using np.add.at
+        for i, (idx, vals) in enumerate(zip(self.indices, self.vals)):
+            idx_arr = np.asarray(idx)
+            vals_arr = np.asarray(vals)
+            np.add.at(B[i], idx_arr, vals_arr)
         return B.reshape(self.shape)
 
     def _matvec(self, v: np.ndarray) -> np.ndarray:
         vi = v.reshape((self.natoms, 3))
         w = np.zeros(self.nints)
-        for i in range(self.nints):
-            for j, val in zip(self.indices[i], self.vals[i]):
-                w[i] += vi[j] @ val
+        for i, (idx, vals) in enumerate(zip(self.indices, self.vals)):
+            idx_arr = np.asarray(idx)
+            vals_arr = np.asarray(vals)
+            w[i] = np.sum(vi[idx_arr] * vals_arr)
         return w
 
     def _rmatvec(self, v: np.ndarray) -> np.ndarray:
         w = np.zeros((self.natoms, 3))
         for vi, indices, vals in zip(v, self.indices, self.vals):
-            for j, val in zip(indices, vals):
-                w[j] += vi * val
+            idx_arr = np.asarray(indices)
+            vals_arr = np.asarray(vals)
+            np.add.at(w, idx_arr, vi * vals_arr)
         return w.ravel()
 
 
@@ -288,20 +292,30 @@ class SparseInternalHessian(LinearOperator):
     ) -> None:
         self.natoms = natoms
         self.shape = (3 * self.natoms, 3 * self.natoms)
-        self.indices = indices
-        self.vals = vals
+        self.indices = np.asarray(indices)
+        self.vals = np.asarray(vals)
 
     def asarray(self) -> np.ndarray:
         H = np.zeros((self.natoms, 3, self.natoms, 3))
-        for (a, i), (b, j) in product(enumerate(self.indices), repeat=2):
-            H[i, :, j, :] += self.vals[a, :, b, :]
+        # Vectorized: iterate over pairs but use vectorized assignment
+        idx = self.indices
+        n = len(idx)
+        for a in range(n):
+            for b in range(n):
+                H[idx[a], :, idx[b], :] += self.vals[a, :, b, :]
         return H.reshape(self.shape)
 
     def _matvec(self, v: np.ndarray) -> np.ndarray:
         vi = v.reshape((self.natoms, 3))
         w = np.zeros_like(vi)
-        for (a, i), (b, j) in product(enumerate(self.indices), repeat=2):
-            w[i] += self.vals[a, :, b, :] @ vi[j, :]
+        # Vectorized: vi[indices] has shape (n, 3), vals has shape (n, 3, n, 3)
+        idx = self.indices
+        # vals @ vi[idx] for each pair
+        vi_sub = vi[idx]  # (n, 3)
+        # Contract: sum over b,j of vals[a,:,b,:] @ vi[idx[b],:]
+        # result[a,:] = sum_b vals[a,:,b,:] @ vi_sub[b,:]
+        result = np.einsum('aibj,bj->ai', self.vals, vi_sub)
+        np.add.at(w, idx, result)
         return w.ravel()
 
     def _rmatvec(self, v: np.ndarray) -> np.ndarray:
@@ -324,8 +338,15 @@ class SparseInternalHessians:
     def ldot(self, v: np.ndarray) -> np.ndarray:
         M = np.zeros((self.natoms, 3, self.natoms, 3))
         for vi, hess in zip(v, self.hessians):
-            for (a, i), (b, j) in product(enumerate(hess.indices), repeat=2):
-                M[i, :, j, :] += vi * hess.vals[a, :, b, :]
+            if vi == 0:
+                continue
+            idx = hess.indices
+            n = len(idx)
+            # Add vi * hess.vals to M at the appropriate indices
+            # hess.vals has shape (n, 3, n, 3)
+            for a in range(n):
+                for b in range(n):
+                    M[idx[a], :, idx[b], :] += vi * hess.vals[a, :, b, :]
         return M.reshape(self.shape[1:])
 
     def rdot(self, v: np.ndarray) -> np.ndarray:
