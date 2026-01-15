@@ -27,6 +27,19 @@ from sella.linalg import (
 
 
 # =============================================================================
+# Lightweight atoms-like wrapper for efficient coordinate calculations
+# =============================================================================
+
+class LightAtoms:
+    """Lightweight wrapper providing positions and cell without Atoms overhead."""
+    __slots__ = ('positions', 'cell')
+
+    def __init__(self, positions: np.ndarray, cell: np.ndarray) -> None:
+        self.positions = positions
+        self.cell = cell
+
+
+# =============================================================================
 # Vectorized (batched) internal coordinate functions using jax.vmap
 # These compute gradients/hessians for ALL coordinates of a given type at once
 # =============================================================================
@@ -151,17 +164,17 @@ class Coordinate:
 
     def calc(self, atoms: Atoms) -> float:
         return float(self._eval0(
-            atoms[self.indices].positions, **self.kwargs
+            atoms.positions[self.indices], **self.kwargs
         ))
 
     def calc_gradient(self, atoms: Atoms) -> np.ndarray:
         return np.array(self._eval1(
-            atoms[self.indices].positions, **self.kwargs
+            atoms.positions[self.indices], **self.kwargs
         ))
 
     def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
         return np.array(self._eval2(
-            atoms[self.indices].positions, **self.kwargs
+            atoms.positions[self.indices], **self.kwargs
         ))
 
     def _check_derivative(
@@ -301,19 +314,19 @@ class Internal(Coordinate):
         tvecs = jnp.asarray(
             self.kwargs['ncvecs'] @ atoms.cell, dtype=np.float64
         )
-        return float(self._eval0(atoms[self.indices].positions, tvecs))
+        return float(self._eval0(atoms.positions[self.indices], tvecs))
 
     def calc_gradient(self, atoms: Atoms) -> np.ndarray:
         tvecs = jnp.asarray(
             self.kwargs['ncvecs'] @ atoms.cell, dtype=np.float64
         )
-        return np.array(self._eval1(atoms[self.indices].positions, tvecs))
+        return np.array(self._eval1(atoms.positions[self.indices], tvecs))
 
     def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
         tvecs = jnp.asarray(
             self.kwargs['ncvecs'] @ atoms.cell, dtype=np.float64
         )
-        return np.array(self._eval2(atoms[self.indices].positions, tvecs))
+        return np.array(self._eval2(atoms.positions[self.indices], tvecs))
 
 
 def _translation(
@@ -696,6 +709,12 @@ class BaseInternals:
     def all_atoms(self) -> Atoms:
         return self.atoms + self.dummies
 
+    @property
+    def light_atoms(self) -> LightAtoms:
+        """Get lightweight atoms-like object for coordinate calculations."""
+        cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+        return LightAtoms(self.all_positions, cell)
+
     def _cache_check(self) -> None:
         # we are comparing the current atomic positions to what they were
         # the last time a property was calculated. These positions are floats,
@@ -877,8 +896,8 @@ class BaseInternals:
             # Build full coords list in order
             all_coords = []
 
-            # Translations (not batched - usually few) - need atoms object
-            atoms = self.all_atoms
+            # Translations (not batched - usually few) - use lightweight atoms
+            atoms = self.light_atoms
             for coord in self.internals['translations']:
                 all_coords.append(coord.calc(atoms))
 
@@ -915,8 +934,8 @@ class BaseInternals:
             # Use vectorized computation for bonds, angles, dihedrals
             batched_grads = self._compute_batched_gradients(positions, cell)
 
-            # Non-batched coords need atoms object
-            atoms = self.all_atoms
+            # Non-batched coords use lightweight atoms
+            atoms = self.light_atoms
             trans_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
                           for coord in self.internals['translations']]
             other_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
@@ -1024,8 +1043,8 @@ class BaseInternals:
             # Use vectorized computation for bonds, angles, dihedrals
             batched_hess = self._compute_batched_hessians(positions, cell)
 
-            # Non-batched coords need atoms object
-            atoms = self.all_atoms
+            # Non-batched coords use lightweight atoms
+            atoms = self.light_atoms
             trans_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
                           for coord in self.internals['translations']]
             other_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
@@ -1220,7 +1239,7 @@ class BaseInternals:
                 new_indices = (*rot.indices[:-1], didx)
                 new_rot = Rotation(
                     new_indices, rot.axis,
-                    self.all_atoms[new_indices].positions
+                    self.all_positions[new_indices]
                 )
                 self.internals['rotations'][i] = new_rot
 
@@ -1332,7 +1351,7 @@ class Constraints(BaseInternals):
             new = Rotation(
                 indices,
                 axis,
-                self.all_atoms[indices].positions
+                self.all_positions[indices]
             )
         try:
             _ = self.internals['rotations'].index(new)
@@ -1590,7 +1609,7 @@ class Internals(BaseInternals):
             new = Rotation(
                 indices,
                 axis,
-                self.all_atoms[indices].positions
+                self.all_positions[indices]
             )
         if (
             new in self.internals['rotations']
