@@ -779,6 +779,36 @@ class BaseInternals:
 
         self._batched_arrays_valid = True
 
+    def _get_cached_tvecs(self, cell: np.ndarray) -> Dict[str, np.ndarray]:
+        """Get cached translation vectors for cell, computing if necessary.
+
+        The tvecs (ncvecs @ cell) are constant for a given cell, so we cache
+        them to avoid redundant matrix multiplications during ODE integration.
+        """
+        cell_hash = cell.tobytes()
+        if hasattr(self, '_tvecs_cache') and self._tvecs_cache.get('cell_hash') == cell_hash:
+            return self._tvecs_cache['tvecs']
+
+        self._build_batched_arrays()
+        tvecs = {}
+        if len(self._bond_indices) > 0:
+            tvecs['bonds'] = self._bond_ncvecs @ cell
+        else:
+            tvecs['bonds'] = np.empty((0, 1, 3), dtype=np.float64)
+
+        if len(self._angle_indices) > 0:
+            tvecs['angles'] = self._angle_ncvecs @ cell
+        else:
+            tvecs['angles'] = np.empty((0, 2, 3), dtype=np.float64)
+
+        if len(self._dihedral_indices) > 0:
+            tvecs['dihedrals'] = self._dihedral_ncvecs @ cell
+        else:
+            tvecs['dihedrals'] = np.empty((0, 3, 3), dtype=np.float64)
+
+        self._tvecs_cache = {'cell_hash': cell_hash, 'tvecs': tvecs}
+        return tvecs
+
     def _invalidate_batched_arrays(self) -> None:
         """Invalidate batched arrays (call when internals change)."""
         self._batched_arrays_valid = False
@@ -786,29 +816,27 @@ class BaseInternals:
     def _compute_batched_values(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
         """Compute all internal coordinate values using vectorized operations."""
         self._build_batched_arrays()
+        tvecs = self._get_cached_tvecs(cell)
         result = {}
 
         # Bonds
         if len(self._bond_indices) > 0:
             bond_pos = positions[self._bond_indices]  # (n_bonds, 2, 3)
-            bond_tvecs = self._bond_ncvecs @ cell     # (n_bonds, 1, 3)
-            result['bonds'] = np.asarray(_bond_value_batched(bond_pos, bond_tvecs))
+            result['bonds'] = np.asarray(_bond_value_batched(bond_pos, tvecs['bonds']))
         else:
             result['bonds'] = np.empty(0)
 
         # Angles
         if len(self._angle_indices) > 0:
             angle_pos = positions[self._angle_indices]  # (n_angles, 3, 3)
-            angle_tvecs = self._angle_ncvecs @ cell     # (n_angles, 2, 3)
-            result['angles'] = np.asarray(_angle_value_batched(angle_pos, angle_tvecs))
+            result['angles'] = np.asarray(_angle_value_batched(angle_pos, tvecs['angles']))
         else:
             result['angles'] = np.empty(0)
 
         # Dihedrals
         if len(self._dihedral_indices) > 0:
             dihedral_pos = positions[self._dihedral_indices]  # (n_dihedrals, 4, 3)
-            dihedral_tvecs = self._dihedral_ncvecs @ cell     # (n_dihedrals, 3, 3)
-            result['dihedrals'] = np.asarray(_dihedral_value_batched(dihedral_pos, dihedral_tvecs))
+            result['dihedrals'] = np.asarray(_dihedral_value_batched(dihedral_pos, tvecs['dihedrals']))
         else:
             result['dihedrals'] = np.empty(0)
 
@@ -820,13 +848,13 @@ class BaseInternals:
         Returns dict mapping coord type to (indices, gradients) tuples.
         """
         self._build_batched_arrays()
+        tvecs = self._get_cached_tvecs(cell)
         result = {}
 
         # Bonds
         if len(self._bond_indices) > 0:
             bond_pos = positions[self._bond_indices]  # (n_bonds, 2, 3)
-            bond_tvecs = self._bond_ncvecs @ cell     # (n_bonds, 1, 3)
-            bond_grads = np.asarray(_bond_grad_batched(bond_pos, bond_tvecs))
+            bond_grads = np.asarray(_bond_grad_batched(bond_pos, tvecs['bonds']))
             result['bonds'] = (self._bond_indices, bond_grads)
         else:
             result['bonds'] = (np.empty((0, 2), dtype=np.int32), np.empty((0, 2, 3)))
@@ -834,8 +862,7 @@ class BaseInternals:
         # Angles
         if len(self._angle_indices) > 0:
             angle_pos = positions[self._angle_indices]
-            angle_tvecs = self._angle_ncvecs @ cell
-            angle_grads = np.asarray(_angle_grad_batched(angle_pos, angle_tvecs))
+            angle_grads = np.asarray(_angle_grad_batched(angle_pos, tvecs['angles']))
             result['angles'] = (self._angle_indices, angle_grads)
         else:
             result['angles'] = (np.empty((0, 3), dtype=np.int32), np.empty((0, 3, 3)))
@@ -843,8 +870,7 @@ class BaseInternals:
         # Dihedrals
         if len(self._dihedral_indices) > 0:
             dihedral_pos = positions[self._dihedral_indices]
-            dihedral_tvecs = self._dihedral_ncvecs @ cell
-            dihedral_grads = np.asarray(_dihedral_grad_batched(dihedral_pos, dihedral_tvecs))
+            dihedral_grads = np.asarray(_dihedral_grad_batched(dihedral_pos, tvecs['dihedrals']))
             result['dihedrals'] = (self._dihedral_indices, dihedral_grads)
         else:
             result['dihedrals'] = (np.empty((0, 4), dtype=np.int32), np.empty((0, 4, 3)))
@@ -857,13 +883,13 @@ class BaseInternals:
         Returns dict mapping coord type to (indices, hessians) tuples.
         """
         self._build_batched_arrays()
+        tvecs = self._get_cached_tvecs(cell)
         result = {}
 
         # Bonds
         if len(self._bond_indices) > 0:
             bond_pos = positions[self._bond_indices]
-            bond_tvecs = self._bond_ncvecs @ cell
-            bond_hess = np.asarray(_bond_hess_batched(bond_pos, bond_tvecs))
+            bond_hess = np.asarray(_bond_hess_batched(bond_pos, tvecs['bonds']))
             result['bonds'] = (self._bond_indices, bond_hess)
         else:
             result['bonds'] = (np.empty((0, 2), dtype=np.int32), np.empty((0, 2, 3, 2, 3)))
@@ -871,8 +897,7 @@ class BaseInternals:
         # Angles
         if len(self._angle_indices) > 0:
             angle_pos = positions[self._angle_indices]
-            angle_tvecs = self._angle_ncvecs @ cell
-            angle_hess = np.asarray(_angle_hess_batched(angle_pos, angle_tvecs))
+            angle_hess = np.asarray(_angle_hess_batched(angle_pos, tvecs['angles']))
             result['angles'] = (self._angle_indices, angle_hess)
         else:
             result['angles'] = (np.empty((0, 3), dtype=np.int32), np.empty((0, 3, 3, 3, 3)))
@@ -880,8 +905,7 @@ class BaseInternals:
         # Dihedrals
         if len(self._dihedral_indices) > 0:
             dihedral_pos = positions[self._dihedral_indices]
-            dihedral_tvecs = self._dihedral_ncvecs @ cell
-            dihedral_hess = np.asarray(_dihedral_hess_batched(dihedral_pos, dihedral_tvecs))
+            dihedral_hess = np.asarray(_dihedral_hess_batched(dihedral_pos, tvecs['dihedrals']))
             result['dihedrals'] = (self._dihedral_indices, dihedral_hess)
         else:
             result['dihedrals'] = (np.empty((0, 4), dtype=np.int32), np.empty((0, 4, 3, 4, 3)))
