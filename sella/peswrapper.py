@@ -539,7 +539,7 @@ class InternalPES(PES):
         """
         dx = target - self.get_x()
         t0 = 0.
-        Binv = np.linalg.pinv(self.int.jacobian())
+        Binv = self._get_Binv()  # Use cached pinv instead of recomputing
         # Store Binv for reuse in _q_ode to avoid repeated SVD computations
         self._ode_Binv = Binv
         y0 = np.hstack((self.apos.ravel(), self.dpos.ravel(),
@@ -638,6 +638,13 @@ class InternalPES(PES):
         Unred = Ui[:, :nnred]
         Vnred = VTi[:nnred].T
         Siinv = np.diag(1 / Si[:nnred])
+
+        # Compute pinv from SVD components and cache it for _get_Binv
+        # pinv(B) = V @ diag(1/S) @ U.T
+        Binv = Vnred @ Siinv @ Unred.T
+        self._pinv_cache['version'] = internal._cache_version
+        self._pinv_cache['pinv'] = Binv
+
         drdxnred = cons.jacobian() @ Vnred @ Siinv
         drdx = drdxnred @ Unred.T
         Uc, Sc, VTc = np.linalg.svd(drdxnred)
