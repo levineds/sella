@@ -686,6 +686,13 @@ class BaseInternals:
         return 3 * (self.natoms + self.ndummies)
 
     @property
+    def all_positions(self) -> np.ndarray:
+        """Get combined positions without creating an Atoms object."""
+        if self.ndummies > 0:
+            return np.vstack([self.atoms.positions, self.dummies.positions])
+        return self.atoms.positions
+
+    @property
     def all_atoms(self) -> Atoms:
         return self.atoms + self.dummies
 
@@ -694,12 +701,13 @@ class BaseInternals:
         # the last time a property was calculated. These positions are floats,
         # but we use a strict equality check to compare to avoid subtle bugs
         # that might occur during fine-resolution geodesic steps.
+        current_pos = self.all_positions
         if (
             self._lastpos is None
-            or np.any(self.all_atoms.positions != self._lastpos)
+            or np.any(current_pos != self._lastpos)
         ):
             self._cache = dict()
-            self._lastpos = self.all_atoms.positions.copy()
+            self._lastpos = current_pos.copy()
             self._cache_version += 1
 
     def _build_batched_arrays(self) -> None:
@@ -860,9 +868,8 @@ class BaseInternals:
         """Calculates the internal coordinate vector using vectorized operations."""
         self._cache_check()
         if 'coords' not in self._cache:
-            atoms = self.all_atoms
-            positions = atoms.positions
-            cell = atoms.cell.array if hasattr(atoms.cell, 'array') else np.asarray(atoms.cell)
+            positions = self.all_positions
+            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
 
             # Use vectorized computation for bonds, angles, dihedrals
             batched_vals = self._compute_batched_values(positions, cell)
@@ -870,7 +877,8 @@ class BaseInternals:
             # Build full coords list in order
             all_coords = []
 
-            # Translations (not batched - usually few)
+            # Translations (not batched - usually few) - need atoms object
+            atoms = self.all_atoms
             for coord in self.internals['translations']:
                 all_coords.append(coord.calc(atoms))
 
@@ -901,14 +909,14 @@ class BaseInternals:
         """Calculates the internal coordinate Jacobian matrix using vectorized operations."""
         self._cache_check()
         if 'jacobian' not in self._cache:
-            atoms = self.all_atoms
-            positions = atoms.positions
-            cell = atoms.cell.array if hasattr(atoms.cell, 'array') else np.asarray(atoms.cell)
+            positions = self.all_positions
+            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
 
             # Use vectorized computation for bonds, angles, dihedrals
             batched_grads = self._compute_batched_gradients(positions, cell)
 
-            # Cache batched data for direct assembly
+            # Non-batched coords need atoms object
+            atoms = self.all_atoms
             trans_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
                           for coord in self.internals['translations']]
             other_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
@@ -1010,14 +1018,14 @@ class BaseInternals:
         """Calculates the Hessian matrix for each internal coordinate using vectorized operations."""
         self._cache_check()
         if 'hessian' not in self._cache:
-            atoms = self.all_atoms
-            positions = atoms.positions
-            cell = atoms.cell.array if hasattr(atoms.cell, 'array') else np.asarray(atoms.cell)
+            positions = self.all_positions
+            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
 
             # Use vectorized computation for bonds, angles, dihedrals
             batched_hess = self._compute_batched_hessians(positions, cell)
 
-            # Cache batched data for direct assembly
+            # Non-batched coords need atoms object
+            atoms = self.all_atoms
             trans_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
                           for coord in self.internals['translations']]
             other_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
@@ -1143,7 +1151,7 @@ class BaseInternals:
         if not np.any(self.atoms.pbc):
             return ncvecs
 
-        pos = self.all_atoms.positions
+        pos = self.all_positions
         dxs = np.array([
             pos[i] - pos[j] for i, j in zip(indices[1:], indices[:-1])
         ])
@@ -1186,7 +1194,7 @@ class BaseInternals:
     ) -> jnp.ndarray:
         """Calculates the principal axes of rotation of a cluster of atoms."""
         indices = np.asarray(indices, dtype=np.int32)
-        pos = self.all_atoms.positions
+        pos = self.all_positions
         dx = pos[indices] - pos[indices].mean(0)
         Inertia = (
             (dx * dx).sum() * jnp.eye(3)
@@ -1976,8 +1984,8 @@ class Internals(BaseInternals):
         # Use vectorized computation to check all angles at once
         self._build_batched_arrays()
         if len(self._angle_indices) > 0:
-            positions = self.all_atoms.positions
-            cell = self.all_atoms.cell.array if hasattr(self.all_atoms.cell, 'array') else np.asarray(self.all_atoms.cell)
+            positions = self.all_positions
+            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
             angle_pos = positions[self._angle_indices]
             angle_tvecs = self._angle_ncvecs @ cell
             angle_vals = np.asarray(_angle_value_batched(angle_pos, angle_tvecs))
