@@ -540,6 +540,8 @@ class InternalPES(PES):
         dx = target - self.get_x()
         t0 = 0.
         Binv = np.linalg.pinv(self.int.jacobian())
+        # Store Binv for reuse in _q_ode to avoid repeated SVD computations
+        self._ode_Binv = Binv
         y0 = np.hstack((self.apos.ravel(), self.dpos.ravel(),
                         Binv @ dx,
                         Binv @ self.curr.get('g', np.zeros_like(dx))))
@@ -747,7 +749,8 @@ class InternalPES(PES):
 
         # Use direct HVP computation instead of forming full Hessians
         D_rdot = self.int.hessian_rdot(dxdt)
-        Binv = self._get_Binv()  # Use cached pinv instead of recomputing
+        # Reuse Binv from ODE initialization to avoid repeated SVD
+        Binv = self._ode_Binv
         D_tmp = -Binv @ D_rdot
         dydt[1] = D_tmp @ dxdt
         dydt[2] = D_tmp @ g
