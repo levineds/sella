@@ -19,7 +19,7 @@ from ase.constraints import (
 )
 
 import jax.numpy as jnp
-from jax import jit, grad, jacfwd, jacrev, custom_jvp, vmap
+from jax import jit, grad, jacfwd, jacrev, custom_jvp, vmap, jvp
 
 from sella.linalg import (
     SparseInternalJacobian, SparseInternalHessian, SparseInternalHessians
@@ -92,6 +92,44 @@ _dihedral_value_batched = jit(vmap(_dihedral_value, in_axes=(0, 0)))
 _bond_hess_batched = jit(vmap(jacfwd(grad(_bond_value, argnums=0), argnums=0), in_axes=(0, 0)))
 _angle_hess_batched = jit(vmap(jacfwd(grad(_angle_value, argnums=0), argnums=0), in_axes=(0, 0)))
 _dihedral_hess_batched = jit(vmap(jacfwd(grad(_dihedral_value, argnums=0), argnums=0), in_axes=(0, 0)))
+
+# =============================================================================
+# Hessian-vector product (HVP) functions using forward-over-reverse mode
+# =============================================================================
+# These compute H @ v directly without materializing the full Hessian matrix.
+# Uses jvp(grad(f), x, v) which is O(n) instead of O(n²) for forming full Hessian.
+# =============================================================================
+
+def _bond_hvp_single(pos: jnp.ndarray, tvec: jnp.ndarray, tangent: jnp.ndarray) -> jnp.ndarray:
+    """Compute Hessian @ tangent for a single bond without forming the Hessian."""
+    primals = (pos, tvec)
+    tangents = (tangent, jnp.zeros_like(tvec))
+    _, hvp_result = jvp(grad(_bond_value, argnums=0), primals, tangents)
+    return hvp_result
+
+
+def _angle_hvp_single(pos: jnp.ndarray, tvec: jnp.ndarray, tangent: jnp.ndarray) -> jnp.ndarray:
+    """Compute Hessian @ tangent for a single angle without forming the Hessian."""
+    primals = (pos, tvec)
+    tangents = (tangent, jnp.zeros_like(tvec))
+    _, hvp_result = jvp(grad(_angle_value, argnums=0), primals, tangents)
+    return hvp_result
+
+
+def _dihedral_hvp_single(pos: jnp.ndarray, tvec: jnp.ndarray, tangent: jnp.ndarray) -> jnp.ndarray:
+    """Compute Hessian @ tangent for a single dihedral without forming the Hessian."""
+    primals = (pos, tvec)
+    tangents = (tangent, jnp.zeros_like(tvec))
+    _, hvp_result = jvp(grad(_dihedral_value, argnums=0), primals, tangents)
+    return hvp_result
+
+
+# Batched HVP functions: compute H @ v for all coords at once
+# Input shapes: pos (n_coords, n_atoms, 3), tvec (n_coords, n_vecs, 3), tangent (n_coords, n_atoms, 3)
+# Output shapes: (n_coords, n_atoms, 3)
+_bond_hvp_batched = jit(vmap(_bond_hvp_single, in_axes=(0, 0, 0)))
+_angle_hvp_batched = jit(vmap(_angle_hvp_single, in_axes=(0, 0, 0)))
+_dihedral_hvp_batched = jit(vmap(_dihedral_hvp_single, in_axes=(0, 0, 0)))
 
 
 IVec = Tuple[int, int, int]
@@ -1169,6 +1207,126 @@ class BaseInternals:
         result = SparseInternalHessians(hessians, self.ndof)
         self._cache['hessian_result'] = result
         return result
+
+    def hessian_rdot(self, v: np.ndarray) -> np.ndarray:
+        """Compute Hessian @ v for all internal coordinates using direct HVP.
+
+        This computes the same result as hessian().rdot(v) but uses forward-over-reverse
+        mode autodiff (jvp(grad(f))) to compute Hessian-vector products directly,
+        avoiding the O(n²) cost of materializing full Hessian matrices.
+
+        Args:
+            v: Vector of shape (ndof,) to multiply with each coordinate's Hessian
+
+        Returns:
+            Array of shape (n_active_coords, ndof) where each row is H_i @ v
+        """
+        self._cache_check()
+        positions = self.all_positions
+        cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+        self._build_batched_arrays()
+        tvecs = self._get_cached_tvecs(cell)
+
+        # Reshape v for easy indexing
+        v_atoms = v.reshape((-1, 3))  # (n_atoms, 3)
+        n_atoms = self.natoms + self.ndummies
+
+        # Get active mask and counts
+        active_mask = self._active_mask
+        n_trans = len(self.internals['translations'])
+        n_bonds = len(self.internals['bonds'])
+        n_angles = len(self.internals['angles'])
+        n_dihedrals = len(self.internals['dihedrals'])
+        n_other = len(self.internals['other'])
+        n_rot = len(self.internals['rotations'])
+
+        start = 0
+        trans_active = active_mask[start:start+n_trans]
+        start += n_trans
+        bonds_active = np.array(active_mask[start:start+n_bonds], dtype=bool)
+        start += n_bonds
+        angles_active = np.array(active_mask[start:start+n_angles], dtype=bool)
+        start += n_angles
+        dihedrals_active = np.array(active_mask[start:start+n_dihedrals], dtype=bool)
+        start += n_dihedrals
+        other_active = active_mask[start:start+n_other]
+        start += n_other
+        rot_active = active_mask[start:start+n_rot]
+
+        results = []
+
+        # Translations - use existing hessian computation (usually few of these)
+        atoms = self.light_atoms
+        for i, coord in enumerate(self.internals['translations']):
+            if trans_active[i]:
+                hess = np.array(coord.calc_hessian(atoms))
+                idx = np.array(coord.indices)
+                v_sub = v_atoms[idx]  # (n_idx, 3)
+                hvp = np.einsum('aibj,bj->ai', hess, v_sub)
+                row = np.zeros(self.ndof)
+                row.reshape((-1, 3))[idx] = hvp
+                results.append(row)
+
+        # Bonds - use batched HVP
+        if bonds_active.any() and len(self._bond_indices) > 0:
+            active_idx = self._bond_indices[bonds_active]
+            bond_pos = positions[active_idx]  # (n_active, 2, 3)
+            bond_tvecs = tvecs['bonds'][bonds_active]  # (n_active, 1, 3)
+            v_sub = v_atoms[active_idx]  # (n_active, 2, 3)
+            hvp = np.asarray(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub))  # (n_active, 2, 3)
+            # Scatter back to full space
+            for i in range(len(active_idx)):
+                row = np.zeros(self.ndof)
+                row.reshape((-1, 3))[active_idx[i]] = hvp[i]
+                results.append(row)
+
+        # Angles - use batched HVP
+        if angles_active.any() and len(self._angle_indices) > 0:
+            active_idx = self._angle_indices[angles_active]
+            angle_pos = positions[active_idx]  # (n_active, 3, 3)
+            angle_tvecs = tvecs['angles'][angles_active]  # (n_active, 2, 3)
+            v_sub = v_atoms[active_idx]  # (n_active, 3, 3)
+            hvp = np.asarray(_angle_hvp_batched(angle_pos, angle_tvecs, v_sub))  # (n_active, 3, 3)
+            for i in range(len(active_idx)):
+                row = np.zeros(self.ndof)
+                row.reshape((-1, 3))[active_idx[i]] = hvp[i]
+                results.append(row)
+
+        # Dihedrals - use batched HVP
+        if dihedrals_active.any() and len(self._dihedral_indices) > 0:
+            active_idx = self._dihedral_indices[dihedrals_active]
+            dih_pos = positions[active_idx]  # (n_active, 4, 3)
+            dih_tvecs = tvecs['dihedrals'][dihedrals_active]  # (n_active, 3, 3)
+            v_sub = v_atoms[active_idx]  # (n_active, 4, 3)
+            hvp = np.asarray(_dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub))  # (n_active, 4, 3)
+            for i in range(len(active_idx)):
+                row = np.zeros(self.ndof)
+                row.reshape((-1, 3))[active_idx[i]] = hvp[i]
+                results.append(row)
+
+        # Other - use existing hessian computation
+        for i, coord in enumerate(self.internals['other']):
+            if other_active[i]:
+                hess = np.array(coord.calc_hessian(atoms))
+                idx = np.array(coord.indices)
+                v_sub = v_atoms[idx]
+                hvp = np.einsum('aibj,bj->ai', hess, v_sub)
+                row = np.zeros(self.ndof)
+                row.reshape((-1, 3))[idx] = hvp
+                results.append(row)
+
+        # Rotations - use existing hessian computation
+        for i, coord in enumerate(self.internals['rotations']):
+            if rot_active[i]:
+                hess = np.array(coord.calc_hessian(atoms))
+                idx = np.array(coord.indices)
+                v_sub = v_atoms[idx]
+                hvp = np.einsum('aibj,bj->ai', hess, v_sub)
+                row = np.zeros(self.ndof)
+                row.reshape((-1, 3))[idx] = hvp
+                results.append(row)
+
+        return np.array(results) if results else np.empty((0, self.ndof))
 
     def wrap(self, vec: np.ndarray) -> np.ndarray:
         """Wraps an internal coord. displacement vector into a valid domain."""

@@ -745,9 +745,10 @@ class InternalPES(PES):
         self.atoms.positions = x[:nxa].reshape((-1, 3)).copy()
         self.dummies.positions = x[nxa:].reshape((-1, 3)).copy()
 
-        D = self.int.hessian()
+        # Use direct HVP computation instead of forming full Hessians
+        D_rdot = self.int.hessian_rdot(dxdt)
         Binv = self._get_Binv()  # Use cached pinv instead of recomputing
-        D_tmp = -Binv @ D.rdot(dxdt)
+        D_tmp = -Binv @ D_rdot
         dydt[1] = D_tmp @ dxdt
         dydt[2] = D_tmp @ g
 
