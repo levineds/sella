@@ -426,29 +426,18 @@ class InternalPES(PES):
     # system's _cache_version counter to detect when positions have changed.
     # =========================================================================
 
-    def _get_Binv(self, rcond=None):
-        """Get cached pseudo-inverse of internal Jacobian.
-
-        Uses regularized pseudo-inverse to handle ill-conditioned Jacobians
-        that arise with TRICs (Translation-Rotation Internal Coordinates).
-
-        Args:
-            rcond: Relative condition number cutoff. Values below
-                   rcond * max_singular_value are treated as zero.
-                   Default is machine precision based on array dimensions.
-        """
+    def _get_Binv(self):
+        """Get cached pseudo-inverse of internal Jacobian."""
         B = self.int.jacobian()
         # Use cache version counter to detect changes
         version = self.int._cache_version
-        cache_key = (version, rcond)
-        if (self._pinv_cache.get('key') == cache_key and
+        if (self._pinv_cache.get('version') == version and
                 self._pinv_cache.get('pinv') is not None):
             return self._pinv_cache['pinv']
 
-        # Use regularized pseudo-inverse
-        Binv = np.linalg.pinv(B, rcond=rcond)
+        Binv = np.linalg.pinv(B)
 
-        self._pinv_cache['key'] = cache_key
+        self._pinv_cache['version'] = version
         self._pinv_cache['pinv'] = Binv
         return Binv
 
@@ -567,18 +556,7 @@ class InternalPES(PES):
         """
         dx = target - self.get_x()
         t0 = 0.
-
-        # Check if TRICs (translations/rotations) are present - they can cause
-        # ill-conditioned Jacobians due to redundancy with primitive internals
-        has_trics = (len(self.int.internals.get('translations', [])) > 0 or
-                     len(self.int.internals.get('rotations', [])) > 0)
-
-        if has_trics:
-            # Use regularized pinv to handle TRIC-induced ill-conditioning
-            Binv = self._get_Binv(rcond=1e-2)
-        else:
-            Binv = self._get_Binv()
-
+        Binv = self._get_Binv()
         # Store Binv for reuse in _q_ode to avoid repeated SVD computations
         self._ode_Binv = Binv
         y0 = np.hstack((self.apos.ravel(), self.dpos.ravel(),

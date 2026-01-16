@@ -2375,6 +2375,7 @@ class Internals(BaseInternals):
                             )
 
     def find_all_dihedrals(self) -> None:
+        # First, find proper dihedrals from angle combinations
         for a1, a2 in combinations(self.internals['angles'], 2):
             try:
                 new = a1 + a2
@@ -2393,6 +2394,64 @@ class Internals(BaseInternals):
                 self.add_dihedral(new)
             except DuplicateInternalError:
                 continue
+
+        # Second, add improper dihedrals for atoms with 3+ neighbors that don't
+        # have any proper dihedral passing through them. This is needed because:
+        # 1. At planar geometries, bond/angle derivatives vanish for out-of-plane motion
+        # 2. Even starting non-planar, the geometry may planarize during optimization
+        # 3. Improper dihedrals capture the out-of-plane (umbrella) mode
+        #
+        # We only add impropers when no proper dihedral exists through the atom,
+        # which avoids redundancy for ring systems like benzene where proper
+        # dihedrals already capture out-of-plane motion.
+
+        # First, find which atoms have proper dihedrals through them
+        dihedral_centers = set()
+        for d, a in zip(self.internals['dihedrals'], self._active['dihedrals']):
+            if a:
+                # Positions 1 and 2 are the "central" atoms of a dihedral
+                dihedral_centers.add(int(d.indices[1]))
+                dihedral_centers.add(int(d.indices[2]))
+
+        # Build neighbor list
+        neighbors = [[] for _ in range(self.natoms)]
+        for bond in self.internals['bonds']:
+            i, j = bond.indices
+            if i < self.natoms:
+                neighbors[i].append((int(j), bond.kwargs['ncvecs'][0]))
+            if j < self.natoms:
+                neighbors[j].append((int(i), -bond.kwargs['ncvecs'][0]))
+
+        for center in range(self.natoms):
+            # Consider atoms with 3 or 4 neighbors that lack proper dihedrals.
+            # - 3 neighbors: at planar geometries (e.g., NO3, sp2 carbons), the
+            #   3 angles sum to 360°, creating linear dependency.
+            # - 4 neighbors: at square planar geometries (e.g., Pt(II)), the
+            #   4 cis angles sum to 360°, similar issue. For tetrahedral, the
+            #   improper is redundant but harmless (pseudo-inverse handles it).
+            # - 5+ neighbors: rare, and typically have proper dihedrals anyway.
+            if len(neighbors[center]) not in (3, 4):
+                continue
+
+            # Skip if this atom already has proper dihedrals through it
+            if center in dihedral_centers:
+                continue
+
+            # Add improper dihedral: neighbors[0]-center-neighbors[1]-neighbors[2]
+            n0, ncvec0 = neighbors[center][0]
+            n1, ncvec1 = neighbors[center][1]
+            n2, ncvec2 = neighbors[center][2]
+            # Improper dihedral indices: (n0, center, n1, n2)
+            # The ncvecs connect consecutive atoms in the dihedral
+            imp_ncvecs = (
+                -ncvec0,  # from n0 to center
+                ncvec1,   # from center to n1
+                ncvec2 - ncvec1,  # from n1 to n2
+            )
+            try:
+                self.add_dihedral((n0, center, n1, n2), imp_ncvecs)
+            except DuplicateInternalError:
+                pass
 
     def validate_basis(self) -> None:
         jac = self.jacobian()
