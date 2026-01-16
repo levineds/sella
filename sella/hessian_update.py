@@ -50,8 +50,9 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None):
         # scalar is the average Ritz value from S.T @ Y
         thetas, _ = eigh(S.T @ Ytilde)
         # Guard against zero eigenvalues which would give log(0) = -Inf
-        thetas_safe = np.where(np.abs(thetas) < 1e-10, 1e-10, np.abs(thetas))
-        lam0 = np.exp(np.average(np.log(thetas_safe)))
+        thetas_abs = np.abs(thetas)
+        thetas_abs = np.maximum(thetas_abs, 1e-14)
+        lam0 = np.exp(np.average(np.log(thetas_abs)))
         d, _ = S.shape
         B = lam0 * np.eye(d)
 
