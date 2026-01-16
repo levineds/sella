@@ -316,6 +316,10 @@ class Sella(Optimizer):
                 v0=None,  # TODO: use leftmost eigenvector from old H
                 internal=self.user_internal,
                 hessian_function=self.pes.hessian_function,
+                optimize_cell=self.optimize_cell,
+                cell_mask=getattr(self.pes, 'cell_mask', None),
+                exp_cell_factor=getattr(self.pes, 'exp_cell_factor', None),
+                scalar_pressure=getattr(self.pes, 'scalar_pressure', 0.0),
             )
             self.initialized = False
             self.rho = 1

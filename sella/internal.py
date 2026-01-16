@@ -868,22 +868,22 @@ class BaseInternals:
         if bonds:
             self._bond_indices = np.array([b.indices for b in bonds], dtype=np.int32)
             self._bond_ncvecs = np.array(
-                [b.kwargs['ncvecs'] for b in bonds], dtype=np.float64
+                [b.kwargs['ncvecs'] for b in bonds], dtype=np.int32
             )
         else:
             self._bond_indices = np.empty((0, 2), dtype=np.int32)
-            self._bond_ncvecs = np.empty((0, 1, 3), dtype=np.float64)
+            self._bond_ncvecs = np.empty((0, 1, 3), dtype=np.int32)
 
         # Build arrays for angles
         angles = self.internals['angles']
         if angles:
             self._angle_indices = np.array([a.indices for a in angles], dtype=np.int32)
             self._angle_ncvecs = np.array(
-                [a.kwargs['ncvecs'] for a in angles], dtype=np.float64
+                [a.kwargs['ncvecs'] for a in angles], dtype=np.int32
             )
         else:
             self._angle_indices = np.empty((0, 3), dtype=np.int32)
-            self._angle_ncvecs = np.empty((0, 2, 3), dtype=np.float64)
+            self._angle_ncvecs = np.empty((0, 2, 3), dtype=np.int32)
 
         # Build arrays for dihedrals
         dihedrals = self.internals['dihedrals']
@@ -892,11 +892,11 @@ class BaseInternals:
                 [d.indices for d in dihedrals], dtype=np.int32
             )
             self._dihedral_ncvecs = np.array(
-                [d.kwargs['ncvecs'] for d in dihedrals], dtype=np.float64
+                [d.kwargs['ncvecs'] for d in dihedrals], dtype=np.int32
             )
         else:
             self._dihedral_indices = np.empty((0, 4), dtype=np.int32)
-            self._dihedral_ncvecs = np.empty((0, 3, 3), dtype=np.float64)
+            self._dihedral_ncvecs = np.empty((0, 3, 3), dtype=np.int32)
 
         self._batched_arrays_valid = True
 
@@ -1234,7 +1234,16 @@ class BaseInternals:
               zero cell derivatives (they don't depend on the cell).
             - Only bonds, angles, and dihedrals with non-zero ncvecs have
               non-zero cell derivatives.
+
+        Raises:
+            ValueError: If the system does not have periodic boundary conditions.
         """
+        if not np.any(self.atoms.pbc):
+            raise ValueError(
+                "cell_jacobian() requires periodic boundary conditions. "
+                "Set atoms.pbc = True for periodic systems."
+            )
+
         self._cache_check()
 
         if 'cell_jacobian' not in self._cache:

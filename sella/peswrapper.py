@@ -1053,7 +1053,13 @@ class CellInternalPES(InternalPES):
             # Cell-only case: dx_final equals the cell displacement
             dx_cell = cell_target - cell_params0
             dx_final = dx_cell.copy()
-            g_final = np.zeros(self.n_cell_dof)
+            # Return actual cell gradient at starting position for proper Hessian update
+            # (dg_actual = get_g() - g_par needs g_par to be the old gradient)
+            g_old = self.curr.get('g', None)
+            if g_old is not None:
+                g_final = g_old[-self.n_cell_dof:].copy()
+            else:
+                g_final = np.zeros(self.n_cell_dof)
             return dx_initial, dx_final, g_final
 
         # Get initial gradient in Cartesian for internal coord update
