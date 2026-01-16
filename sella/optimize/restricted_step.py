@@ -170,7 +170,7 @@ class RestrictedAtomicStep(BaseRestrictedStep):
             return val
 
         dsda_mat = dsda.reshape((-1, 3))
-        dval = dsda_mat[index] @ s_mat[index] / val
+        dval = dsda_mat[index] @ s_mat[index] / max(val, 1e-15)
         return val, dval
 
 
