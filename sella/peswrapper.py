@@ -275,7 +275,7 @@ class PES:
         if P_is_none or self.first_diag:
             v0 = self.v0 if self.v0 is not None else self.get_g() @ Ufree
             # If v0 is near-zero, let rayleigh_ritz choose its own initial guess
-            if v0 is not None and np.linalg.norm(v0) < 1e-10:
+            if v0 is not None and np.linalg.norm(v0) < 1e-12:
                 v0 = None
         else:
             v0 = None
