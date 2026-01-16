@@ -185,3 +185,44 @@ class TestTRICs:
             ints.validate_basis()
             # Should not warn if TRIC DOF calculation is correct
             assert len(w) == 0, f"Unexpected warning: {w[0].message if w else 'none'}"
+
+    def test_tric_optimization_convergence(self):
+        """Test that optimization with TRICs converges (ODE doesn't fail).
+
+        This tests the fix for the ODE convergence issue with ill-conditioned
+        Jacobians that arise from TRICs.
+        """
+        from ase.calculators.lj import LennardJones
+        from sella import Sella
+
+        # Bi(NO3)3 cluster - a real-world TRIC test case
+        atoms = Atoms(
+            'BiN3O9',
+            positions=[
+                [-0.168754, 0.103309, -0.601068],   # Bi
+                [-1.452579, 0.996969, 1.671974],    # N
+                [-1.906613, 1.312382, 2.719561],    # O
+                [-0.390479, 0.236458, 1.599985],    # O
+                [-1.916359, 1.339852, 0.548706],    # O
+                [2.088604, 1.559729, 0.184556],     # N
+                [3.081561, 2.106988, 0.537575],     # O
+                [0.991304, 2.160371, -0.042657],    # O
+                [2.046745, 0.279049, -0.004926],    # O
+                [-0.824031, -2.516641, 0.135921],   # N
+                [-1.024602, -3.638619, 0.469313],   # O
+                [0.376482, -2.057305, -0.023988],   # O
+                [-1.745220, -1.672049, -0.097571],  # O
+            ]
+        )
+        atoms.calc = LennardJones()
+
+        # Use TRICs with small scale to ensure fragments are detected
+        ints = Internals(atoms, allow_fragments=True)
+        ints.find_all_bonds(scale=1.0)
+        ints.find_all_angles()
+        ints.find_all_dihedrals()
+
+        # This should not raise RuntimeError about ODE convergence
+        opt = Sella(atoms, internal=ints)
+        # Just run a few steps to verify ODE works
+        opt.run(fmax=1.0, steps=5)
