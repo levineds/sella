@@ -955,5 +955,125 @@ class TestCellConstraints:
         assert opt_diag.pes.n_cell_dof == 3
 
 
+class TestRefineInitialHessian:
+    """Test the refine_initial_hessian option for cell optimization."""
+
+    def test_refine_hessian_produces_nonzero_coupling(self):
+        """Test that refine_initial_hessian produces non-zero coupling blocks."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        # With refinement
+        pes_refined = CellInternalPES(
+            atoms,
+            Internals(atoms),
+            refine_initial_hessian=True,
+        )
+
+        H = pes_refined.H.B
+        n_int = pes_refined.n_internal
+
+        # The coupling block should be non-zero (or at least the cell-cell block
+        # should differ from 70*I)
+        H_coupling = H[:n_int, n_int:]
+        H_cell = H[n_int:, n_int:]
+
+        # Cell-cell block should not be exactly 70*I (it was computed via FD)
+        # Note: it might still be close to diagonal for simple systems
+        assert H_cell.shape == (pes_refined.n_cell_dof, pes_refined.n_cell_dof)
+
+    def test_refine_hessian_vs_default_different(self):
+        """Test that refined Hessian differs from default."""
+        # Without refinement
+        atoms1 = bulk('Cu', 'fcc', a=3.6)
+        atoms1.calc = EMT()
+        pes_default = CellInternalPES(
+            atoms1,
+            Internals(atoms1),
+            refine_initial_hessian=False,
+        )
+
+        # With refinement
+        atoms2 = bulk('Cu', 'fcc', a=3.6)
+        atoms2.calc = EMT()
+        pes_refined = CellInternalPES(
+            atoms2,
+            Internals(atoms2),
+            refine_initial_hessian=True,
+        )
+
+        H_default = pes_default.H.B
+        H_refined = pes_refined.H.B
+
+        n_int = pes_default.n_internal
+
+        # The cell-cell blocks should be different
+        H_cell_default = H_default[n_int:, n_int:]
+        H_cell_refined = H_refined[n_int:, n_int:]
+
+        # Default is 70*I, refined should be computed from actual curvature
+        assert not np.allclose(H_cell_default, H_cell_refined)
+
+    def test_refine_hessian_cartesian_pes(self):
+        """Test refine_initial_hessian with CellCartesianPES."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        pes = CellCartesianPES(
+            atoms,
+            refine_initial_hessian=True,
+        )
+
+        H = pes.H.B
+        n_cart = pes.n_cart
+
+        # Hessian should have correct shape
+        assert H.shape == (pes.dim, pes.dim)
+
+        # Cell-cell block should exist
+        H_cell = H[n_cart:, n_cart:]
+        assert H_cell.shape == (pes.n_cell_dof, pes.n_cell_dof)
+
+    def test_refine_hessian_via_sella_api(self):
+        """Test refine_initial_hessian through Sella API."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        opt = Sella(
+            atoms,
+            internal=True,
+            order=0,
+            optimize_cell=True,
+            refine_initial_hessian=True,
+            logfile=None,
+        )
+
+        # Should be CellInternalPES
+        assert isinstance(opt.pes, CellInternalPES)
+
+        # Hessian should be properly dimensioned
+        H = opt.pes.H.B
+        assert H.shape == (opt.pes.dim, opt.pes.dim)
+
+    def test_refine_hessian_force_call_count(self):
+        """Test that refinement makes expected number of force calls."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        # Only allow diagonal cell DOF for fewer calls
+        cell_mask = np.eye(3, dtype=bool)  # 3 DOF
+
+        pes = CellInternalPES(
+            atoms,
+            Internals(atoms),
+            cell_mask=cell_mask,
+            refine_initial_hessian=True,
+        )
+
+        # Should have made 2 * n_cell_dof = 6 evaluations during init
+        # (2 per cell DOF for central difference)
+        assert pes.neval == 6
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

@@ -70,6 +70,7 @@ class Sella(Optimizer):
         scalar_pressure: float = 0.0,
         smax: float = None,
         allow_fragments: bool = False,
+        refine_initial_hessian: bool = False,
         **kwargs
     ):
         """Initialize Sella optimizer.
@@ -95,6 +96,12 @@ class Sella(Optimizer):
             If True, allow disconnected molecular fragments when using internal
             coordinates. Adds translation and rotation coordinates (TRICs) for
             each fragment. Useful for molecular crystals. Default is False.
+        refine_initial_hessian : bool, optional
+            If True, compute cell-coordinate coupling and cell-cell Hessian blocks
+            via finite differences when optimize_cell=True. This requires additional
+            force evaluations (2 * n_cell_dof, typically 18) but can significantly
+            improve convergence for systems with strong cell-coordinate coupling.
+            Default is False.
         """
         if order == 0:
             default = _default_kwargs['minimum']
@@ -141,6 +148,7 @@ class Sella(Optimizer):
             exp_cell_factor=exp_cell_factor,
             scalar_pressure=scalar_pressure,
             allow_fragments=allow_fragments,
+            refine_initial_hessian=refine_initial_hessian,
             **kwargs
         )
 
@@ -198,6 +206,7 @@ class Sella(Optimizer):
         exp_cell_factor: float = None,
         scalar_pressure: float = 0.0,
         allow_fragments: bool = False,
+        refine_initial_hessian: bool = False,
         **kwargs
     ):
         if internal:
@@ -231,6 +240,7 @@ class Sella(Optimizer):
                     exp_cell_factor=exp_cell_factor,
                     cell_mask=cell_mask,
                     scalar_pressure=scalar_pressure,
+                    refine_initial_hessian=refine_initial_hessian,
                     **kwargs
                 )
             else:
@@ -261,6 +271,7 @@ class Sella(Optimizer):
                     exp_cell_factor=exp_cell_factor,
                     cell_mask=cell_mask,
                     scalar_pressure=scalar_pressure,
+                    refine_initial_hessian=refine_initial_hessian,
                     **kwargs
                 )
             else:

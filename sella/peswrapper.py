@@ -926,6 +926,13 @@ class CellInternalPES(InternalPES):
         Default is all True (full cell optimization).
     scalar_pressure : float, optional
         External pressure in eV/Å³. Default is 0.
+    refine_initial_hessian : bool, optional
+        If True, compute cell-coordinate coupling and cell-cell Hessian blocks
+        via finite differences. This requires additional force evaluations
+        (2 * n_cell_dof) but can improve convergence for coupled systems.
+        Default is False.
+    hessian_delta : float, optional
+        Finite difference step size for Hessian refinement. Default is 1e-5.
     """
 
     def __init__(
@@ -936,6 +943,8 @@ class CellInternalPES(InternalPES):
         exp_cell_factor: float = None,
         cell_mask: np.ndarray = None,
         scalar_pressure: float = 0.0,
+        refine_initial_hessian: bool = False,
+        hessian_delta: float = 1e-5,
         H0: np.ndarray = None,
         **kwargs
     ):
@@ -987,11 +996,20 @@ class CellInternalPES(InternalPES):
             H_internal = P @ self.int.guess_hessian() @ P
             H0_full[:self.n_internal, :self.n_internal] = H_internal
 
-        # Cell block: use diagonal guess based on typical bulk moduli
-        # Higher values are more conservative (smaller initial steps)
-        # 70 eV is reasonable for metals; molecular systems may need less
-        h0_cell = 70.0
-        H0_full[self.n_internal:, self.n_internal:] = h0_cell * np.eye(self.n_cell_dof)
+        if refine_initial_hessian:
+            # Compute cell-related Hessian blocks via finite differences
+            # This gives us both the coupling (internal-cell) and cell-cell blocks
+            H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
+            # Fill in the cell columns
+            H0_full[:, self.n_internal:] = H_cell_cols
+            # Symmetrize: H[cell, :] = H[:, cell].T
+            H0_full[self.n_internal:, :] = H_cell_cols.T
+        else:
+            # Cell block: use diagonal guess based on typical bulk moduli
+            # Higher values are more conservative (smaller initial steps)
+            # 70 eV is reasonable for metals; molecular systems may need less
+            h0_cell = 70.0
+            H0_full[self.n_internal:, self.n_internal:] = h0_cell * np.eye(self.n_cell_dof)
 
         self.set_H(H0_full, initialized=False)
 
@@ -1005,6 +1023,55 @@ class CellInternalPES(InternalPES):
         InternalPES.restore(self)
         if 'cell' in self.savepoint:
             self.atoms.set_cell(self.savepoint['cell'], scale_atoms=False)
+
+    def _compute_cell_hessian_columns(self, delta: float) -> np.ndarray:
+        """Compute Hessian columns for cell DOF via finite differences.
+
+        This computes d(gradient)/d(cell_param) for all cell parameters,
+        giving us both the internal-cell coupling block and the cell-cell block.
+
+        Parameters
+        ----------
+        delta : float
+            Finite difference step size.
+
+        Returns
+        -------
+        H_cols : ndarray
+            Array of shape (dim, n_cell_dof) containing Hessian columns.
+        """
+        H_cols = np.zeros((self.dim, self.n_cell_dof))
+
+        # Save current state
+        x0 = self.get_x()
+        cell0 = self.atoms.get_cell().array.copy()
+        pos0 = self.atoms.positions.copy()
+
+        for i in range(self.n_cell_dof):
+            # Displace cell parameter +delta
+            x_plus = x0.copy()
+            x_plus[self.n_internal + i] += delta
+            self.set_x(x_plus)
+            _, g_plus = self.eval()
+
+            # Displace cell parameter -delta
+            x_minus = x0.copy()
+            x_minus[self.n_internal + i] -= delta
+            self.set_x(x_minus)
+            _, g_minus = self.eval()
+
+            # Central difference
+            H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
+
+        # Restore original state
+        self.atoms.positions = pos0
+        self.atoms.set_cell(cell0, scale_atoms=False)
+        # Clear cached values to force recomputation
+        self.curr['x'] = None
+        self.curr['f'] = None
+        self.curr['g'] = None
+
+        return H_cols
 
     def get_x(self) -> np.ndarray:
         """Return combined internal coordinates + cell parameters.
@@ -1456,6 +1523,13 @@ class CellCartesianPES(PES):
         Default is all True (full cell optimization).
     scalar_pressure : float, optional
         External pressure in eV/Å³. Default is 0.
+    refine_initial_hessian : bool, optional
+        If True, compute cell-coordinate coupling and cell-cell Hessian blocks
+        via finite differences. This requires additional force evaluations
+        (2 * n_cell_dof) but can improve convergence for coupled systems.
+        Default is False.
+    hessian_delta : float, optional
+        Finite difference step size for Hessian refinement. Default is 1e-5.
     """
 
     def __init__(
@@ -1465,6 +1539,8 @@ class CellCartesianPES(PES):
         exp_cell_factor: float = None,
         cell_mask: np.ndarray = None,
         scalar_pressure: float = 0.0,
+        refine_initial_hessian: bool = False,
+        hessian_delta: float = 1e-5,
         H0: np.ndarray = None,
         **kwargs
     ):
@@ -1511,9 +1587,18 @@ class CellCartesianPES(PES):
             # Default: 70 eV/Å² is reasonable for stiff materials
             H0_full[:self.n_cart, :self.n_cart] = 70.0 * np.eye(self.n_cart)
 
-        # Cell block: use diagonal guess based on typical bulk moduli
-        h0_cell = 70.0
-        H0_full[self.n_cart:, self.n_cart:] = h0_cell * np.eye(self.n_cell_dof)
+        if refine_initial_hessian:
+            # Compute cell-related Hessian blocks via finite differences
+            # This gives us both the coupling (Cartesian-cell) and cell-cell blocks
+            H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
+            # Fill in the cell columns
+            H0_full[:, self.n_cart:] = H_cell_cols
+            # Symmetrize: H[cell, :] = H[:, cell].T
+            H0_full[self.n_cart:, :] = H_cell_cols.T
+        else:
+            # Cell block: use diagonal guess based on typical bulk moduli
+            h0_cell = 70.0
+            H0_full[self.n_cart:, self.n_cart:] = h0_cell * np.eye(self.n_cell_dof)
 
         self.set_H(H0_full, initialized=False)
 
@@ -1527,6 +1612,55 @@ class CellCartesianPES(PES):
         PES.restore(self)
         if 'cell' in self.savepoint:
             self.atoms.set_cell(self.savepoint['cell'], scale_atoms=False)
+
+    def _compute_cell_hessian_columns(self, delta: float) -> np.ndarray:
+        """Compute Hessian columns for cell DOF via finite differences.
+
+        This computes d(gradient)/d(cell_param) for all cell parameters,
+        giving us both the Cartesian-cell coupling block and the cell-cell block.
+
+        Parameters
+        ----------
+        delta : float
+            Finite difference step size.
+
+        Returns
+        -------
+        H_cols : ndarray
+            Array of shape (dim, n_cell_dof) containing Hessian columns.
+        """
+        H_cols = np.zeros((self.dim, self.n_cell_dof))
+
+        # Save current state
+        x0 = self.get_x()
+        cell0 = self.atoms.get_cell().array.copy()
+        pos0 = self.atoms.positions.copy()
+
+        for i in range(self.n_cell_dof):
+            # Displace cell parameter +delta
+            x_plus = x0.copy()
+            x_plus[self.n_cart + i] += delta
+            self.set_x(x_plus)
+            _, g_plus = self.eval()
+
+            # Displace cell parameter -delta
+            x_minus = x0.copy()
+            x_minus[self.n_cart + i] -= delta
+            self.set_x(x_minus)
+            _, g_minus = self.eval()
+
+            # Central difference
+            H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
+
+        # Restore original state
+        self.atoms.positions = pos0
+        self.atoms.set_cell(cell0, scale_atoms=False)
+        # Clear cached values to force recomputation
+        self.curr['x'] = None
+        self.curr['f'] = None
+        self.curr['g'] = None
+
+        return H_cols
 
     def get_x(self) -> np.ndarray:
         """Return Cartesian positions + cell parameters.
