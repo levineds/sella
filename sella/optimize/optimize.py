@@ -106,35 +106,12 @@ class Sella(Optimizer):
         else:
             self.delta = delta0 * self.pes.get_Ufree().shape[1]
 
-        if sigma_inc is None:
-            self.sigma_inc = default['sigma_inc']
-        else:
-            self.sigma_inc = sigma_inc
-
-        if sigma_dec is None:
-            self.sigma_dec = default['sigma_dec']
-        else:
-            self.sigma_dec = sigma_dec
-
-        if rho_inc is None:
-            self.rho_inc = default['rho_inc']
-        else:
-            self.rho_inc = rho_inc
-
-        if rho_dec is None:
-            self.rho_dec = default['rho_dec']
-        else:
-            self.rho_dec = rho_dec
-
-        if method is None:
-            self.method = default['method']
-        else:
-            self.method = method
-
-        if eig is None:
-            self.eig = default['eig']
-        else:
-            self.eig = eig
+        self.sigma_inc = sigma_inc if sigma_inc is not None else default['sigma_inc']
+        self.sigma_dec = sigma_dec if sigma_dec is not None else default['sigma_dec']
+        self.rho_inc = rho_inc if rho_inc is not None else default['rho_inc']
+        self.rho_dec = rho_dec if rho_dec is not None else default['rho_dec']
+        self.method = method if method is not None else default['method']
+        self.eig = eig if eig is not None else default['eig']
 
         self.ord = order
         self.eta = eta
@@ -275,14 +252,13 @@ class Sella(Optimizer):
             return
 
         # Update trust radius
-        if rho is None:
-            pass
-        elif rho < 1./self.rho_dec or rho > self.rho_dec:
-            self.delta = max(smag * self.sigma_dec, self.delta_min)
-        elif 1./self.rho_inc < rho < self.rho_inc:
-            self.delta = max(self.sigma_inc * smag, self.delta)
-        self.rho = rho
-        if self.rho is None:
+        if rho is not None:
+            if rho < 1./self.rho_dec or rho > self.rho_dec:
+                self.delta = max(smag * self.sigma_dec, self.delta_min)
+            elif 1./self.rho_inc < rho < self.rho_inc:
+                self.delta = max(self.sigma_inc * smag, self.delta)
+            self.rho = rho
+        else:
             self.rho = 1.
 
     def converged(self, forces=None):

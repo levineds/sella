@@ -200,7 +200,7 @@ class PES:
                 new_point = False
             else:
                 return False
-        drdx, Ucons, Unred, Ufree = self._calc_basis()
+        basis = self._calc_basis()
 
         if feval:
             f, g = self.eval()
@@ -214,11 +214,13 @@ class PES:
         self.curr['x'] = x
         self.curr['f'] = f
         self.curr['g'] = g
-        self._update_basis()
+        self._update_basis(basis)
         return True
 
-    def _update_basis(self):
-        drdx, Ucons, Unred, Ufree = self._calc_basis()
+    def _update_basis(self, basis=None):
+        if basis is None:
+            basis = self._calc_basis()
+        drdx, Ucons, Unred, Ufree = basis
         self.curr['drdx'] = drdx
         self.curr['Ucons'] = Ucons
         self.curr['Unred'] = Unred
@@ -263,18 +265,16 @@ class PES:
         nfree = Ufree.shape[1]
 
         P = self.get_HL().project(Ufree)
+        P_is_none = P.B is None
 
-        if P.B is None or self.first_diag:
-            v0 = self.v0
-            if v0 is None:
-                v0 = self.get_g() @ Ufree
+        # Determine initial guess vector
+        if P_is_none or self.first_diag:
+            v0 = self.v0 if self.v0 is not None else self.get_g() @ Ufree
         else:
             v0 = None
 
-        if P.B is None:
-            P = np.eye(nfree)
-        else:
-            P = P.asarray()
+        # Convert P to array
+        P = np.eye(nfree) if P_is_none else P.asarray()
 
         Hproj = NumericalHessian(self._calc_eg, self.get_x(), self.get_g(),
                                  self.eta, threepoint, Ufree)
