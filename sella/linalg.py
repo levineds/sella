@@ -158,12 +158,16 @@ class ApproximateHessian(LinearOperator):
 
         self.set_B(B0)
 
-    @property
-    def evals(self):
-        """Lazily compute eigenvalues on first access."""
+    def _ensure_eigen_computed(self):
+        """Compute eigendecomposition if not already done."""
         if not self._eigen_computed and self.B is not None:
             self._evals, self._evecs = eigh(self.B)
             self._eigen_computed = True
+
+    @property
+    def evals(self):
+        """Lazily compute eigenvalues on first access."""
+        self._ensure_eigen_computed()
         return self._evals
 
     @evals.setter
@@ -175,9 +179,7 @@ class ApproximateHessian(LinearOperator):
     @property
     def evecs(self):
         """Lazily compute eigenvectors on first access."""
-        if not self._eigen_computed and self.B is not None:
-            self._evals, self._evecs = eigh(self.B)
-            self._eigen_computed = True
+        self._ensure_eigen_computed()
         return self._evecs
 
     @evecs.setter
