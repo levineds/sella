@@ -500,9 +500,11 @@ class TestSellaWithCellOptimization:
         with pytest.raises(ValueError, match="order=0"):
             Sella(atoms, internal=True, order=1, optimize_cell=True)
 
-        # Should fail with internal=False
-        with pytest.raises(ValueError, match="internal=True"):
-            Sella(atoms, internal=False, order=0, optimize_cell=True)
+        # internal=False with optimize_cell=True should use CellCartesianPES
+        atoms2 = atoms.copy()
+        atoms2.calc = EMT()
+        opt = Sella(atoms2, internal=False, order=0, optimize_cell=True)
+        assert isinstance(opt.pes, CellCartesianPES)
 
         # Should fail without PBC
         atoms_nopbc = atoms.copy()
@@ -678,6 +680,204 @@ class TestCellGradient:
 
         # All components should be finite
         assert np.all(np.isfinite(g))
+
+
+class TestMolecularCrystal:
+    """Test cell optimization for molecular crystal systems.
+
+    Molecular crystals have multiple separate molecules in a periodic cell,
+    requiring TRICs (Translation-Rotation Internal Coordinates) for proper
+    handling of each molecular fragment.
+    """
+
+    def test_molecular_crystal_with_trics(self):
+        """Test that molecular crystal optimization works with allow_fragments=True."""
+        # Create a simple molecular crystal: two water molecules in a box
+        water1 = molecule('H2O')
+        water2 = molecule('H2O')
+
+        # Place molecules in different parts of the cell
+        water1.positions += [1.0, 1.0, 1.0]
+        water2.positions += [4.0, 4.0, 4.0]
+
+        # Combine into one system
+        atoms = water1 + water2
+        atoms.set_cell([7.0, 7.0, 7.0])
+        atoms.pbc = True
+        atoms.calc = LennardJones()
+
+        # Create optimizer with allow_fragments=True for TRICs
+        opt = Sella(
+            atoms,
+            internal=True,
+            order=0,
+            optimize_cell=True,
+            allow_fragments=True,
+            logfile=None,
+        )
+
+        assert isinstance(opt.pes, CellInternalPES)
+
+        # Verify the internal coords have TRICs (translations and rotations)
+        internals = opt.pes.int
+        assert internals.ntrans > 0, "Should have translation coordinates for fragments"
+        assert internals.nrotations > 0, "Should have rotation coordinates for fragments"
+
+        # Take a few steps to verify no errors
+        for _ in range(3):
+            opt.step()
+
+    def test_molecular_crystal_cartesian(self):
+        """Test molecular crystal optimization with Cartesian coordinates."""
+        # Create two methane molecules
+        ch4_1 = molecule('CH4')
+        ch4_2 = molecule('CH4')
+
+        ch4_1.positions += [1.5, 1.5, 1.5]
+        ch4_2.positions += [5.0, 5.0, 5.0]
+
+        atoms = ch4_1 + ch4_2
+        atoms.set_cell([8.0, 8.0, 8.0])
+        atoms.pbc = True
+        atoms.calc = LennardJones()
+
+        # Use Cartesian coordinates (internal=False) with cell optimization
+        opt = Sella(
+            atoms,
+            internal=False,
+            order=0,
+            optimize_cell=True,
+            logfile=None,
+        )
+
+        assert isinstance(opt.pes, CellCartesianPES)
+
+        # Take a few steps
+        for _ in range(3):
+            opt.step()
+
+    def test_molecular_crystal_trics_dof_count(self):
+        """Test that TRICs add correct DOF for molecular fragments."""
+        # Create two separate H2 molecules
+        atoms = Atoms(
+            'H4',
+            positions=[
+                [0.0, 0.0, 0.0],
+                [0.74, 0.0, 0.0],
+                [4.0, 4.0, 4.0],
+                [4.74, 4.0, 4.0],
+            ]
+        )
+        atoms.set_cell([8.0, 8.0, 8.0])
+        atoms.pbc = True
+        atoms.calc = LennardJones()
+
+        # With allow_fragments=True, should get TRICs for each fragment
+        internals = Internals(atoms, allow_fragments=True)
+        internals.find_all_bonds()
+
+        # Should have 2 bonds (one per H2)
+        assert internals.nbonds == 2
+
+        # Should have translations for the 2 fragments
+        assert internals.ntrans > 0
+
+        # Should have rotations for fragments that can rotate
+        # (H2 is linear, so rotation DOF may be limited)
+        assert internals.nrotations >= 0
+
+
+class TestTRICsCellDerivatives:
+    """Test that TRICs have correct cell derivatives.
+
+    For molecular crystals, translation and rotation coordinates should
+    have zero cell derivatives since they describe internal molecular
+    motion that doesn't depend on the cell.
+    """
+
+    def test_translation_cell_derivative_zero(self):
+        """Test that translation coordinates have zero cell derivatives."""
+        # Create a simple diatomic in a periodic cell
+        atoms = Atoms('H2', positions=[[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]])
+        atoms.set_cell([5.0, 5.0, 5.0])
+        atoms.pbc = True
+
+        internals = Internals(atoms, allow_fragments=True)
+        internals.find_all_bonds()
+
+        # Get the translation coordinates
+        translations = internals.internals.get('translations', [])
+
+        for trans in translations:
+            grad_cell = trans.calc_cell_gradient(atoms)
+            # Translation center of mass should not depend on cell
+            assert_allclose(grad_cell, 0, atol=1e-10)
+
+    def test_rotation_cell_derivative_zero(self):
+        """Test that rotation coordinates have zero cell derivatives."""
+        # Create water molecule (non-linear, has rotations)
+        atoms = molecule('H2O')
+        atoms.center(vacuum=3.0)
+        atoms.pbc = True
+
+        internals = Internals(atoms, allow_fragments=True)
+        internals.find_all_bonds()
+        internals.find_all_angles()
+
+        # Get rotation coordinates
+        rotations = internals.internals.get('rotations', [])
+
+        for rot in rotations:
+            grad_cell = rot.calc_cell_gradient(atoms)
+            # Rotation orientation should not depend on cell
+            assert_allclose(grad_cell, 0, atol=1e-10)
+
+    def test_bond_cell_derivative_intramolecular(self):
+        """Test intramolecular bond has zero cell derivative if not crossing PBC."""
+        # Create H2 well within the cell (not crossing boundary)
+        atoms = Atoms('H2', positions=[[2.0, 2.5, 2.5], [2.74, 2.5, 2.5]])
+        atoms.set_cell([5.0, 5.0, 5.0])
+        atoms.pbc = True
+
+        internals = Internals(atoms)
+        internals.find_all_bonds()
+
+        bond = internals.internals['bonds'][0]
+
+        # For intramolecular bond not crossing PBC, cell derivative should be zero
+        # (the ncvec should be zero)
+        grad_cell = bond.calc_cell_gradient(atoms)
+
+        # Check that gradient is zero (bond doesn't cross boundary)
+        assert_allclose(grad_cell, 0, atol=1e-10)
+
+    def test_cell_jacobian_trics_rows_zero(self):
+        """Test that TRICs rows in cell_jacobian are zero."""
+        atoms = molecule('H2O')
+        atoms.center(vacuum=3.0)
+        atoms.pbc = True
+
+        internals = Internals(atoms, allow_fragments=True)
+        internals.find_all_bonds()
+        internals.find_all_angles()
+
+        J_cell = internals.cell_jacobian()
+
+        # The rows corresponding to translations and rotations should be zero
+        # First ntrans rows are translations
+        n_trans = internals.ntrans
+        n_rot = internals.nrotations
+
+        if n_trans > 0:
+            trans_rows = J_cell[:n_trans, :]
+            assert_allclose(trans_rows, 0, atol=1e-10)
+
+        # Last nrotations rows are rotations (after other coords)
+        if n_rot > 0:
+            # Rotations come after: trans, bonds, angles, dihedrals, other
+            rot_start = n_trans + internals.nbonds + internals.nangles + internals.ndihedrals + internals.nother
+            rot_rows = J_cell[rot_start:rot_start + n_rot, :]
+            assert_allclose(rot_rows, 0, atol=1e-10)
 
 
 class TestCellConstraints:

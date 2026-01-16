@@ -11,7 +11,7 @@ from ase.utils import basestring
 from ase.io.trajectory import Trajectory
 
 from .restricted_step import get_restricted_step
-from sella.peswrapper import PES, InternalPES, CellInternalPES
+from sella.peswrapper import PES, InternalPES, CellInternalPES, CellCartesianPES
 from sella.internal import Internals, Constraints
 
 _default_kwargs = dict(
@@ -69,6 +69,7 @@ class Sella(Optimizer):
         exp_cell_factor: float = None,
         scalar_pressure: float = 0.0,
         smax: float = None,
+        allow_fragments: bool = False,
         **kwargs
     ):
         """Initialize Sella optimizer.
@@ -79,7 +80,7 @@ class Sella(Optimizer):
             ASE Atoms object to optimize.
         optimize_cell : bool, optional
             If True, optimize unit cell parameters along with atomic positions.
-            Requires internal=True and order=0. Default is False.
+            Requires order=0. Default is False.
         cell_mask : ndarray, optional
             Boolean mask of shape (3, 3) indicating which cell DOF are free.
             Default is all True (full cell optimization).
@@ -90,6 +91,10 @@ class Sella(Optimizer):
         smax : float, optional
             Maximum stress tolerance for convergence when optimize_cell=True.
             If None, uses fmax.
+        allow_fragments : bool, optional
+            If True, allow disconnected molecular fragments when using internal
+            coordinates. Adds translation and rotation coordinates (TRICs) for
+            each fragment. Useful for molecular crystals. Default is False.
         """
         if order == 0:
             default = _default_kwargs['minimum']
@@ -104,11 +109,6 @@ class Sella(Optimizer):
                 raise ValueError(
                     "Cell optimization is only supported for minima (order=0), "
                     f"got order={order}."
-                )
-            if not internal:
-                raise ValueError(
-                    "Cell optimization requires internal=True. "
-                    "Set internal=True to enable cell optimization."
                 )
             if not np.any(atoms.pbc):
                 raise ValueError(
@@ -140,6 +140,7 @@ class Sella(Optimizer):
             cell_mask=cell_mask,
             exp_cell_factor=exp_cell_factor,
             scalar_pressure=scalar_pressure,
+            allow_fragments=allow_fragments,
             **kwargs
         )
 
@@ -196,6 +197,7 @@ class Sella(Optimizer):
         cell_mask: np.ndarray = None,
         exp_cell_factor: float = None,
         scalar_pressure: float = 0.0,
+        allow_fragments: bool = False,
         **kwargs
     ):
         if internal:
@@ -210,7 +212,9 @@ class Sella(Optimizer):
                     )
             else:
                 auto_find_internals = True
-                internal = Internals(atoms, cons=constraints)
+                internal = Internals(
+                    atoms, cons=constraints, allow_fragments=allow_fragments
+                )
             self.internal = internal.copy()
             self.constraints = None
 
@@ -245,7 +249,22 @@ class Sella(Optimizer):
             if constraints is None:
                 constraints = Constraints(atoms)
             self.constraints = constraints
-            self.pes = PES(
+            if optimize_cell:
+                # Use CellCartesianPES for Cartesian + cell optimization
+                self.pes = CellCartesianPES(
+                    atoms,
+                    constraints=constraints,
+                    trajectory=trajectory,
+                    eta=eta,
+                    v0=v0,
+                    hessian_function=hessian_function,
+                    exp_cell_factor=exp_cell_factor,
+                    cell_mask=cell_mask,
+                    scalar_pressure=scalar_pressure,
+                    **kwargs
+                )
+            else:
+                self.pes = PES(
                 atoms,
                 constraints=constraints,
                 trajectory=trajectory,

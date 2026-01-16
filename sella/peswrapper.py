@@ -1689,33 +1689,46 @@ class CellCartesianPES(PES):
 
         The cell DOF are treated as unconstrained additional coordinates.
         """
-        # Get Cartesian basis from parent
-        result = PES._calc_basis(self)
-        drdx_cart, Ucons_cart, Unred_cart, Ufree_cart = result
+        # Compute Cartesian basis directly (not via parent, since parent uses self.dim)
+        # This mirrors PES._calc_basis but uses n_cart instead of self.dim
+        pos_hash = self.atoms.positions.tobytes()
+        if self._basis_cache['pos_hash'] == pos_hash:
+            return self._basis_cache['result']
+
+        drdx_cart = self.cons.jacobian()  # Constraint Jacobian for Cartesian coords
+        U, S, VT = np.linalg.svd(drdx_cart)
+        ncons = np.sum(S > 1e-6)
+        Ucons_cart = VT[:ncons].T
+        Ufree_cart = VT[ncons:].T
+        Unred_cart = np.eye(self.n_cart)
 
         # Extend to include cell DOF
-        n_cart = drdx_cart.shape[1]
-        n_total = n_cart + self.n_cell_dof
+        n_total = self.n_cart + self.n_cell_dof
 
         # drdx extended with zeros for cell columns
         drdx = np.zeros((drdx_cart.shape[0], n_total))
-        drdx[:, :n_cart] = drdx_cart
+        drdx[:, :self.n_cart] = drdx_cart
 
         # Ucons stays the same (no cell constraints)
         Ucons = np.zeros((n_total, Ucons_cart.shape[1]))
-        Ucons[:n_cart, :] = Ucons_cart
+        Ucons[:self.n_cart, :] = Ucons_cart
 
         # Unred extended with identity for cell DOF
         Unred = np.zeros((n_total, Unred_cart.shape[1] + self.n_cell_dof))
-        Unred[:n_cart, :Unred_cart.shape[1]] = Unred_cart
-        Unred[n_cart:, Unred_cart.shape[1]:] = np.eye(self.n_cell_dof)
+        Unred[:self.n_cart, :Unred_cart.shape[1]] = Unred_cart
+        Unred[self.n_cart:, Unred_cart.shape[1]:] = np.eye(self.n_cell_dof)
 
         # Ufree extended with identity for cell DOF
         Ufree = np.zeros((n_total, Ufree_cart.shape[1] + self.n_cell_dof))
-        Ufree[:n_cart, :Ufree_cart.shape[1]] = Ufree_cart
-        Ufree[n_cart:, Ufree_cart.shape[1]:] = np.eye(self.n_cell_dof)
+        Ufree[:self.n_cart, :Ufree_cart.shape[1]] = Ufree_cart
+        Ufree[self.n_cart:, Ufree_cart.shape[1]:] = np.eye(self.n_cell_dof)
 
-        return drdx, Ucons, Unred, Ufree
+        result = drdx, Ucons, Unred, Ufree
+
+        # Cache the result
+        self._basis_cache['pos_hash'] = pos_hash
+        self._basis_cache['result'] = result
+        return result
 
     def converged(self, fmax: float, smax: float = None, cmax: float = 1e-5):
         """Check convergence of forces and stress.
