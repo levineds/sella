@@ -268,8 +268,8 @@ class ApproximateHessian(LinearOperator):
     def __add__(self, other):
         initialized = self.initialized
         if isinstance(other, ApproximateHessian):
-            other = other.B
             initialized = initialized and other.initialized
+            other = other.B
         if not self.initialized or other is None:
             tot = None
             initialized = False
