@@ -1413,3 +1413,359 @@ class CellInternalPES(InternalPES):
             Hc[:n_int, :n_int] = Hc_int
 
         return Hc
+
+
+class CellCartesianPES(PES):
+    """Cartesian PES with unit cell optimization.
+
+    This class extends PES to simultaneously optimize both atomic Cartesian
+    positions and the unit cell parameters.
+
+    The cell is parameterized using the log of the deformation gradient:
+        F = cell @ inv(orig_cell)
+        cell_params = logm(F) * exp_cell_factor
+
+    This parameterization ensures that:
+    1. The identity corresponds to zero cell parameters
+    2. Small deformations are approximately linear in the parameters
+    3. Large deformations are handled smoothly
+
+    Parameters
+    ----------
+    atoms : Atoms
+        ASE Atoms object with periodic boundary conditions.
+    exp_cell_factor : float, optional
+        Scaling factor for cell parameterization. Default is number of atoms.
+    cell_mask : ndarray, optional
+        Boolean mask of shape (3, 3) indicating which cell DOF are free.
+        Default is all True (full cell optimization).
+    scalar_pressure : float, optional
+        External pressure in eV/Å³. Default is 0.
+    """
+
+    def __init__(
+        self,
+        atoms: Atoms,
+        *args,
+        exp_cell_factor: float = None,
+        cell_mask: np.ndarray = None,
+        scalar_pressure: float = 0.0,
+        H0: np.ndarray = None,
+        **kwargs
+    ):
+        # Store original cell as reference before any optimization
+        self.orig_cell = atoms.get_cell().array.copy()
+
+        # Cell parameterization scaling (like ASE's FrechetCellFilter)
+        if exp_cell_factor is None:
+            exp_cell_factor = float(len(atoms))
+        self.exp_cell_factor = exp_cell_factor
+
+        # Cell mask: which of the 9 cell matrix elements are free
+        if cell_mask is None:
+            cell_mask = np.ones((3, 3), dtype=bool)
+        self.cell_mask = np.asarray(cell_mask, dtype=bool).reshape((3, 3))
+        self.n_cell_dof = int(self.cell_mask.sum())
+
+        # External pressure
+        self.scalar_pressure = scalar_pressure
+
+        # Flag to control get_x behavior during parent initialization
+        self._initializing = True
+
+        # Initialize parent class - PES uses 3*natoms as dimension
+        PES.__init__(self, atoms, *args, H0=H0, **kwargs)
+
+        # Store Cartesian dimension (set by parent)
+        self.n_cart = self.dim  # 3 * natoms
+
+        # Update dimension to include cell DOF
+        self.dim = self.n_cart + self.n_cell_dof
+
+        # Done initializing - now get_x returns full vector
+        self._initializing = False
+
+        # Create proper Hessian with correct dimensions
+        # Use block-diagonal structure: Cartesian Hessian + cell Hessian
+        H_old = self.H.B if self.H is not None and self.H.B is not None else None
+
+        H0_full = np.zeros((self.dim, self.dim))
+        if H_old is not None:
+            H0_full[:self.n_cart, :self.n_cart] = H_old
+        else:
+            # Default: 70 eV/Å² is reasonable for stiff materials
+            H0_full[:self.n_cart, :self.n_cart] = 70.0 * np.eye(self.n_cart)
+
+        # Cell block: use diagonal guess based on typical bulk moduli
+        h0_cell = 70.0
+        H0_full[self.n_cart:, self.n_cart:] = h0_cell * np.eye(self.n_cell_dof)
+
+        self.set_H(H0_full, initialized=False)
+
+    def save(self):
+        """Save current state including cell."""
+        PES.save(self)
+        self.savepoint['cell'] = self.atoms.get_cell().array.copy()
+
+    def restore(self):
+        """Restore saved state including cell."""
+        PES.restore(self)
+        if 'cell' in self.savepoint:
+            self.atoms.set_cell(self.savepoint['cell'], scale_atoms=False)
+
+    def get_x(self) -> np.ndarray:
+        """Return Cartesian positions + cell parameters.
+
+        During initialization (_initializing=True), returns only Cartesian coords
+        to be compatible with parent class initialization.
+        """
+        x_cart = self.apos.ravel().copy()
+
+        # During parent initialization, return only Cartesian coords
+        if getattr(self, '_initializing', True):
+            return x_cart
+
+        cell_params = self._masked_cell_params()
+        return np.concatenate([x_cart, cell_params])
+
+    def _get_deformation_gradient(self) -> np.ndarray:
+        """Get current deformation gradient F = cell @ inv(orig_cell)."""
+        return self.atoms.get_cell().array @ np.linalg.inv(self.orig_cell)
+
+    def _get_log_deform(self) -> np.ndarray:
+        """Get log of deformation gradient, scaled by exp_cell_factor."""
+        F = self._get_deformation_gradient()
+        return logm(F).real * self.exp_cell_factor
+
+    def _set_cell_from_log_deform(self, log_deform_scaled: np.ndarray) -> None:
+        """Set cell from scaled log-deformation gradient."""
+        log_deform = log_deform_scaled / self.exp_cell_factor
+        F = expm(log_deform.real)
+        new_cell = self.orig_cell @ F.T
+        self.atoms.set_cell(new_cell, scale_atoms=False)
+
+    def _masked_cell_params(self) -> np.ndarray:
+        """Get cell parameters as flat array (only free DOF)."""
+        log_deform = self._get_log_deform()
+        return log_deform[self.cell_mask]
+
+    def _set_masked_cell_params(self, params: np.ndarray) -> None:
+        """Set cell from flat array of free DOF."""
+        log_deform = self._get_log_deform()
+        log_deform[self.cell_mask] = params
+        self._set_cell_from_log_deform(log_deform)
+
+    def set_x(self, target: np.ndarray):
+        """Set Cartesian positions and cell parameters.
+
+        Much simpler than CellInternalPES since Cartesian positions can be
+        set directly without iterative or ODE-based solvers.
+
+        Returns
+        -------
+        dx_initial, dx_final, g_par : tuple of np.ndarray
+            Displacement information for Hessian update.
+        """
+        x0 = self.get_x()
+        dx_initial = target - x0
+
+        # Split target into Cartesian and cell parts
+        x_cart_target = target[:self.n_cart]
+        cell_target = target[self.n_cart:]
+
+        # Get initial cell params
+        cell_params0 = self._masked_cell_params()
+
+        # Update cell first
+        self._set_masked_cell_params(cell_target)
+
+        # Update positions directly (simple for Cartesian!)
+        x_cart0 = self.apos.ravel()
+        diff = x_cart_target - x_cart0
+        self.atoms.positions = x_cart_target.reshape((-1, 3))
+
+        dx_final = np.concatenate([diff, cell_target - cell_params0])
+
+        # Return parallel gradient for Hessian update
+        g_old = self.curr.get('g', None)
+        if g_old is not None:
+            g_par = g_old.copy()
+        else:
+            g_par = np.zeros(self.dim)
+
+        return dx_initial, dx_final, g_par
+
+    def eval(self) -> tuple:
+        """Evaluate energy and combined gradient (Cartesian + cell)."""
+        self.neval += 1
+        f = self.atoms.get_potential_energy()
+
+        # Add pressure contribution: H = E + P*V
+        if self.scalar_pressure != 0.0:
+            f += self.scalar_pressure * self.atoms.get_volume()
+
+        # Cartesian gradient (no Jacobian needed)
+        forces = self.atoms.get_forces()
+        g_cart = -forces.ravel()
+
+        # Stress tensor -> cell gradient
+        stress = self.atoms.get_stress()  # 6-component Voigt, eV/Å³
+        g_cell = self._stress_to_cell_gradient(stress)
+
+        self.write_traj()
+        return f, np.concatenate([g_cart, g_cell])
+
+    def _stress_to_cell_gradient(self, stress_voigt: np.ndarray) -> np.ndarray:
+        """Convert stress tensor to gradient w.r.t. cell parameters.
+
+        Following ASE's FrechetCellFilter formulation.
+        """
+        volume = self.atoms.get_volume()
+        stress_3x3 = voigt_6_to_full_3x3_stress(stress_voigt)
+
+        # Add external pressure contribution
+        if self.scalar_pressure != 0.0:
+            stress_3x3 += self.scalar_pressure * np.eye(3)
+
+        # Gradient w.r.t. cell = V * stress
+        g_cell_3x3 = volume * stress_3x3
+
+        # Apply cell mask
+        g_cell_masked = g_cell_3x3 * self.cell_mask
+
+        # Scale by exp_cell_factor (inverse of the scaling in get_x)
+        g_cell_full = g_cell_masked / self.exp_cell_factor
+
+        # Return only free DOF
+        return g_cell_full[self.cell_mask]
+
+    def get_g(self) -> np.ndarray:
+        """Get combined gradient (Cartesian + cell)."""
+        self._update()
+        return self.curr['g'].copy()
+
+    def _update(self, feval: bool = True):
+        """Update current state including cell gradient."""
+        x = self.get_x()
+        new_point = True
+        if self.curr['x'] is not None and np.all(x == self.curr['x']):
+            if feval and self.curr['f'] is None:
+                new_point = False
+            else:
+                return False
+
+        if feval:
+            f, g = self.eval()
+        else:
+            f = None
+            g = None
+
+        if new_point:
+            self.last = self.curr.copy()
+
+        self.curr['x'] = x
+        self.curr['f'] = f
+        self.curr['g'] = g
+        self._update_basis()
+        return True
+
+    def _calc_basis(self):
+        """Calculate basis including cell DOF.
+
+        The cell DOF are treated as unconstrained additional coordinates.
+        """
+        # Get Cartesian basis from parent
+        result = PES._calc_basis(self)
+        drdx_cart, Ucons_cart, Unred_cart, Ufree_cart = result
+
+        # Extend to include cell DOF
+        n_cart = drdx_cart.shape[1]
+        n_total = n_cart + self.n_cell_dof
+
+        # drdx extended with zeros for cell columns
+        drdx = np.zeros((drdx_cart.shape[0], n_total))
+        drdx[:, :n_cart] = drdx_cart
+
+        # Ucons stays the same (no cell constraints)
+        Ucons = np.zeros((n_total, Ucons_cart.shape[1]))
+        Ucons[:n_cart, :] = Ucons_cart
+
+        # Unred extended with identity for cell DOF
+        Unred = np.zeros((n_total, Unred_cart.shape[1] + self.n_cell_dof))
+        Unred[:n_cart, :Unred_cart.shape[1]] = Unred_cart
+        Unred[n_cart:, Unred_cart.shape[1]:] = np.eye(self.n_cell_dof)
+
+        # Ufree extended with identity for cell DOF
+        Ufree = np.zeros((n_total, Ufree_cart.shape[1] + self.n_cell_dof))
+        Ufree[:n_cart, :Ufree_cart.shape[1]] = Ufree_cart
+        Ufree[n_cart:, Ufree_cart.shape[1]:] = np.eye(self.n_cell_dof)
+
+        return drdx, Ucons, Unred, Ufree
+
+    def converged(self, fmax: float, smax: float = None, cmax: float = 1e-5):
+        """Check convergence of forces and stress.
+
+        Parameters
+        ----------
+        fmax : float
+            Maximum force tolerance (eV/Å).
+        smax : float, optional
+            Maximum stress tolerance. If None, uses fmax.
+        cmax : float, optional
+            Constraint residual tolerance.
+
+        Returns
+        -------
+        conv : bool
+            True if converged.
+        fmax_actual : float
+            Maximum force.
+        cmax_actual : float
+            Constraint residual norm.
+        smax_actual : float
+            Maximum stress gradient.
+        """
+        if smax is None:
+            smax = fmax
+
+        # Force convergence (project out constraints)
+        g = self.get_g()
+        g_cart = g[:self.n_cart]
+        Ufree = self.get_Ufree()
+        Ufree_cart = Ufree[:self.n_cart, :Ufree.shape[1] - self.n_cell_dof]
+        g_proj = (Ufree_cart @ Ufree_cart.T @ g_cart).reshape((-1, 3))
+
+        fmax_actual = np.linalg.norm(g_proj, axis=1).max()
+
+        # Stress convergence
+        g_cell = g[self.n_cart:]
+        smax_actual = np.abs(g_cell).max() if len(g_cell) > 0 else 0.0
+
+        # Constraint residual
+        cmax_actual = np.linalg.norm(self.get_res())
+
+        conv = (fmax_actual < fmax) and (smax_actual < smax) and (cmax_actual < cmax)
+        return conv, fmax_actual, cmax_actual, smax_actual
+
+    def get_projected_forces(self) -> np.ndarray:
+        """Returns Nx3 array of atomic forces orthogonal to constraints."""
+        g = self.get_g()
+        g_cart = g[:self.n_cart]
+        Ufree = self.get_Ufree()
+        Ufree_cart = Ufree[:self.n_cart, :]
+        return -((Ufree_cart @ Ufree_cart.T) @ g_cart).reshape((-1, 3))
+
+    def get_drdx(self):
+        """Get constraint Jacobian extended for cell DOF."""
+        drdx_cart = PES.get_drdx(self)
+        n_cons = drdx_cart.shape[0]
+        drdx = np.zeros((n_cons, self.dim))
+        drdx[:, :self.n_cart] = drdx_cart
+        return drdx
+
+    def get_Hc(self):
+        """Get constraint Hessian extended for cell DOF."""
+        Hc_cart = PES.get_Hc(self)
+        Hc = np.zeros((self.dim, self.dim))
+        Hc[:self.n_cart, :self.n_cart] = Hc_cart
+        return Hc

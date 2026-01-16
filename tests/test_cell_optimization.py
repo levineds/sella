@@ -10,7 +10,7 @@ from ase.calculators.emt import EMT
 from ase.calculators.lj import LennardJones
 
 from sella import Sella
-from sella.peswrapper import CellInternalPES
+from sella.peswrapper import CellInternalPES, CellCartesianPES
 from sella.internal import Internals, Bond, Angle
 
 
@@ -249,6 +249,233 @@ class TestCellInternalPES:
 
         assert isinstance(f, float)
         assert len(g) == pes.dim
+
+
+class TestCellCartesianPES:
+    """Test CellCartesianPES class."""
+
+    def test_cell_cartesian_pes_initialization(self):
+        """Test that CellCartesianPES initializes correctly."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        pes = CellCartesianPES(atoms)
+
+        # Check dimensions include cell DOF
+        assert pes.n_cell_dof == 9  # Full 3x3 cell
+        assert pes.n_cart == 3 * len(atoms)
+        assert pes.dim == pes.n_cart + 9
+
+    def test_cell_cartesian_pes_get_x(self):
+        """Test get_x returns combined Cartesian + cell vector."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        pes = CellCartesianPES(atoms)
+
+        x = pes.get_x()
+
+        # Length should be n_cart + n_cell_dof
+        assert len(x) == pes.dim
+
+        # First n_cart elements are Cartesian positions
+        positions_flat = atoms.get_positions().ravel()
+        assert_allclose(x[:pes.n_cart], positions_flat, rtol=1e-10)
+
+        # Cell params at identity should be approximately zero
+        # (log of identity matrix is zero)
+        assert_allclose(x[pes.n_cart:], 0, atol=1e-10)
+
+    def test_cell_cartesian_pes_cell_mask(self):
+        """Test cell_mask parameter."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        # Only allow diagonal elements (hydrostatic strain)
+        cell_mask = np.eye(3, dtype=bool)
+
+        pes = CellCartesianPES(atoms, cell_mask=cell_mask)
+
+        assert pes.n_cell_dof == 3  # Only 3 diagonal elements
+        assert pes.dim == pes.n_cart + 3
+
+    def test_cell_cartesian_pes_eval(self):
+        """Test eval returns correct gradient shape."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        pes = CellCartesianPES(atoms)
+
+        f, g = pes.eval()
+
+        assert isinstance(f, float)
+        assert len(g) == pes.dim
+
+    def test_cell_cartesian_pes_save_restore(self):
+        """Test save and restore functionality."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        pes = CellCartesianPES(atoms)
+
+        # Save initial state
+        pes.save()
+        x0 = pes.get_x()
+        cell0 = atoms.get_cell().array.copy()
+        pos0 = atoms.get_positions().copy()
+
+        # Modify positions and cell
+        atoms.positions += 0.1
+        new_cell = atoms.get_cell().array * 1.05
+        atoms.set_cell(new_cell, scale_atoms=False)
+
+        # Verify modifications took effect
+        assert not np.allclose(atoms.get_positions(), pos0)
+        assert not np.allclose(atoms.get_cell().array, cell0)
+
+        # Restore and verify
+        pes.restore()
+        assert_allclose(atoms.get_positions(), pos0)
+        assert_allclose(atoms.get_cell().array, cell0)
+
+    def test_cell_cartesian_pes_set_x(self):
+        """Test set_x updates positions and cell."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        pes = CellCartesianPES(atoms)
+
+        # Get initial x
+        x0 = pes.get_x()
+
+        # Create target with small perturbations
+        x_target = x0.copy()
+        x_target[:pes.n_cart] += 0.01  # Small position change
+        x_target[pes.n_cart:] += 0.001  # Small cell change
+
+        # Set new x
+        pes.set_x(x_target)
+
+        # Get x and verify it's close to target
+        x_new = pes.get_x()
+        # Cell parameters should match
+        assert_allclose(x_new[pes.n_cart:], x_target[pes.n_cart:], rtol=1e-6)
+        # Positions should match
+        assert_allclose(x_new[:pes.n_cart], x_target[:pes.n_cart], rtol=1e-6)
+
+    def test_cell_cartesian_vs_internal_gradient_shape(self):
+        """Compare CellCartesianPES and CellInternalPES gradient shapes."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        # CellCartesianPES
+        pes_cart = CellCartesianPES(atoms.copy())
+        pes_cart.atoms.calc = EMT()
+        _, g_cart = pes_cart.eval()
+
+        # CellInternalPES
+        internals = Internals(atoms)
+        pes_int = CellInternalPES(atoms, internals)
+        _, g_int = pes_int.eval()
+
+        # Both should have 9 cell DOF (full 3x3 cell)
+        assert pes_cart.n_cell_dof == 9
+        assert pes_int.n_cell_dof == 9
+
+        # Cell parts of gradient should have same length
+        assert len(g_cart[pes_cart.n_cart:]) == len(g_int[pes_int.n_internal:])
+
+    def test_cell_cartesian_pes_pressure(self):
+        """Test scalar pressure contribution."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        # Without pressure
+        pes_no_p = CellCartesianPES(atoms.copy())
+        pes_no_p.atoms.calc = EMT()
+        f_no_p, _ = pes_no_p.eval()
+
+        # With pressure
+        pressure = 0.1  # eV/Å³
+        atoms2 = atoms.copy()
+        atoms2.calc = EMT()
+        pes_p = CellCartesianPES(atoms2, scalar_pressure=pressure)
+        f_p, _ = pes_p.eval()
+
+        # Energy with pressure should be higher (positive pressure)
+        volume = atoms.get_volume()
+        expected_diff = pressure * volume
+        assert_allclose(f_p - f_no_p, expected_diff, rtol=1e-10)
+
+
+class TestCellCartesianGradient:
+    """Test cell gradient calculations in CellCartesianPES."""
+
+    def test_cell_gradient_numerical(self):
+        """Test cell gradient matches numerical finite difference for bulk Cu."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        pes = CellCartesianPES(atoms)
+
+        # Get analytical gradient
+        _, g = pes.eval()
+        g_cell = g[pes.n_cart:]  # Cell part of gradient
+
+        # Numerical gradient via finite difference on cell parameters
+        delta = 1e-6
+        x0 = pes.get_x()
+        g_cell_numeric = np.zeros(pes.n_cell_dof)
+
+        for i in range(pes.n_cell_dof):
+            x_plus = x0.copy()
+            x_plus[pes.n_cart + i] += delta
+            pes.set_x(x_plus)
+            e_plus, _ = pes.eval()
+
+            x_minus = x0.copy()
+            x_minus[pes.n_cart + i] -= delta
+            pes.set_x(x_minus)
+            e_minus, _ = pes.eval()
+
+            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
+
+        pes.set_x(x0)
+
+        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
+
+    def test_cartesian_gradient_numerical(self):
+        """Test Cartesian gradient matches numerical finite difference."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        pes = CellCartesianPES(atoms)
+
+        # Get analytical gradient
+        _, g = pes.eval()
+        g_cart = g[:pes.n_cart]  # Cartesian part of gradient
+
+        # Numerical gradient via finite difference
+        delta = 1e-6
+        x0 = pes.get_x()
+        g_cart_numeric = np.zeros(pes.n_cart)
+
+        for i in range(pes.n_cart):
+            x_plus = x0.copy()
+            x_plus[i] += delta
+            pes.set_x(x_plus)
+            e_plus, _ = pes.eval()
+
+            x_minus = x0.copy()
+            x_minus[i] -= delta
+            pes.set_x(x_minus)
+            e_minus, _ = pes.eval()
+
+            g_cart_numeric[i] = (e_plus - e_minus) / (2 * delta)
+
+        pes.set_x(x0)
+
+        assert_allclose(g_cart, g_cart_numeric, atol=1e-4, rtol=1e-3)
 
 
 class TestSellaWithCellOptimization:
