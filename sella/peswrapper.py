@@ -962,13 +962,24 @@ class CellInternalPES(InternalPES):
             H_internal = P @ self.int.guess_hessian() @ P
             H0_full[:self.n_internal, :self.n_internal] = H_internal
 
-        # Cell block: use a larger diagonal guess
-        # Typical bulk moduli give Hessian elements of 50-100 eV for cell DOF
-        # Using log-deformation parameterization with exp_cell_factor scaling
+        # Cell block: use diagonal guess based on typical bulk moduli
+        # Higher values are more conservative (smaller initial steps)
+        # 70 eV is reasonable for metals; molecular systems may need less
         h0_cell = 70.0
         H0_full[self.n_internal:, self.n_internal:] = h0_cell * np.eye(self.n_cell_dof)
 
         self.set_H(H0_full, initialized=False)
+
+    def save(self):
+        """Save current state including cell."""
+        InternalPES.save(self)
+        self.savepoint['cell'] = self.atoms.get_cell().array.copy()
+
+    def restore(self):
+        """Restore saved state including cell."""
+        InternalPES.restore(self)
+        if 'cell' in self.savepoint:
+            self.atoms.set_cell(self.savepoint['cell'], scale_atoms=False)
 
     def get_x(self) -> np.ndarray:
         """Return combined internal coordinates + cell parameters.
