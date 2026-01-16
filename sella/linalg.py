@@ -344,14 +344,26 @@ class SparseInternalHessian(LinearOperator):
         self.vals = np.asarray(vals)
 
     def asarray(self) -> np.ndarray:
-        H = np.zeros((self.natoms, 3, self.natoms, 3))
-        # Vectorized: iterate over pairs but use vectorized assignment
+        H = np.zeros((self.natoms, self.natoms, 3, 3))
         idx = self.indices
         n = len(idx)
-        for a in range(n):
-            for b in range(n):
-                H[idx[a], :, idx[b], :] += self.vals[a, :, b, :]
-        return H.reshape(self.shape)
+        if n == 0:
+            return H.transpose(0, 2, 1, 3).reshape(self.shape)
+
+        # Create meshgrid of all (a, b) pairs and compute linear indices
+        idx_a, idx_b = np.meshgrid(idx, idx, indexing='ij')
+        linear_idx = idx_a * self.natoms + idx_b  # (n, n) linear indices
+
+        # H is (natoms, natoms, 3, 3) so H_flat[a*natoms+b] = H[a, b, :, :]
+        H_flat = H.reshape(self.natoms * self.natoms, 3, 3)
+        # vals has shape (n, 3, n, 3) - transpose to (n, n, 3, 3) before reshaping
+        vals_flat = self.vals.transpose(0, 2, 1, 3).reshape(n * n, 3, 3)
+
+        # Vectorized accumulation
+        np.add.at(H_flat, linear_idx.ravel(), vals_flat)
+
+        # Transpose back to (natoms, 3, natoms, 3) and reshape
+        return H.transpose(0, 2, 1, 3).reshape(self.shape)
 
     def _matvec(self, v: np.ndarray) -> np.ndarray:
         vi = v.reshape((self.natoms, 3))
