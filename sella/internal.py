@@ -2176,6 +2176,7 @@ class Internals(BaseInternals):
         self,
         nbond_cart_thr: int = 6,
         max_bonds: int = 20,
+        scale: float = 1.25,
     ) -> None:
         rcov = covalent_radii[self.atoms.numbers]
         nbonds = np.zeros(self.natoms, dtype=np.int32)
@@ -2189,7 +2190,6 @@ class Internals(BaseInternals):
             c10y[j, nbonds[j]] = i
             nbonds[j] += 1
 
-        scale = 1.25
         first_run = True
         while True:
             # use flood fill algorithm to count the number of disconnected
@@ -2205,11 +2205,15 @@ class Internals(BaseInternals):
             # are complete, and we can stop
             if nlabels == 1:
                 break
+
+            # Remove labels from atoms with no bonding partners.
+            # This must happen BEFORE the allow_fragments break, otherwise
+            # single atoms will retain fragment labels and cause rotation ICs
+            # to be incorrectly added to single-atom groups.
+            labels[nbonds == 0] = -1
+
             if self.allow_fragments and not first_run:
                 break
-
-            # remove labels from atoms with no bonding partners
-            labels[nbonds == 0] = -1
 
             for i, j in cwr(range(self.natoms), 2):
                 # do not add a bond between atoms belonging to the same
@@ -2394,7 +2398,16 @@ class Internals(BaseInternals):
         jac = self.jacobian()
         U, S, VT = np.linalg.svd(jac)
         ndeloc = np.sum(S > 1e-8)
-        ndof = 3 * (self.natoms + self.ndummies) - 6
+
+        # If TRICs (translations/rotations) are present, they span the full
+        # 3N DOF. Otherwise, 6 DOF are removed for global translation/rotation.
+        has_trics = (len(self.internals['translations']) > 0 or
+                     len(self.internals['rotations']) > 0)
+        if has_trics:
+            ndof = 3 * (self.natoms + self.ndummies)
+        else:
+            ndof = 3 * (self.natoms + self.ndummies) - 6
+
         if ndeloc != ndof:
             warnings.warn(
                 f'{ndeloc} coords found! Expected {ndof}.'
