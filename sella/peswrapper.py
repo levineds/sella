@@ -1,7 +1,7 @@
 from typing import Union, Callable
 
 import numpy as np
-from scipy.linalg import eigh
+from scipy.linalg import eigh, expm, logm
 from scipy.integrate import LSODA
 from ase import Atoms
 from ase.utils import basestring
@@ -337,7 +337,14 @@ class PES:
         else:
             ratio = df_actual / df_pred
 
-        self._update_H(dx_final, dg_actual)
+        # Only update Hessian if the step quality (ratio = actual/predicted energy change)
+        # is reasonable. Skip update when ratio indicates a poor step:
+        # - ratio <= 0.1: step was much worse than predicted (or went uphill)
+        # - ratio >= 3.0: prediction was very inaccurate
+        # Skipping bad updates prevents Hessian oscillation when optimizer alternates
+        # between overshooting in opposite directions.
+        if ratio is None or 0.1 < ratio < 3.0:
+            self._update_H(dx_final, dg_actual)
 
         if diag:
             if self.hessian_function is not None:
@@ -835,3 +842,547 @@ class InternalPES(PES):
         self.H.set_B(self._convert_cartesian_hessian_to_internal(
             self.hessian_function(self.atoms)
         ))
+
+
+# =============================================================================
+# Utility functions for cell optimization
+# =============================================================================
+
+def voigt_6_to_full_3x3_stress(stress_voigt: np.ndarray) -> np.ndarray:
+    """Convert 6-component Voigt stress to full 3x3 stress tensor.
+
+    ASE uses the convention: [xx, yy, zz, yz, xz, xy]
+    """
+    xx, yy, zz, yz, xz, xy = stress_voigt
+    return np.array([
+        [xx, xy, xz],
+        [xy, yy, yz],
+        [xz, yz, zz]
+    ])
+
+
+def full_3x3_to_voigt_6_stress(stress_3x3: np.ndarray) -> np.ndarray:
+    """Convert 3x3 stress tensor to 6-component Voigt notation."""
+    return np.array([
+        stress_3x3[0, 0],  # xx
+        stress_3x3[1, 1],  # yy
+        stress_3x3[2, 2],  # zz
+        stress_3x3[1, 2],  # yz
+        stress_3x3[0, 2],  # xz
+        stress_3x3[0, 1],  # xy
+    ])
+
+
+class CellInternalPES(InternalPES):
+    """Internal coordinate PES with unit cell optimization.
+
+    This class extends InternalPES to simultaneously optimize both internal
+    coordinates (bonds, angles, dihedrals) and the unit cell parameters.
+
+    The cell is parameterized using the log of the deformation gradient:
+        F = cell @ inv(orig_cell)
+        cell_params = logm(F) * exp_cell_factor
+
+    This parameterization ensures that:
+    1. The identity corresponds to zero cell parameters
+    2. Small deformations are approximately linear in the parameters
+    3. Large deformations are handled smoothly
+
+    Parameters
+    ----------
+    atoms : Atoms
+        ASE Atoms object with periodic boundary conditions.
+    internals : Internals
+        Internal coordinate system definition.
+    exp_cell_factor : float, optional
+        Scaling factor for cell parameterization. Default is number of atoms.
+    cell_mask : ndarray, optional
+        Boolean mask of shape (3, 3) indicating which cell DOF are free.
+        Default is all True (full cell optimization).
+    scalar_pressure : float, optional
+        External pressure in eV/Å³. Default is 0.
+    """
+
+    def __init__(
+        self,
+        atoms: Atoms,
+        internals: Internals,
+        *args,
+        exp_cell_factor: float = None,
+        cell_mask: np.ndarray = None,
+        scalar_pressure: float = 0.0,
+        H0: np.ndarray = None,
+        **kwargs
+    ):
+        # Store original cell as reference before any optimization
+        self.orig_cell = atoms.get_cell().array.copy()
+
+        # Cell parameterization scaling (like ASE's FrechetCellFilter)
+        if exp_cell_factor is None:
+            exp_cell_factor = float(len(atoms))
+        self.exp_cell_factor = exp_cell_factor
+
+        # Cell mask: which of the 9 cell matrix elements are free
+        if cell_mask is None:
+            cell_mask = np.ones((3, 3), dtype=bool)
+        self.cell_mask = np.asarray(cell_mask, dtype=bool).reshape((3, 3))
+        self.n_cell_dof = int(self.cell_mask.sum())
+
+        # External pressure
+        self.scalar_pressure = scalar_pressure
+
+        # Flag to control get_x behavior during parent initialization
+        # When True, get_x returns only internal coords (for parent __init__)
+        self._initializing = True
+        self.n_internal = None  # Will be set by parent
+
+        # Initialize parent class - this will set up internal coords
+        InternalPES.__init__(self, atoms, internals, *args, H0=H0, **kwargs)
+
+        # Now parent is initialized. Store internal-only dimension.
+        self.n_internal = self.dim  # Parent set dim to internal coords count
+
+        # Update dimension to include cell DOF
+        self.dim = self.n_internal + self.n_cell_dof
+
+        # Done initializing - now get_x returns full vector
+        self._initializing = False
+
+        # Create proper Hessian with correct dimensions
+        # Use block-diagonal structure: internal Hessian + cell Hessian
+        H_old = self.H.B if self.H is not None and self.H.B is not None else None
+
+        # Pad internal Hessian and add cell block
+        H0_full = np.zeros((self.dim, self.dim))
+        if H_old is not None:
+            H0_full[:self.n_internal, :self.n_internal] = H_old
+        else:
+            B = self.int.jacobian()
+            P = B @ np.linalg.pinv(B)
+            H_internal = P @ self.int.guess_hessian() @ P
+            H0_full[:self.n_internal, :self.n_internal] = H_internal
+
+        # Cell block: use a larger diagonal guess
+        # Typical bulk moduli give Hessian elements of 50-100 eV for cell DOF
+        # Using log-deformation parameterization with exp_cell_factor scaling
+        h0_cell = 70.0
+        H0_full[self.n_internal:, self.n_internal:] = h0_cell * np.eye(self.n_cell_dof)
+
+        self.set_H(H0_full, initialized=False)
+
+    def get_x(self) -> np.ndarray:
+        """Return combined internal coordinates + cell parameters.
+
+        During initialization (_initializing=True), returns only internal coords
+        to be compatible with parent class initialization.
+        """
+        q = self.int.calc()  # Internal coordinates
+
+        # During parent initialization, return only internal coords
+        if getattr(self, '_initializing', True):
+            return q
+
+        cell_params = self._masked_cell_params()  # Cell DOF
+        return np.concatenate([q, cell_params])
+
+    def _get_deformation_gradient(self) -> np.ndarray:
+        """Get current deformation gradient F = cell @ inv(orig_cell)."""
+        return self.atoms.get_cell().array @ np.linalg.inv(self.orig_cell)
+
+    def _get_log_deform(self) -> np.ndarray:
+        """Get log of deformation gradient, scaled by exp_cell_factor."""
+        F = self._get_deformation_gradient()
+        return logm(F).real * self.exp_cell_factor
+
+    def _set_cell_from_log_deform(self, log_deform_scaled: np.ndarray) -> None:
+        """Set cell from scaled log-deformation gradient."""
+        log_deform = log_deform_scaled / self.exp_cell_factor
+        F = expm(log_deform.real)
+        new_cell = self.orig_cell @ F.T
+        self.atoms.set_cell(new_cell, scale_atoms=False)
+
+    def _masked_cell_params(self) -> np.ndarray:
+        """Get cell parameters as flat array (only free DOF)."""
+        log_deform = self._get_log_deform()
+        return log_deform[self.cell_mask]
+
+    def _set_masked_cell_params(self, params: np.ndarray) -> None:
+        """Set cell from flat array of free DOF."""
+        log_deform = self._get_log_deform()
+        log_deform[self.cell_mask] = params
+        self._set_cell_from_log_deform(log_deform)
+
+    def set_x(self, target: np.ndarray):
+        """Set internal coordinates and cell parameters.
+
+        This is more complex than InternalPES.set_x because:
+        1. We first update the cell (which changes internal coord values)
+        2. Then update atomic positions to match target internal coords
+
+        Returns
+        -------
+        dx_initial, dx_final, g_par : tuple of np.ndarray
+            Displacement information for Hessian update.
+        """
+        x0 = self.get_x()
+        dx_initial = target - x0
+
+        # Split target into internal and cell parts
+        q_target = target[:self.n_internal]
+        cell_target = target[self.n_internal:]
+
+        # Get initial cell params
+        cell_params0 = self._masked_cell_params()
+
+        # Update cell
+        self._set_masked_cell_params(cell_target)
+
+        # If there are no internal coordinates, we're done
+        if self.n_internal == 0:
+            # Cell-only case: dx_final equals the cell displacement
+            dx_cell = cell_target - cell_params0
+            dx_final = dx_cell.copy()
+            g_final = np.zeros(self.n_cell_dof)
+            return dx_initial, dx_final, g_final
+
+        # Get initial gradient in Cartesian for internal coord update
+        g0 = np.linalg.lstsq(
+            self.int.jacobian(),
+            self.curr.get('g', np.zeros(self.n_internal))[:self.n_internal],
+            rcond=None,
+        )[0] if 'g' in self.curr and self.curr['g'] is not None else np.zeros(3 * len(self.atoms))
+
+        # Now update atomic positions to match internal coordinate target
+        # This is tricky: the internal coord values changed when cell changed
+        # We use the iterative stepper from parent class
+        if self.iterative_stepper:
+            res = self._set_x_iterative_internal(q_target)
+            if res is None:
+                res = self._set_x_ode_internal(q_target)
+        else:
+            res = self._set_x_ode_internal(q_target)
+
+        if res is None:
+            # Fallback: just do parent set_x ignoring cell
+            dx_int, _, g_int = InternalPES.set_x(self, q_target)
+            dx_final = np.concatenate([dx_int, cell_target - cell_params0])
+            g_final = np.concatenate([g_int, np.zeros(self.n_cell_dof)])
+        else:
+            dx_int_initial, dx_int_final, g_int = res
+            dx_final = np.concatenate([dx_int_final, cell_target - cell_params0])
+            g_final = np.concatenate([g_int, np.zeros(self.n_cell_dof)])
+
+        return dx_initial, dx_final, g_final
+
+    def _set_x_iterative_internal(self, q_target: np.ndarray, max_iter: int = 20):
+        """Iterative stepper for internal coords only (cell already updated)."""
+        pos0 = self.atoms.positions.copy()
+        dpos0 = self.dummies.positions.copy()
+        x0 = self.int.calc()
+        dx_initial = q_target - x0
+
+        g0 = np.linalg.lstsq(
+            self.int.jacobian(),
+            self.curr.get('g', np.zeros_like(dx_initial))[:self.n_internal]
+            if 'g' in self.curr and self.curr['g'] is not None
+            else np.zeros_like(dx_initial),
+            rcond=None,
+        )[0]
+
+        rms_prev = np.inf
+        initial_rms = None
+
+        for iteration in range(max_iter):
+            residual = self.int.wrap(q_target - self.int.calc())
+            rms = np.linalg.norm(residual) / np.sqrt(len(residual))
+
+            if initial_rms is None:
+                initial_rms = rms
+
+            if rms < 1e-8:
+                break
+
+            if rms > initial_rms * 2.0:
+                self.atoms.positions = pos0
+                self.dummies.positions = dpos0
+                return None
+
+            rms_prev = rms
+
+            dx = np.linalg.lstsq(
+                self.int.jacobian(),
+                residual,
+                rcond=None,
+            )[0].reshape((-1, 3))
+
+            self.atoms.positions += dx[:len(self.atoms)]
+            self.dummies.positions += dx[len(self.atoms):]
+
+            self.bad_int = self.int.check_for_bad_internals()
+            if self.bad_int is not None:
+                self.atoms.positions = pos0
+                self.dummies.positions = dpos0
+                self.bad_int = None
+                return None
+
+        final_residual = self.int.wrap(q_target - self.int.calc())
+        final_rms = np.linalg.norm(final_residual) / np.sqrt(len(dx_initial))
+        if final_rms > 1e-6:
+            self.atoms.positions = pos0
+            self.dummies.positions = dpos0
+            return None
+
+        dx_final = self.int.calc() - x0
+        g_final = self.int.jacobian() @ g0
+        return dx_initial, dx_final, g_final
+
+    def _set_x_ode_internal(self, q_target: np.ndarray):
+        """ODE-based stepper for internal coords only (cell already updated)."""
+        x0 = self.int.calc()
+        dx = q_target - x0
+        t0 = 0.
+        Binv = self._get_Binv()
+        self._ode_Binv = Binv
+
+        y0 = np.hstack((
+            self.apos.ravel(),
+            self.dpos.ravel(),
+            Binv @ dx,
+            Binv @ self.curr.get('g', np.zeros_like(dx))[:self.n_internal]
+            if 'g' in self.curr and self.curr['g'] is not None
+            else np.zeros(3 * (len(self.atoms) + len(self.dummies)))
+        ))
+        ode = LSODA(self._q_ode, t0, y0, t_bound=1., atol=1e-6)
+
+        while ode.status == 'running':
+            ode.step()
+            y = ode.y
+            t0 = ode.t
+            self.bad_int = self.int.check_for_bad_internals()
+            if self.bad_int is not None:
+                break
+            if ode.nfev > 1000:
+                raise RuntimeError("Geometry update ODE is taking too long!")
+
+        if ode.status == 'failed':
+            raise RuntimeError("Geometry update ODE failed to converge!")
+
+        nxa = 3 * len(self.atoms)
+        nxd = 3 * len(self.dummies)
+        y = y.reshape((3, nxa + nxd))
+        self.atoms.positions = y[0, :nxa].reshape((-1, 3))
+        self.dummies.positions = y[0, nxa:].reshape((-1, 3))
+        B = self.int.jacobian()
+        dx_final = t0 * B @ y[1]
+        g_final = B @ y[2]
+        dx_initial = t0 * dx
+        return dx_initial, dx_final, g_final
+
+    def eval(self) -> tuple:
+        """Evaluate energy and combined gradient (internal + cell)."""
+        self.neval += 1
+        f = self.atoms.get_potential_energy()
+
+        # Add pressure contribution: H = E + P*V
+        if self.scalar_pressure != 0.0:
+            f += self.scalar_pressure * self.atoms.get_volume()
+
+        # Atomic forces -> internal coordinate gradient
+        forces = self.atoms.get_forces()
+        g_cart = -forces.ravel()
+        Binv = self._get_Binv()
+        g_internal = g_cart @ Binv[:len(g_cart)]
+
+        # Stress tensor -> cell gradient
+        stress = self.atoms.get_stress()  # 6-component Voigt, eV/Å³
+        g_cell = self._stress_to_cell_gradient(stress)
+
+        self.write_traj()
+        return f, np.concatenate([g_internal, g_cell])
+
+    def _stress_to_cell_gradient(self, stress_voigt: np.ndarray) -> np.ndarray:
+        """Convert stress tensor to gradient w.r.t. cell parameters.
+
+        Following ASE's FrechetCellFilter formulation.
+
+        ASE cell force = virial / cell_factor where virial = -V * stress
+        Since Sella uses gradients = -forces, we have:
+        gradient = -cell_force = -virial / cell_factor = V * stress / cell_factor
+        """
+        volume = self.atoms.get_volume()
+        stress_3x3 = voigt_6_to_full_3x3_stress(stress_voigt)
+
+        # Add external pressure contribution
+        if self.scalar_pressure != 0.0:
+            stress_3x3 += self.scalar_pressure * np.eye(3)
+
+        # Gradient w.r.t. cell = V * stress (positive because gradient = -force)
+        # This is the opposite sign from ASE's "force" = -V * stress
+        g_cell_3x3 = volume * stress_3x3
+
+        # Apply cell mask
+        g_cell_masked = g_cell_3x3 * self.cell_mask
+
+        # Scale by exp_cell_factor (inverse of the scaling in get_x)
+        g_cell_full = g_cell_masked / self.exp_cell_factor
+
+        # Return only free DOF
+        return g_cell_full[self.cell_mask]
+
+    def get_g(self) -> np.ndarray:
+        """Get combined gradient (internal + cell)."""
+        self._update()
+        return self.curr['g'].copy()
+
+    def _update(self, feval: bool = True):
+        """Update current state including cell gradient."""
+        x = self.get_x()
+        new_point = True
+        if self.curr['x'] is not None and np.all(x == self.curr['x']):
+            if feval and self.curr['f'] is None:
+                new_point = False
+            else:
+                return False
+
+        if feval:
+            f, g = self.eval()
+        else:
+            f = None
+            g = None
+
+        if new_point:
+            self.last = self.curr.copy()
+
+        self.curr['x'] = x
+        self.curr['f'] = f
+        self.curr['g'] = g
+
+        # Update basis for internal coordinates
+        basis = self._calc_basis()
+        self._update_basis(basis)
+        return True
+
+    def _calc_basis(self, internal=None, cons=None):
+        """Calculate basis including cell DOF.
+
+        The cell DOF are treated as unconstrained additional coordinates.
+        """
+        # Get internal coordinate basis from parent
+        result = InternalPES._calc_basis(self, internal=internal, cons=cons)
+        drdx_int, Ucons_int, Unred_int, Ufree_int = result
+
+        # Extend to include cell DOF
+        n_int = drdx_int.shape[1]
+        n_total = n_int + self.n_cell_dof
+
+        # Cell DOF are not constrained, so they're all in Ufree
+        # drdx extended with zeros for cell columns
+        drdx = np.zeros((drdx_int.shape[0], n_total))
+        drdx[:, :n_int] = drdx_int
+
+        # Ucons stays the same (no cell constraints)
+        Ucons = np.zeros((n_total, Ucons_int.shape[1]))
+        Ucons[:n_int, :] = Ucons_int
+
+        # Unred extended with identity for cell DOF
+        Unred = np.zeros((n_total, Unred_int.shape[1] + self.n_cell_dof))
+        Unred[:n_int, :Unred_int.shape[1]] = Unred_int
+        Unred[n_int:, Unred_int.shape[1]:] = np.eye(self.n_cell_dof)
+
+        # Ufree extended with identity for cell DOF
+        Ufree = np.zeros((n_total, Ufree_int.shape[1] + self.n_cell_dof))
+        Ufree[:n_int, :Ufree_int.shape[1]] = Ufree_int
+        Ufree[n_int:, Ufree_int.shape[1]:] = np.eye(self.n_cell_dof)
+
+        return drdx, Ucons, Unred, Ufree
+
+    def converged(self, fmax: float, smax: float = None, cmax: float = 1e-5):
+        """Check convergence of forces and stress.
+
+        Parameters
+        ----------
+        fmax : float
+            Maximum force tolerance (eV/Å).
+        smax : float, optional
+            Maximum stress tolerance. If None, uses fmax.
+        cmax : float, optional
+            Constraint residual tolerance.
+
+        Returns
+        -------
+        conv : bool
+            True if converged.
+        fmax_actual : float
+            Maximum force.
+        cmax_actual : float
+            Constraint residual norm.
+        smax_actual : float
+            Maximum stress gradient.
+        """
+        if smax is None:
+            smax = fmax
+
+        # Force convergence (project out constraints)
+        g = self.get_g()
+        g_internal = g[:self.n_internal]
+        Ufree_int = self.curr['Ufree'][:self.n_internal, :self.curr['Ufree'].shape[1] - self.n_cell_dof]
+        g_proj = Ufree_int @ Ufree_int.T @ g_internal
+
+        # Convert to Cartesian for force norm
+        B = self.int.jacobian()
+        g_cart = (g_proj @ B).reshape((-1, 3))
+        fmax_actual = np.linalg.norm(g_cart, axis=1).max()
+
+        # Stress convergence
+        g_cell = g[self.n_internal:]
+        smax_actual = np.abs(g_cell).max() if len(g_cell) > 0 else 0.0
+
+        # Constraint residual
+        cmax_actual = np.linalg.norm(self.get_res())
+
+        conv = (fmax_actual < fmax) and (smax_actual < smax) and (cmax_actual < cmax)
+        return conv, fmax_actual, cmax_actual, smax_actual
+
+    def get_projected_forces(self) -> np.ndarray:
+        """Returns Nx3 array of atomic forces orthogonal to constraints."""
+        g = self.get_g()
+        g_internal = g[:self.n_internal]
+        Ufree = self.get_Ufree()
+        Ufree_int = Ufree[:self.n_internal, :]
+        B = self.int.jacobian()
+        return -((Ufree_int @ Ufree_int.T) @ g_internal @ B).reshape((-1, 3))
+
+    def get_drdx(self):
+        """Get constraint Jacobian extended for cell DOF.
+
+        The constraint Jacobian from the parent class only has columns for
+        internal coordinates. We extend it with zero columns for cell DOF
+        since there are no constraints on the cell.
+        """
+        # Get internal constraint Jacobian from parent
+        drdx_int = InternalPES.get_drdx(self)
+
+        # Extend with zeros for cell DOF
+        n_cons = drdx_int.shape[0]
+        drdx = np.zeros((n_cons, self.dim))
+        drdx[:, :self.n_internal] = drdx_int
+
+        return drdx
+
+    def get_Hc(self):
+        """Get constraint Hessian extended for cell DOF.
+
+        The constraint Hessian from InternalPES has shape (n_internal, n_internal).
+        We extend it with zeros to (dim, dim) since there are no constraints
+        on cell DOF.
+        """
+        # Get internal constraint Hessian from parent
+        Hc_int = InternalPES.get_Hc(self)
+
+        # Extend to full dimension
+        Hc = np.zeros((self.dim, self.dim))
+        n_int = self.n_internal
+        if Hc_int.size > 0:
+            Hc[:n_int, :n_int] = Hc_int
+
+        return Hc

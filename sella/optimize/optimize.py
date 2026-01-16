@@ -11,7 +11,7 @@ from ase.utils import basestring
 from ase.io.trajectory import Trajectory
 
 from .restricted_step import get_restricted_step
-from sella.peswrapper import PES, InternalPES
+from sella.peswrapper import PES, InternalPES, CellInternalPES
 from sella.internal import Internals, Constraints
 
 _default_kwargs = dict(
@@ -64,12 +64,57 @@ class Sella(Optimizer):
         nsteps_per_diag: int = 3,
         diag_every_n: Optional[int] = None,
         hessian_function: Optional[Callable[[Atoms], np.ndarray]] = None,
+        optimize_cell: bool = False,
+        cell_mask: np.ndarray = None,
+        exp_cell_factor: float = None,
+        scalar_pressure: float = 0.0,
+        smax: float = None,
         **kwargs
     ):
+        """Initialize Sella optimizer.
+
+        Parameters
+        ----------
+        atoms : Atoms
+            ASE Atoms object to optimize.
+        optimize_cell : bool, optional
+            If True, optimize unit cell parameters along with atomic positions.
+            Requires internal=True and order=0. Default is False.
+        cell_mask : ndarray, optional
+            Boolean mask of shape (3, 3) indicating which cell DOF are free.
+            Default is all True (full cell optimization).
+        exp_cell_factor : float, optional
+            Scaling factor for cell parameterization. Default is number of atoms.
+        scalar_pressure : float, optional
+            External pressure in eV/Å³ for cell optimization. Default is 0.
+        smax : float, optional
+            Maximum stress tolerance for convergence when optimize_cell=True.
+            If None, uses fmax.
+        """
         if order == 0:
             default = _default_kwargs['minimum']
         else:
             default = _default_kwargs['saddle']
+
+        # Validate cell optimization parameters
+        self.optimize_cell = optimize_cell
+        self.smax = smax
+        if optimize_cell:
+            if order != 0:
+                raise ValueError(
+                    "Cell optimization is only supported for minima (order=0), "
+                    f"got order={order}."
+                )
+            if not internal:
+                raise ValueError(
+                    "Cell optimization requires internal=True. "
+                    "Set internal=True to enable cell optimization."
+                )
+            if not np.any(atoms.pbc):
+                raise ValueError(
+                    "Cell optimization requires periodic boundary conditions. "
+                    "Set atoms.pbc = True for periodic systems."
+                )
 
         if trajectory is not None:
             if isinstance(trajectory, basestring):
@@ -89,6 +134,10 @@ class Sella(Optimizer):
             v0,
             internal,
             hessian_function,
+            optimize_cell=optimize_cell,
+            cell_mask=cell_mask,
+            exp_cell_factor=exp_cell_factor,
+            scalar_pressure=scalar_pressure,
             **kwargs
         )
 
@@ -141,6 +190,10 @@ class Sella(Optimizer):
         v0: np.ndarray = None,
         internal: Union[bool, Internals] = False,
         hessian_function: Optional[Callable[[Atoms], np.ndarray]] = None,
+        optimize_cell: bool = False,
+        cell_mask: np.ndarray = None,
+        exp_cell_factor: float = None,
+        scalar_pressure: float = 0.0,
         **kwargs
     ):
         if internal:
@@ -158,16 +211,33 @@ class Sella(Optimizer):
                 internal = Internals(atoms, cons=constraints)
             self.internal = internal.copy()
             self.constraints = None
-            self.pes = InternalPES(
-                atoms,
-                internals=internal,
-                trajectory=trajectory,
-                eta=eta,
-                v0=v0,
-                auto_find_internals=auto_find_internals,
-                hessian_function=hessian_function,
-                **kwargs
-            )
+
+            if optimize_cell:
+                # Use CellInternalPES for combined internal + cell optimization
+                self.pes = CellInternalPES(
+                    atoms,
+                    internals=internal,
+                    trajectory=trajectory,
+                    eta=eta,
+                    v0=v0,
+                    auto_find_internals=auto_find_internals,
+                    hessian_function=hessian_function,
+                    exp_cell_factor=exp_cell_factor,
+                    cell_mask=cell_mask,
+                    scalar_pressure=scalar_pressure,
+                    **kwargs
+                )
+            else:
+                self.pes = InternalPES(
+                    atoms,
+                    internals=internal,
+                    trajectory=trajectory,
+                    eta=eta,
+                    v0=v0,
+                    auto_find_internals=auto_find_internals,
+                    hessian_function=hessian_function,
+                    **kwargs
+                )
         else:
             self.internal = None
             if constraints is None:
@@ -262,23 +332,45 @@ class Sella(Optimizer):
             self.rho = 1.
 
     def converged(self, forces=None):
-        return self.pes.converged(self.fmax)[0]
+        # fmax might be None if converged() is called before run()
+        fmax = getattr(self, 'fmax', None) or 0.05  # Default threshold
+        if self.optimize_cell:
+            smax = self.smax if self.smax is not None else fmax
+            return self.pes.converged(fmax, smax=smax)[0]
+        return self.pes.converged(fmax)[0]
 
     def log(self, forces=None):
         if self.logfile is None:
             return
-        _, fmax, cmax = self.pes.converged(self.fmax)
-        e = self.pes.get_f()
-        T = strftime("%H:%M:%S", localtime())
-        name = self.__class__.__name__
-        buf = " " * len(name)
-        if self.nsteps == 0:
-            self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
-                               "{:>12s} {:>12s}\n"
-                               .format("Step", "Time", "Energy", "fmax",
-                                       "cmax", "rtrust", "rho"))
-        self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
-                           "{:>12.4f} {:>12.4f}\n"
-                           .format(name, self.nsteps, T, e, fmax, cmax,
-                                   self.delta, self.rho))
+        if self.optimize_cell:
+            smax = self.smax if self.smax is not None else self.fmax
+            _, fmax, cmax, smax_actual = self.pes.converged(self.fmax, smax=smax)
+            e = self.pes.get_f()
+            T = strftime("%H:%M:%S", localtime())
+            name = self.__class__.__name__
+            buf = " " * len(name)
+            if self.nsteps == 0:
+                self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
+                                   "{:>12s} {:>12s} {:>12s}\n"
+                                   .format("Step", "Time", "Energy", "fmax",
+                                           "smax", "cmax", "rtrust", "rho"))
+            self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
+                               "{:>12.4f} {:>12.4f} {:>12.4f}\n"
+                               .format(name, self.nsteps, T, e, fmax, smax_actual,
+                                       cmax, self.delta, self.rho))
+        else:
+            _, fmax, cmax = self.pes.converged(self.fmax)
+            e = self.pes.get_f()
+            T = strftime("%H:%M:%S", localtime())
+            name = self.__class__.__name__
+            buf = " " * len(name)
+            if self.nsteps == 0:
+                self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
+                                   "{:>12s} {:>12s}\n"
+                                   .format("Step", "Time", "Energy", "fmax",
+                                           "cmax", "rtrust", "rho"))
+            self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
+                               "{:>12.4f} {:>12.4f}\n"
+                               .format(name, self.nsteps, T, e, fmax, cmax,
+                                       self.delta, self.rho))
         self.logfile.flush()

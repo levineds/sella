@@ -178,7 +178,7 @@ class MaxInternalStep(BaseRestrictedStep):
     synonyms = ['mis', 'max internal step']
 
     def __init__(
-        self, pes, *args, wx=1., wb=1., wa=1., wd=1., wo=1., **kwargs
+        self, pes, *args, wx=1., wb=1., wa=1., wd=1., wo=1., wc=1., **kwargs
     ):
         if pes.int is None:
             raise ValueError(
@@ -190,6 +190,7 @@ class MaxInternalStep(BaseRestrictedStep):
         self.wa = wa
         self.wd = wd
         self.wo = wo
+        self.wc = wc  # Weight for cell DOF
         BaseRestrictedStep.__init__(self, pes, *args, **kwargs)
 
     def cons(self, s, dsda=None):
@@ -201,6 +202,10 @@ class MaxInternalStep(BaseRestrictedStep):
             + [self.wo] * self.pes.int.nother
             + [self.wx] * self.pes.int.nrotations
         )
+        # Add cell DOF weights if present
+        n_cell_dof = getattr(self.pes, 'n_cell_dof', 0)
+        if n_cell_dof > 0:
+            w = np.concatenate([w, [self.wc] * n_cell_dof])
         assert len(w) == len(s)
 
         sw = np.abs(s * w)

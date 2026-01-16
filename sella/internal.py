@@ -132,6 +132,56 @@ _angle_hvp_batched = jit(vmap(_angle_hvp_single, in_axes=(0, 0, 0)))
 _dihedral_hvp_batched = jit(vmap(_dihedral_hvp_single, in_axes=(0, 0, 0)))
 
 
+# =============================================================================
+# Cell-derivative functions for unit cell optimization
+# =============================================================================
+# These compute derivatives of internal coordinates with respect to cell matrix.
+# Used for coupled atomic + cell optimization in periodic systems.
+#
+# The chain rule is: d(coord)/d(cell) = d(coord)/d(tvec) @ d(tvec)/d(cell)
+# Since tvec = ncvec @ cell, we have d(tvec)/d(cell) = ncvec (Kronecker structure)
+# =============================================================================
+
+def _bond_with_cell(pos: jnp.ndarray, ncvec: jnp.ndarray, cell: jnp.ndarray) -> float:
+    """Bond length with cell as explicit parameter for autodiff."""
+    tvec = ncvec @ cell  # (1, 3) @ (3, 3) -> (1, 3)
+    return jnp.linalg.norm(pos[1] - pos[0] + tvec[0])
+
+
+def _angle_with_cell(pos: jnp.ndarray, ncvec: jnp.ndarray, cell: jnp.ndarray) -> float:
+    """Angle with cell as explicit parameter for autodiff."""
+    tvec = ncvec @ cell  # (2, 3) @ (3, 3) -> (2, 3)
+    dx1 = -(pos[1] - pos[0] + tvec[0])
+    dx2 = pos[2] - pos[1] + tvec[1]
+    cos_angle = dx1 @ dx2 / (jnp.linalg.norm(dx1) * jnp.linalg.norm(dx2))
+    cos_angle = jnp.clip(cos_angle, -1.0, 1.0)
+    return jnp.arccos(cos_angle)
+
+
+def _dihedral_with_cell(pos: jnp.ndarray, ncvec: jnp.ndarray, cell: jnp.ndarray) -> float:
+    """Dihedral angle with cell as explicit parameter for autodiff."""
+    tvec = ncvec @ cell  # (3, 3) @ (3, 3) -> (3, 3)
+    dx1 = pos[1] - pos[0] + tvec[0]
+    dx2 = pos[2] - pos[1] + tvec[1]
+    dx3 = pos[3] - pos[2] + tvec[2]
+    numer = dx2 @ jnp.cross(jnp.cross(dx1, dx2), jnp.cross(dx2, dx3))
+    denom = jnp.linalg.norm(dx2) * jnp.cross(dx1, dx2) @ jnp.cross(dx2, dx3)
+    return jnp.arctan2(numer, denom)
+
+
+# Single-coordinate cell gradients: output shape (3, 3) for d(coord)/d(cell)
+_bond_cell_grad_single = jit(grad(_bond_with_cell, argnums=2))
+_angle_cell_grad_single = jit(grad(_angle_with_cell, argnums=2))
+_dihedral_cell_grad_single = jit(grad(_dihedral_with_cell, argnums=2))
+
+# Batched cell gradients: input (n_coords, n_atoms, 3), (n_coords, n_vecs, 3), (3, 3)
+# Output: (n_coords, 3, 3)
+# Note: cell is NOT batched (same cell for all coords), so in_axes=(0, 0, None)
+_bond_cell_grad_batched = jit(vmap(_bond_cell_grad_single, in_axes=(0, 0, None)))
+_angle_cell_grad_batched = jit(vmap(_angle_cell_grad_single, in_axes=(0, 0, None)))
+_dihedral_cell_grad_batched = jit(vmap(_dihedral_cell_grad_single, in_axes=(0, 0, None)))
+
+
 IVec = Tuple[int, int, int]
 
 
@@ -374,6 +424,31 @@ class Internal(Coordinate):
         )
         return np.array(self._eval2(atoms.positions[self.indices], tvecs))
 
+    @staticmethod
+    def _eval_cell_grad(
+        pos: jnp.ndarray, ncvecs: jnp.ndarray, cell: jnp.ndarray
+    ) -> jnp.ndarray:
+        """Compute gradient of coordinate with respect to cell matrix.
+
+        Must be overridden in subclasses (Bond, Angle, Dihedral).
+        Returns shape (3, 3) for d(coord)/d(cell).
+        """
+        raise NotImplementedError
+
+    def calc_cell_gradient(self, atoms: Atoms) -> np.ndarray:
+        """Compute gradient of this coordinate w.r.t. cell matrix.
+
+        Returns:
+            np.ndarray: Shape (3, 3) array of d(coord)/d(cell[i,j])
+        """
+        ncvecs = jnp.asarray(self.kwargs['ncvecs'], dtype=np.float64)
+        cell = jnp.asarray(
+            atoms.cell.array if hasattr(atoms.cell, 'array') else np.asarray(atoms.cell),
+            dtype=np.float64
+        )
+        pos = jnp.asarray(atoms.positions[self.indices], dtype=np.float64)
+        return np.array(self._eval_cell_grad(pos, ncvecs, cell))
+
 
 def _translation(
     pos: jnp.ndarray,
@@ -569,6 +644,7 @@ class Bond(Internal):
     _eval0 = staticmethod(jit(_bond))
     _eval1 = staticmethod(_gradient(_bond))
     _eval2 = staticmethod(_hessian(_bond))
+    _eval_cell_grad = staticmethod(_bond_cell_grad_single)
 
     def calc_vec(self, atoms: Atoms) -> np.ndarray:
         tvecs = np.asarray(
@@ -594,6 +670,7 @@ class Angle(Internal):
     _eval0 = staticmethod(jit(_angle))
     _eval1 = staticmethod(_gradient(_angle))
     _eval2 = staticmethod(_hessian(_angle))
+    _eval_cell_grad = staticmethod(_angle_cell_grad_single)
 
 
 def _dihedral(
@@ -613,6 +690,7 @@ class Dihedral(Internal):
     _eval0 = staticmethod(jit(_dihedral))
     _eval1 = staticmethod(_gradient(_dihedral))
     _eval2 = staticmethod(_hessian(_dihedral))
+    _eval_cell_grad = staticmethod(_dihedral_cell_grad_single)
 
 
 Bond.union = Angle
@@ -955,6 +1033,42 @@ class BaseInternals:
 
         return result
 
+    def _compute_batched_cell_gradients(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
+        """Compute all internal coordinate cell gradients using vectorized operations.
+
+        Returns dict mapping coord type to cell gradient arrays.
+        Each gradient has shape (n_coords, 3, 3) for d(coord)/d(cell).
+        """
+        self._build_batched_arrays()
+        cell_jax = jnp.asarray(cell, dtype=np.float64)
+        result = {}
+
+        # Bonds - need positions and ncvecs (not tvecs) for cell gradient
+        if len(self._bond_indices) > 0:
+            bond_pos = jnp.asarray(positions[self._bond_indices], dtype=np.float64)
+            bond_ncvecs = jnp.asarray(self._bond_ncvecs, dtype=np.float64)
+            result['bonds'] = np.asarray(_bond_cell_grad_batched(bond_pos, bond_ncvecs, cell_jax))
+        else:
+            result['bonds'] = np.empty((0, 3, 3))
+
+        # Angles
+        if len(self._angle_indices) > 0:
+            angle_pos = jnp.asarray(positions[self._angle_indices], dtype=np.float64)
+            angle_ncvecs = jnp.asarray(self._angle_ncvecs, dtype=np.float64)
+            result['angles'] = np.asarray(_angle_cell_grad_batched(angle_pos, angle_ncvecs, cell_jax))
+        else:
+            result['angles'] = np.empty((0, 3, 3))
+
+        # Dihedrals
+        if len(self._dihedral_indices) > 0:
+            dihedral_pos = jnp.asarray(positions[self._dihedral_indices], dtype=np.float64)
+            dihedral_ncvecs = jnp.asarray(self._dihedral_ncvecs, dtype=np.float64)
+            result['dihedrals'] = np.asarray(_dihedral_cell_grad_batched(dihedral_pos, dihedral_ncvecs, cell_jax))
+        else:
+            result['dihedrals'] = np.empty((0, 3, 3))
+
+        return result
+
     def copy(self) -> 'BaseInternals':
         raise NotImplementedError
 
@@ -1107,6 +1221,92 @@ class BaseInternals:
                 row += 1
 
         return B.reshape((n_active, 3 * n_atoms))
+
+    def cell_jacobian(self) -> np.ndarray:
+        """Compute Jacobian of internal coordinates with respect to cell matrix.
+
+        Returns:
+            np.ndarray: Shape (n_active_coords, 9) matrix where each row is
+                        the flattened d(coord)/d(cell) gradient.
+
+        Note:
+            - Translations, rotations, and other non-periodic coordinates have
+              zero cell derivatives (they don't depend on the cell).
+            - Only bonds, angles, and dihedrals with non-zero ncvecs have
+              non-zero cell derivatives.
+        """
+        self._cache_check()
+
+        if 'cell_jacobian' not in self._cache:
+            positions = self.all_positions
+            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+
+            # Compute batched cell gradients for bonds, angles, dihedrals
+            cell_grads = self._compute_batched_cell_gradients(positions, cell)
+            self._cache['cell_jacobian_batched'] = cell_grads
+            self._cache['cell_jacobian'] = object()
+
+        cell_grads = self._cache['cell_jacobian_batched']
+
+        # Get counts for each type
+        n_trans = len(self.internals['translations'])
+        n_bonds = len(self.internals['bonds'])
+        n_angles = len(self.internals['angles'])
+        n_dihedrals = len(self.internals['dihedrals'])
+        n_other = len(self.internals['other'])
+        n_rot = len(self.internals['rotations'])
+
+        # Build active masks per type
+        active_mask = self._active_mask
+        start = 0
+        trans_active = active_mask[start:start+n_trans]
+        start += n_trans
+        bonds_active = active_mask[start:start+n_bonds]
+        start += n_bonds
+        angles_active = active_mask[start:start+n_angles]
+        start += n_angles
+        dihedrals_active = active_mask[start:start+n_dihedrals]
+        start += n_dihedrals
+        other_active = active_mask[start:start+n_other]
+        start += n_other
+        rot_active = active_mask[start:start+n_rot]
+
+        n_active = sum(active_mask)
+        B_cell = np.zeros((n_active, 3, 3))
+        row = 0
+
+        # Translations have zero cell derivatives (they're CoM positions)
+        row += sum(trans_active)
+
+        # Bonds
+        bonds_active_arr = np.array(bonds_active, dtype=bool)
+        n_active_bonds = bonds_active_arr.sum()
+        if n_active_bonds > 0:
+            B_cell[row:row+n_active_bonds] = cell_grads['bonds'][bonds_active_arr]
+            row += n_active_bonds
+
+        # Angles
+        angles_active_arr = np.array(angles_active, dtype=bool)
+        n_active_angles = angles_active_arr.sum()
+        if n_active_angles > 0:
+            B_cell[row:row+n_active_angles] = cell_grads['angles'][angles_active_arr]
+            row += n_active_angles
+
+        # Dihedrals
+        dihedrals_active_arr = np.array(dihedrals_active, dtype=bool)
+        n_active_dihedrals = dihedrals_active_arr.sum()
+        if n_active_dihedrals > 0:
+            B_cell[row:row+n_active_dihedrals] = cell_grads['dihedrals'][dihedrals_active_arr]
+            row += n_active_dihedrals
+
+        # Other has zero cell derivatives (custom coordinates, not periodic)
+        row += sum(other_active)
+
+        # Rotations have zero cell derivatives
+        row += sum(rot_active)
+
+        # Flatten cell matrix to 9-element vector (row-major order)
+        return B_cell.reshape((n_active, 9))
 
     def hessian(self) -> np.ndarray:
         """Calculates the Hessian matrix for each internal coordinate using vectorized operations."""
