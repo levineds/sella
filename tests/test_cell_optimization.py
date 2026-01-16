@@ -360,5 +360,173 @@ class TestVoigtConversion:
         assert_allclose(stress_3x3, stress_3x3.T)
 
 
+class TestStressTensor:
+    """Test stress tensor calculations for cell optimization."""
+
+    def test_stress_changes_with_strain_inorganic(self):
+        """Test that stress changes when cell is strained for bulk Cu."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+        stress_ref = atoms.get_stress()
+
+        # Strain the cell
+        atoms_strained = bulk('Cu', 'fcc', a=3.8)  # Different lattice constant
+        atoms_strained.calc = EMT()
+        stress_strained = atoms_strained.get_stress()
+
+        # Stress should change
+        assert not np.allclose(stress_ref, stress_strained)
+
+        # Stress should be finite
+        assert np.all(np.isfinite(stress_ref))
+        assert np.all(np.isfinite(stress_strained))
+
+    def test_stress_finite_molecular(self):
+        """Test stress is finite for molecular system (CH4 in periodic box)."""
+        # Create CH4 in a periodic box
+        mol = molecule('CH4')
+        mol.center(vacuum=4.0)
+        mol.pbc = True
+        mol.calc = EMT()
+
+        # Should be able to get stress without error
+        stress_voigt = mol.get_stress()
+        assert len(stress_voigt) == 6
+        assert np.all(np.isfinite(stress_voigt))
+
+
+class TestCellGradient:
+    """Test cell gradient calculations in CellInternalPES."""
+
+    def test_cell_gradient_numerical_inorganic(self):
+        """Test cell gradient matches numerical finite difference for bulk Cu."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        internals = Internals(atoms)
+        pes = CellInternalPES(atoms, internals)
+
+        # Get analytical gradient
+        _, g = pes.eval()
+        g_cell = g[pes.n_internal:]  # Cell part of gradient
+
+        # Numerical gradient via finite difference on cell parameters
+        delta = 1e-6
+        x0 = pes.get_x()
+        g_cell_numeric = np.zeros(pes.n_cell_dof)
+
+        for i in range(pes.n_cell_dof):
+            x_plus = x0.copy()
+            x_plus[pes.n_internal + i] += delta
+            pes.set_x(x_plus)
+            e_plus, _ = pes.eval()
+
+            x_minus = x0.copy()
+            x_minus[pes.n_internal + i] -= delta
+            pes.set_x(x_minus)
+            e_minus, _ = pes.eval()
+
+            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
+
+        pes.set_x(x0)
+
+        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
+
+    def test_cell_gradient_shape_molecular(self):
+        """Test cell gradient has correct shape for molecular system."""
+        mol = molecule('H2O')
+        mol.center(vacuum=3.5)
+        mol.pbc = True
+        mol.calc = EMT()
+
+        internals = Internals(mol)
+        internals.find_all_bonds()
+        internals.find_all_angles()
+        pes = CellInternalPES(mol, internals)
+
+        _, g = pes.eval()
+
+        # Gradient should have n_internal + n_cell_dof components
+        assert len(g) == pes.n_internal + pes.n_cell_dof
+
+        # All components should be finite
+        assert np.all(np.isfinite(g))
+
+
+class TestCellConstraints:
+    """Test cell optimization with various constraints."""
+
+    def test_hydrostatic_only_dof_count(self):
+        """Test that hydrostatic constraint gives correct number of DOF."""
+        atoms = bulk('Cu', 'fcc', a=3.8)
+        atoms.calc = EMT()
+
+        # Only allow diagonal elements
+        cell_mask = np.eye(3, dtype=bool)
+
+        opt = Sella(
+            atoms,
+            internal=True,
+            order=0,
+            optimize_cell=True,
+            cell_mask=cell_mask,
+            logfile=None,
+        )
+
+        # Check that only 3 cell DOF (diagonal elements)
+        assert opt.pes.n_cell_dof == 3
+
+    def test_isotropic_scaling(self):
+        """Test cell optimization with isotropic scaling only (1 DOF)."""
+        atoms = bulk('Cu', 'fcc', a=3.8)
+        atoms.calc = EMT()
+
+        # Only allow uniform scaling (first diagonal element)
+        cell_mask = np.zeros((3, 3), dtype=bool)
+        cell_mask[0, 0] = True
+
+        opt = Sella(
+            atoms,
+            internal=True,
+            order=0,
+            optimize_cell=True,
+            cell_mask=cell_mask,
+            logfile=None,
+        )
+
+        assert opt.pes.n_cell_dof == 1
+
+    def test_no_shear_mask(self):
+        """Test that shear components can be masked out."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        # Allow all 9 components (full cell optimization)
+        full_mask = np.ones((3, 3), dtype=bool)
+        opt_full = Sella(
+            atoms.copy(),
+            internal=True,
+            order=0,
+            optimize_cell=True,
+            cell_mask=full_mask,
+            logfile=None,
+        )
+        atoms.calc = EMT()  # Reset
+
+        # Allow only diagonal (no shear)
+        diag_mask = np.eye(3, dtype=bool)
+        opt_diag = Sella(
+            atoms,
+            internal=True,
+            order=0,
+            optimize_cell=True,
+            cell_mask=diag_mask,
+            logfile=None,
+        )
+
+        assert opt_full.pes.n_cell_dof == 9
+        assert opt_diag.pes.n_cell_dof == 3
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
