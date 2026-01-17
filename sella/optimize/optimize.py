@@ -443,3 +443,100 @@ class Sella(Optimizer):
         if (hasattr(self.logfile, 'flush') and
                 type(self.logfile).__name__ != 'Log'):
             self.logfile.flush()
+
+    def run_alternating(
+        self,
+        fmax: float = 0.05,
+        smax: float = None,
+        steps_per_phase: int = 50,
+        max_cycles: int = 20,
+    ):
+        """Run alternating optimization: internal DOFs, then cell, repeat.
+
+        This can help when simultaneous optimization of internal coordinates
+        and cell parameters leads to poor convergence due to coupling issues.
+
+        Parameters
+        ----------
+        fmax : float
+            Force convergence criterion (eV/Å).
+        smax : float
+            Stress convergence criterion (eV/Å³). Defaults to fmax.
+        steps_per_phase : int
+            Maximum steps per optimization phase.
+        max_cycles : int
+            Maximum number of alternating cycles.
+
+        Returns
+        -------
+        converged : bool
+            True if optimization converged.
+        """
+        import numpy as np
+        from ase.constraints import FixAtoms
+
+        if not self.optimize_cell:
+            raise ValueError(
+                "run_alternating requires optimize_cell=True"
+            )
+
+        if smax is None:
+            smax = fmax
+
+        atoms = self.atoms
+
+        for cycle in range(max_cycles):
+            print(f"\n{'='*60}")
+            print(f"ALTERNATING CYCLE {cycle + 1}")
+            print(f"{'='*60}")
+
+            # Phase 1: Optimize internal coordinates with frozen cell
+            print(f"\n--- Phase 1: Optimizing atoms (cell frozen) ---")
+            atoms.constraints = []
+
+            dyn1 = Sella(
+                atoms,
+                order=self.ord,
+                internal=self.user_internal,
+                optimize_cell=False,  # Freeze cell
+                logfile=self.logfile,
+            )
+            dyn1.run(fmax=fmax, steps=steps_per_phase)
+
+            # Phase 2: Optimize cell with frozen atoms
+            print(f"\n--- Phase 2: Optimizing cell (atoms frozen) ---")
+            atoms.constraints = [FixAtoms(indices=range(len(atoms)))]
+
+            dyn2 = Sella(
+                atoms,
+                order=0,
+                internal=False,
+                optimize_cell=True,
+                refine_initial_hessian=1,
+                logfile=self.logfile,
+            )
+            dyn2.run(fmax=smax, steps=steps_per_phase)
+
+            # Remove constraints and check convergence
+            atoms.constraints = []
+
+            # Recompute forces and stress
+            forces = atoms.get_forces()
+            fmax_current = np.sqrt((forces**2).sum(axis=1).max())
+            stress = atoms.get_stress()
+            smax_current = np.abs(stress[:3]).max()  # xx, yy, zz components
+            energy = atoms.get_potential_energy()
+
+            print(f"\n--- Cycle {cycle + 1} Summary ---")
+            print(f"Energy: {energy:.6f} eV")
+            print(f"fmax:   {fmax_current:.4f} eV/Å")
+            print(f"smax:   {smax_current:.4f} eV/Å³")
+
+            if fmax_current < fmax and smax_current < smax:
+                print(f"\n{'='*60}")
+                print("CONVERGED!")
+                print(f"{'='*60}")
+                return True
+
+        print(f"\nMax cycles reached without convergence.")
+        return False
