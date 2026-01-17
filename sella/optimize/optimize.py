@@ -409,4 +409,3 @@ class Sella(Optimizer):
                                "{:>12.4f} {:>12.4f}\n"
                                .format(name, self.nsteps, T, e, fmax, cmax,
                                        self.delta, self.rho))
-        self.logfile.flush()
