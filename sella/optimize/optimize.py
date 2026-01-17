@@ -70,7 +70,8 @@ class Sella(Optimizer):
         scalar_pressure: float = 0.0,
         smax: float = None,
         allow_fragments: bool = False,
-        refine_initial_hessian: bool = False,
+        refine_initial_hessian: Union[bool, int] = False,
+        save_hessian: str = None,
         **kwargs
     ):
         """Initialize Sella optimizer.
@@ -96,12 +97,14 @@ class Sella(Optimizer):
             If True, allow disconnected molecular fragments when using internal
             coordinates. Adds translation and rotation coordinates (TRICs) for
             each fragment. Useful for molecular crystals. Default is False.
-        refine_initial_hessian : bool, optional
-            If True, compute cell-coordinate coupling and cell-cell Hessian blocks
-            via finite differences when optimize_cell=True. This requires additional
-            force evaluations (2 * n_cell_dof, typically 18) but can significantly
-            improve convergence for systems with strong cell-coordinate coupling.
-            Default is False.
+        refine_initial_hessian : bool or int, optional
+            Level of Hessian refinement via finite differences:
+            - False or 0: No refinement (default)
+            - True or 1: Refine cell-related blocks only (2 * n_cell_dof force calls)
+            - 2: Also refine translation/rotation blocks for molecular crystals
+              (adds 2 * n_tric force calls, where n_tric = n_fragments * 6)
+        save_hessian : str, optional
+            Path to save the initial Hessian as .npy file for analysis.
         """
         if order == 0:
             default = _default_kwargs['minimum']
@@ -149,6 +152,7 @@ class Sella(Optimizer):
             scalar_pressure=scalar_pressure,
             allow_fragments=allow_fragments,
             refine_initial_hessian=refine_initial_hessian,
+            save_hessian=save_hessian,
             **kwargs
         )
 
@@ -206,7 +210,8 @@ class Sella(Optimizer):
         exp_cell_factor: float = None,
         scalar_pressure: float = 0.0,
         allow_fragments: bool = False,
-        refine_initial_hessian: bool = False,
+        refine_initial_hessian: Union[bool, int] = False,
+        save_hessian: str = None,
         **kwargs
     ):
         if internal:
@@ -241,6 +246,7 @@ class Sella(Optimizer):
                     cell_mask=cell_mask,
                     scalar_pressure=scalar_pressure,
                     refine_initial_hessian=refine_initial_hessian,
+                    save_hessian=save_hessian,
                     **kwargs
                 )
             else:
@@ -272,6 +278,7 @@ class Sella(Optimizer):
                     cell_mask=cell_mask,
                     scalar_pressure=scalar_pressure,
                     refine_initial_hessian=refine_initial_hessian,
+                    save_hessian=save_hessian,
                     **kwargs
                 )
             else:

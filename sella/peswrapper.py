@@ -943,11 +943,24 @@ class CellInternalPES(InternalPES):
         exp_cell_factor: float = None,
         cell_mask: np.ndarray = None,
         scalar_pressure: float = 0.0,
-        refine_initial_hessian: bool = False,
+        refine_initial_hessian: Union[bool, int] = False,
         hessian_delta: float = 1e-5,
+        save_hessian: str = None,
         H0: np.ndarray = None,
         **kwargs
     ):
+        """Initialize CellInternalPES.
+
+        Parameters
+        ----------
+        refine_initial_hessian : bool or int
+            Level of Hessian refinement via finite differences:
+            - False or 0: No refinement (default)
+            - True or 1: Refine cell-related blocks only
+            - 2: Refine cell + translation/rotation blocks (for molecular crystals)
+        save_hessian : str, optional
+            Path to save the initial Hessian as .npy file for analysis.
+        """
         # Store original cell as reference before any optimization
         self.orig_cell = atoms.get_cell().array.copy()
 
@@ -996,20 +1009,37 @@ class CellInternalPES(InternalPES):
             H_internal = P @ self.int.guess_hessian() @ P
             H0_full[:self.n_internal, :self.n_internal] = H_internal
 
-        if refine_initial_hessian:
-            # Compute cell-related Hessian blocks via finite differences
-            # This gives us both the coupling (internal-cell) and cell-cell blocks
-            H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
-            # Fill in the cell columns
-            H0_full[:, self.n_internal:] = H_cell_cols
-            # Symmetrize: H[cell, :] = H[:, cell].T
-            H0_full[self.n_internal:, :] = H_cell_cols.T
+        # Convert bool to int for refinement level
+        if refine_initial_hessian is True:
+            refine_level = 1
+        elif refine_initial_hessian is False:
+            refine_level = 0
         else:
-            # Cell block: use diagonal guess based on typical bulk moduli
-            # Higher values are more conservative (smaller initial steps)
-            # 70 eV is reasonable for metals; molecular systems may need less
+            refine_level = int(refine_initial_hessian)
+
+        if refine_level >= 1:
+            # Level 1: Refine cell-related blocks
+            H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
+            H0_full[:, self.n_internal:] = H_cell_cols
+            H0_full[self.n_internal:, :] = H_cell_cols.T
+
+        if refine_level >= 2:
+            # Level 2: Also refine translation and rotation blocks
+            H_tric_cols = self._compute_tric_hessian_columns(hessian_delta)
+            tric_indices = self._get_tric_indices()
+            for i, idx in enumerate(tric_indices):
+                H0_full[:, idx] = H_tric_cols[:, i]
+                H0_full[idx, :] = H_tric_cols[:, i]
+
+        if refine_level == 0:
+            # No refinement: use diagonal guess for cell block
             h0_cell = 70.0
             H0_full[self.n_internal:, self.n_internal:] = h0_cell * np.eye(self.n_cell_dof)
+
+        # Save Hessian if requested
+        if save_hessian is not None:
+            np.save(save_hessian, H0_full)
+            print(f"Initial Hessian saved to {save_hessian}")
 
         self.set_H(H0_full, initialized=False)
 
@@ -1064,6 +1094,79 @@ class CellInternalPES(InternalPES):
             self.set_x(x_minus)
             _, g_minus = self.eval()
             print(f"\rRefining initial Hessian: {2*i + 2}/{n_evals} force calls", end="", flush=True)
+
+            # Central difference
+            H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
+
+        print()  # Newline after progress
+
+        # Restore original state
+        self.atoms.positions = pos0
+        self.atoms.set_cell(cell0, scale_atoms=False)
+        # Clear cached values to force recomputation
+        self.curr['x'] = None
+        self.curr['f'] = None
+        self.curr['g'] = None
+
+        return H_cols
+
+    def _get_tric_indices(self) -> np.ndarray:
+        """Get indices of translation and rotation coordinates in internal space."""
+        n_trans = len(self.int.internals['translations'])
+        n_bonds = len(self.int.internals['bonds'])
+        n_angles = len(self.int.internals['angles'])
+        n_dihedrals = len(self.int.internals['dihedrals'])
+        n_rot = len(self.int.internals['rotations'])
+
+        # Internal coord order: translations, bonds, angles, dihedrals, other, rotations
+        trans_indices = list(range(n_trans))
+        rot_start = n_trans + n_bonds + n_angles + n_dihedrals + len(self.int.internals['other'])
+        rot_indices = list(range(rot_start, rot_start + n_rot))
+
+        return np.array(trans_indices + rot_indices)
+
+    def _compute_tric_hessian_columns(self, delta: float) -> np.ndarray:
+        """Compute Hessian columns for translation/rotation DOF via finite differences.
+
+        This refines the coupling between TRICs and all other coordinates,
+        which is important for molecular crystals where fragment motions are coupled.
+
+        Parameters
+        ----------
+        delta : float
+            Finite difference step size.
+
+        Returns
+        -------
+        H_cols : ndarray
+            Array of shape (dim, n_tric) containing Hessian columns.
+        """
+        tric_indices = self._get_tric_indices()
+        n_tric = len(tric_indices)
+        H_cols = np.zeros((self.dim, n_tric))
+
+        # Save current state
+        x0 = self.get_x()
+        cell0 = self.atoms.get_cell().array.copy()
+        pos0 = self.atoms.positions.copy()
+
+        n_evals = 2 * n_tric
+        print(f"Refining TRIC Hessian: 0/{n_evals} force calls", end="", flush=True)
+
+        for i, idx in enumerate(tric_indices):
+            # Displace TRIC parameter +delta
+            x_plus = x0.copy()
+            x_plus[idx] += delta
+            self.set_x(x_plus)
+            _, g_plus = self.eval()
+            print(f"\rRefining TRIC Hessian: {2*i + 1}/{n_evals} force calls", end="", flush=True)
+
+            # Displace TRIC parameter -delta
+            x_minus = x0.copy()
+            x_minus[idx] -= delta
+            self.set_x(x_minus)
+            _, g_minus = self.eval()
+            print(f"\rRefining TRIC Hessian: {2*i + 2}/{n_evals} force calls", end="", flush=True)
 
             # Central difference
             H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
@@ -1530,13 +1633,15 @@ class CellCartesianPES(PES):
         Default is all True (full cell optimization).
     scalar_pressure : float, optional
         External pressure in eV/Å³. Default is 0.
-    refine_initial_hessian : bool, optional
-        If True, compute cell-coordinate coupling and cell-cell Hessian blocks
-        via finite differences. This requires additional force evaluations
-        (2 * n_cell_dof) but can improve convergence for coupled systems.
-        Default is False.
+    refine_initial_hessian : bool or int, optional
+        Level of Hessian refinement via finite differences:
+        - False or 0: No refinement (default)
+        - True or 1: Refine cell-related blocks only (2 * n_cell_dof force calls)
+        Note: Level 2 (TRICs) is not applicable for Cartesian coordinates.
     hessian_delta : float, optional
         Finite difference step size for Hessian refinement. Default is 1e-5.
+    save_hessian : str, optional
+        Path to save the initial Hessian as .npy file for analysis.
     """
 
     def __init__(
@@ -1546,11 +1651,24 @@ class CellCartesianPES(PES):
         exp_cell_factor: float = None,
         cell_mask: np.ndarray = None,
         scalar_pressure: float = 0.0,
-        refine_initial_hessian: bool = False,
+        refine_initial_hessian: Union[bool, int] = False,
         hessian_delta: float = 1e-5,
+        save_hessian: str = None,
         H0: np.ndarray = None,
         **kwargs
     ):
+        """Initialize CellCartesianPES.
+
+        Parameters
+        ----------
+        refine_initial_hessian : bool or int
+            Level of Hessian refinement via finite differences:
+            - False or 0: No refinement (default)
+            - True or 1: Refine cell-related blocks only
+            Note: Level 2 (TRICs) is not applicable for Cartesian coordinates.
+        save_hessian : str, optional
+            Path to save the initial Hessian as .npy file for analysis.
+        """
         # Store original cell as reference before any optimization
         self.orig_cell = atoms.get_cell().array.copy()
 
@@ -1594,18 +1712,29 @@ class CellCartesianPES(PES):
             # Default: 70 eV/Å² is reasonable for stiff materials
             H0_full[:self.n_cart, :self.n_cart] = 70.0 * np.eye(self.n_cart)
 
-        if refine_initial_hessian:
-            # Compute cell-related Hessian blocks via finite differences
-            # This gives us both the coupling (Cartesian-cell) and cell-cell blocks
-            H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
-            # Fill in the cell columns
-            H0_full[:, self.n_cart:] = H_cell_cols
-            # Symmetrize: H[cell, :] = H[:, cell].T
-            H0_full[self.n_cart:, :] = H_cell_cols.T
+        # Convert bool to int for refinement level
+        if refine_initial_hessian is True:
+            refine_level = 1
+        elif refine_initial_hessian is False:
+            refine_level = 0
         else:
-            # Cell block: use diagonal guess based on typical bulk moduli
+            refine_level = int(refine_initial_hessian)
+
+        if refine_level >= 1:
+            # Level 1: Refine cell-related blocks
+            H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
+            H0_full[:, self.n_cart:] = H_cell_cols
+            H0_full[self.n_cart:, :] = H_cell_cols.T
+
+        if refine_level == 0:
+            # No refinement: use diagonal guess for cell block
             h0_cell = 70.0
             H0_full[self.n_cart:, self.n_cart:] = h0_cell * np.eye(self.n_cell_dof)
+
+        # Save Hessian if requested
+        if save_hessian is not None:
+            np.save(save_hessian, H0_full)
+            print(f"Initial Hessian saved to {save_hessian}")
 
         self.set_H(H0_full, initialized=False)
 
