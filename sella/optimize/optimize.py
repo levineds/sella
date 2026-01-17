@@ -171,6 +171,11 @@ class Sella(Optimizer):
         else:
             self.delta = delta0 * self.pes.get_Ufree().shape[1]
 
+        # Separate trust radius for cell optimization
+        if optimize_cell:
+            self.delta_cell = delta0
+            self.rho_cell = 1.0
+
         self.sigma_inc = sigma_inc if sigma_inc is not None else default['sigma_inc']
         self.sigma_dec = sigma_dec if sigma_dec is not None else default['sigma_dec']
         self.rho_inc = rho_inc if rho_inc is not None else default['rho_inc']
@@ -310,15 +315,34 @@ class Sella(Optimizer):
         self.pes.save()
         all_valid = False
         x0 = self.pes.get_x()
+        s_cell_mag = 0.0  # Track cell step magnitude for cell trust radius update
         while not all_valid:
             s, smag = self.rs(
                 self.pes, self.ord, self.delta, method=self.method
             ).get_s()
+
+            # Apply separate trust radius constraint to cell portion
+            # Keep original smag for internal trust radius update (don't recalculate)
+            if self.optimize_cell:
+                n_cell = getattr(self.pes, 'n_cell_dof', 0)
+                if n_cell > 0:
+                    s_cell = s[-n_cell:]
+                    s_cell_mag = np.linalg.norm(s_cell)
+                    if s_cell_mag > self.delta_cell:
+                        # Scale down cell step to respect delta_cell
+                        scale = self.delta_cell / s_cell_mag
+                        s[-n_cell:] = s_cell * scale
+                        s_cell_mag = self.delta_cell
+                        # Don't recalculate smag - keep the step solver's value
+                        # for trust radius update compatibility
+
             self.pes.set_x(x0 + s)
             all_valid = self.pes.cons.validate_inequalities()
             self.pes._update_basis()
             self.pes.restore()
         self.pes._update_basis()
+        # Store cell step magnitude for cell trust radius update
+        self._s_cell_mag = s_cell_mag
         return s, smag
 
     def step(self):
@@ -375,6 +399,56 @@ class Sella(Optimizer):
         else:
             self.rho = 1.
 
+        # Update cell-specific trust radius based on cell gradient contribution
+        if self.optimize_cell and rho is not None:
+            n_cell = getattr(self.pes, 'n_cell_dof', 0)
+            if n_cell > 0:
+                # Use the cell step magnitude stored from _predict_step
+                s_cell_mag = getattr(self, '_s_cell_mag', 0.0)
+                if s_cell_mag > 1e-10:
+                    # Compute cell-specific rho using gradient information
+                    g_old = self.pes.last.get('g')
+                    g_new = self.pes.curr.get('g')
+                    if g_old is not None and g_new is not None:
+                        g_old_cell = g_old[-n_cell:]
+                        g_new_cell = g_new[-n_cell:]
+                        s_cell = s[-n_cell:]
+
+                        # Predicted cell energy change (first order)
+                        pred_cell = -float(g_old_cell @ s_cell)
+
+                        # Estimate actual cell contribution from gradient change
+                        # If cell gradient decreased in direction of step, good progress
+                        grad_proj_old = float(g_old_cell @ s_cell) / s_cell_mag
+                        grad_proj_new = float(g_new_cell @ s_cell) / s_cell_mag
+
+                        # rho_cell: ratio of actual to predicted improvement
+                        # If gradient component along step direction decreased, good
+                        if abs(pred_cell) > 1e-10:
+                            # Use overall rho weighted by cell contribution fraction
+                            pred_total = -float(g_old @ s)
+                            if abs(pred_total) > 1e-10:
+                                cell_frac = abs(pred_cell) / abs(pred_total)
+                                # Blend: use overall rho but weight by cell fraction
+                                rho_cell = rho * (1 - cell_frac) + cell_frac * (
+                                    1.0 if grad_proj_new < grad_proj_old else 0.5
+                                )
+                            else:
+                                rho_cell = rho
+                        else:
+                            rho_cell = rho
+
+                        # Update delta_cell using same logic as delta
+                        if rho_cell < 1./self.rho_dec or rho_cell > self.rho_dec:
+                            self.delta_cell = max(
+                                s_cell_mag * self.sigma_dec, self.delta_min
+                            )
+                        elif 1./self.rho_inc < rho_cell < self.rho_inc:
+                            self.delta_cell = max(
+                                self.sigma_inc * s_cell_mag, self.delta_cell
+                            )
+                        self.rho_cell = rho_cell
+
     def converged(self, forces=None):
         # fmax might be None if converged() is called before run()
         fmax = getattr(self, 'fmax', None) or 0.05  # Default threshold
@@ -395,13 +469,13 @@ class Sella(Optimizer):
             buf = " " * len(name)
             if self.nsteps == 0:
                 self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
-                                   "{:>12s} {:>12s} {:>12s}\n"
+                                   "{:>12s} {:>12s} {:>12s} {:>12s}\n"
                                    .format("Step", "Time", "Energy", "fmax",
-                                           "smax", "cmax", "rtrust", "rho"))
+                                           "smax", "cmax", "rtrust", "rtrust_c", "rho"))
             self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
-                               "{:>12.4f} {:>12.4f} {:>12.4f}\n"
+                               "{:>12.4f} {:>12.4f} {:>12.4f} {:>12.4f}\n"
                                .format(name, self.nsteps, T, e, fmax, smax_actual,
-                                       cmax, self.delta, self.rho))
+                                       cmax, self.delta, self.delta_cell, self.rho))
         else:
             _, fmax, cmax = self.pes.converged(self.fmax)
             e = self.pes.get_f()
