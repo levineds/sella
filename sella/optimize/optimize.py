@@ -208,8 +208,10 @@ class Sella(Optimizer):
         self.refine_hessian_every = refine_hessian_every
         self.nsteps_since_refine = 0
 
-        # Separate trust radius for cell optimization
-        if optimize_cell:
+        # Separate trust radius for cell optimization (only for internal coords)
+        # For Cartesian, position and cell DOF are on similar scales, so
+        # a single trust radius works better.
+        if optimize_cell and internal:
             self.delta_cell = delta0 if delta0 is not None else 0.1
             self.rho_cell = 1.0
 
@@ -484,17 +486,28 @@ class Sella(Optimizer):
             T = strftime("%H:%M:%S", localtime())
             name = self.__class__.__name__
             buf = " " * len(name)
-            delta_cell = getattr(self, 'delta_cell', self.delta)
-            if self.nsteps == 0:
-                self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
-                                   "{:>12s} {:>8s} {:>8s} {:>12s}\n"
-                                   .format("Step", "Time", "Energy", "fmax",
-                                           "smax", "cmax", "rtrust", "ctrust",
-                                           "rho"))
-            self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
-                               "{:>12.4f} {:>8.4f} {:>8.4f} {:>12.4f}\n"
-                               .format(name, self.nsteps, T, e, fmax, smax_actual,
-                                       cmax, self.delta, delta_cell, self.rho))
+            # Use separate trust radius display only when delta_cell exists
+            if hasattr(self, 'delta_cell'):
+                if self.nsteps == 0:
+                    self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
+                                       "{:>12s} {:>8s} {:>8s} {:>12s}\n"
+                                       .format("Step", "Time", "Energy", "fmax",
+                                               "smax", "cmax", "rtrust", "ctrust",
+                                               "rho"))
+                self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
+                                   "{:>12.4f} {:>8.4f} {:>8.4f} {:>12.4f}\n"
+                                   .format(name, self.nsteps, T, e, fmax, smax_actual,
+                                           cmax, self.delta, self.delta_cell, self.rho))
+            else:
+                if self.nsteps == 0:
+                    self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
+                                       "{:>12s} {:>12s} {:>12s}\n"
+                                       .format("Step", "Time", "Energy", "fmax",
+                                               "smax", "cmax", "rtrust", "rho"))
+                self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
+                                   "{:>12.4f} {:>12.4f} {:>12.4f}\n"
+                                   .format(name, self.nsteps, T, e, fmax, smax_actual,
+                                           cmax, self.delta, self.rho))
         else:
             _, fmax, cmax = self.pes.converged(self.fmax)
             e = self.pes.get_f()
