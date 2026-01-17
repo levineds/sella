@@ -570,6 +570,31 @@ def _rotation(
     return 2 * q[axis + 1] * asinc(q[0])
 
 
+def _rotation_hvp(
+    pos: jnp.ndarray,
+    axis: int,
+    refpos: jnp.ndarray,
+    tangent: jnp.ndarray
+) -> jnp.ndarray:
+    """Compute Hessian @ tangent for rotation without forming the full Hessian.
+
+    Uses forward-over-reverse mode autodiff: jvp(grad(f)) which is O(N) instead
+    of O(N²) for materializing the full Hessian via jacfwd(jacfwd(f)).
+    """
+    primals = (pos,)
+    tangents = (tangent,)
+    # grad returns gradient w.r.t. pos; jvp computes directional derivative
+    _, hvp_result = jvp(
+        lambda p: grad(_rotation, argnums=0)(p, axis, refpos),
+        primals,
+        tangents
+    )
+    return hvp_result
+
+
+_rotation_hvp_jit = jit(_rotation_hvp, static_argnums=(1,))
+
+
 class Rotation(Coordinate):
     def __init__(
         self,
@@ -1470,17 +1495,11 @@ class BaseInternals:
 
         results = []
 
-        # Translations - use existing hessian computation (usually few of these)
-        atoms = self.light_atoms
+        # Translations - Hessian is zero (translation is linear: mean of positions)
+        # So HVP is always zero, just append zero rows
         for i, coord in enumerate(self.internals['translations']):
             if trans_active[i]:
-                hess = np.array(coord.calc_hessian(atoms))
-                idx = np.array(coord.indices)
-                v_sub = v_atoms[idx]  # (n_idx, 3)
-                hvp = np.einsum('aibj,bj->ai', hess, v_sub)
-                row = np.zeros(self.ndof)
-                row.reshape((-1, 3))[idx] = hvp
-                results.append(row)
+                results.append(np.zeros(self.ndof))
 
         # Bonds - use batched HVP
         if bonds_active.any() and len(self._bond_indices) > 0:
@@ -1530,13 +1549,16 @@ class BaseInternals:
                 row.reshape((-1, 3))[idx] = hvp
                 results.append(row)
 
-        # Rotations - use existing hessian computation
+        # Rotations - use O(N) HVP instead of O(N²) full Hessian materialization
         for i, coord in enumerate(self.internals['rotations']):
             if rot_active[i]:
-                hess = np.array(coord.calc_hessian(atoms))
                 idx = np.array(coord.indices)
+                pos = positions[idx]
                 v_sub = v_atoms[idx]
-                hvp = np.einsum('aibj,bj->ai', hess, v_sub)
+                axis = coord.kwargs['axis']
+                refpos = coord.kwargs['refpos']
+                # Use direct HVP computation (O(N) instead of O(N²))
+                hvp = np.asarray(_rotation_hvp_jit(pos, axis, refpos, v_sub))
                 row = np.zeros(self.ndof)
                 row.reshape((-1, 3))[idx] = hvp
                 results.append(row)
