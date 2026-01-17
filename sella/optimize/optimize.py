@@ -359,8 +359,11 @@ class Sella(Optimizer):
                     s[-n_cell:] = s_cell * (self.delta_cell / s_cell_mag)
                     s_cell_mag = self.delta_cell  # Update magnitude after scaling
 
-                # Use internal magnitude for smag (used for delta updates)
-                smag = s_int_mag
+                # For internal coordinates, use internal magnitude for smag
+                # (internal and cell DOF are on different scales).
+                # For Cartesian, use total step magnitude (scales are comparable).
+                if self.internal:
+                    smag = s_int_mag
 
             self.pes.set_x(x0 + s)
             all_valid = self.pes.cons.validate_inequalities()
