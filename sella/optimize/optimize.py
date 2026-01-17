@@ -71,6 +71,7 @@ class Sella(Optimizer):
         smax: float = None,
         allow_fragments: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
+        refine_hessian_every: Optional[int] = None,
         save_hessian: str = None,
         **kwargs
     ):
@@ -104,6 +105,10 @@ class Sella(Optimizer):
             - 2: Also refine translation/rotation blocks for molecular crystals
               (adds 2 * n_tric force calls, where n_tric = n_fragments * 6)
             - 3: Refine full internal Hessian (2 * n_internal force calls, expensive!)
+        refine_hessian_every : int, optional
+            Re-refine the Hessian every N steps during optimization.
+            Uses the same refinement level as refine_initial_hessian.
+            Helps recover from accumulated bad curvature. Default is None (disabled).
         save_hessian : str, optional
             Path to save the initial Hessian as .npy file for analysis.
         """
@@ -195,6 +200,13 @@ class Sella(Optimizer):
         self.nsteps_per_diag = nsteps_per_diag
         self.nsteps_since_diag = 0
         self.diag_every_n = np.inf if diag_every_n is None else diag_every_n
+
+        # Periodic Hessian re-refinement settings
+        self.refine_level = (1 if refine_initial_hessian is True
+                             else 0 if refine_initial_hessian is False
+                             else int(refine_initial_hessian))
+        self.refine_hessian_every = refine_hessian_every
+        self.nsteps_since_refine = 0
 
     def initialize_pes(
         self,
@@ -374,6 +386,15 @@ class Sella(Optimizer):
             self.rho = rho
         else:
             self.rho = 1.
+
+        # Periodic Hessian re-refinement
+        self.nsteps_since_refine += 1
+        if (self.refine_hessian_every is not None and
+                self.refine_level > 0 and
+                self.nsteps_since_refine >= self.refine_hessian_every and
+                hasattr(self.pes, 'refine_hessian')):
+            self.pes.refine_hessian(self.refine_level)
+            self.nsteps_since_refine = 0
 
     def converged(self, forces=None):
         # fmax might be None if converged() is called before run()

@@ -1058,6 +1058,53 @@ class CellInternalPES(InternalPES):
         if 'cell' in self.savepoint:
             self.atoms.set_cell(self.savepoint['cell'], scale_atoms=False)
 
+    def refine_hessian(self, refine_level: int = 1, delta: float = 1e-5):
+        """Re-refine Hessian blocks via finite differences during optimization.
+
+        This can help recover from accumulated bad curvature in the Hessian
+        that develops during BFGS updates.
+
+        Parameters
+        ----------
+        refine_level : int
+            Level of refinement (1=cell, 2=cell+TRIC, 3=full internal).
+        delta : float
+            Finite difference step size.
+        """
+        if refine_level < 1:
+            return
+
+        # Get current Hessian
+        H = self.H.asarray()
+
+        if refine_level >= 1:
+            # Level 1: Refine cell-related blocks
+            H_cell_cols = self._compute_cell_hessian_columns(delta)
+            # Set internal-cell coupling (and its transpose for symmetry)
+            H[:self.n_internal, self.n_internal:] = H_cell_cols[:self.n_internal, :]
+            H[self.n_internal:, :self.n_internal] = H_cell_cols[:self.n_internal, :].T
+            # Set cell-cell block with explicit symmetrization
+            H_cell_cell = H_cell_cols[self.n_internal:, :]
+            H[self.n_internal:, self.n_internal:] = (H_cell_cell + H_cell_cell.T) / 2
+
+        if refine_level >= 2:
+            # Level 2: Also refine translation and rotation blocks
+            H_tric_cols = self._compute_tric_hessian_columns(delta)
+            tric_indices = self._get_tric_indices()
+            for i, idx in enumerate(tric_indices):
+                H[:, idx] = H_tric_cols[:, i]
+                H[idx, :] = H_tric_cols[:, i]
+
+        if refine_level >= 3:
+            # Level 3: Refine full internal Hessian (expensive!)
+            H_int_cols = self._compute_internal_hessian_columns(delta)
+            # Symmetrize and set the internal-internal block
+            H[:self.n_internal, :self.n_internal] = (H_int_cols + H_int_cols.T) / 2
+
+        # Update the Hessian (preserves eigenvalue tracking, etc.)
+        self.set_H(H, initialized=True)
+        print(f" [Hessian re-refined at level {refine_level}]")
+
     def _compute_cell_hessian_columns(self, delta: float) -> np.ndarray:
         """Compute Hessian columns for cell DOF via finite differences.
 
@@ -1814,6 +1861,38 @@ class CellCartesianPES(PES):
         PES.restore(self)
         if 'cell' in self.savepoint:
             self.atoms.set_cell(self.savepoint['cell'], scale_atoms=False)
+
+    def refine_hessian(self, refine_level: int = 1, delta: float = 1e-5):
+        """Re-refine Hessian blocks via finite differences during optimization.
+
+        This can help recover from accumulated bad curvature in the Hessian
+        that develops during BFGS updates.
+
+        Parameters
+        ----------
+        refine_level : int
+            Level of refinement (only level 1 supported for Cartesian).
+        delta : float
+            Finite difference step size.
+        """
+        if refine_level < 1:
+            return
+
+        # Get current Hessian
+        H = self.H.asarray()
+
+        # Level 1: Refine cell-related blocks
+        H_cell_cols = self._compute_cell_hessian_columns(delta)
+        # Set Cartesian-cell coupling (and its transpose for symmetry)
+        H[:self.n_cart, self.n_cart:] = H_cell_cols[:self.n_cart, :]
+        H[self.n_cart:, :self.n_cart] = H_cell_cols[:self.n_cart, :].T
+        # Set cell-cell block with explicit symmetrization
+        H_cell_cell = H_cell_cols[self.n_cart:, :]
+        H[self.n_cart:, self.n_cart:] = (H_cell_cell + H_cell_cell.T) / 2
+
+        # Update the Hessian (preserves eigenvalue tracking, etc.)
+        self.set_H(H, initialized=True)
+        print(f" [Hessian re-refined at level {refine_level}]")
 
     def _compute_cell_hessian_columns(self, delta: float) -> np.ndarray:
         """Compute Hessian columns for cell DOF via finite differences.
