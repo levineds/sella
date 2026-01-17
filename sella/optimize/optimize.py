@@ -351,11 +351,16 @@ class Sella(Optimizer):
                 s_int_mag = np.linalg.norm(s_int)
                 if s_int_mag > self.delta:
                     s[:-n_cell] = s_int * (self.delta / s_int_mag)
+                    s_int_mag = self.delta  # Update magnitude after scaling
 
                 # Scale cell portion if it exceeds delta_cell
                 s_cell_mag = np.linalg.norm(s_cell)
                 if s_cell_mag > self.delta_cell:
                     s[-n_cell:] = s_cell * (self.delta_cell / s_cell_mag)
+                    s_cell_mag = self.delta_cell  # Update magnitude after scaling
+
+                # Use internal magnitude for smag (used for delta updates)
+                smag = s_int_mag
 
             self.pes.set_x(x0 + s)
             all_valid = self.pes.cons.validate_inequalities()
