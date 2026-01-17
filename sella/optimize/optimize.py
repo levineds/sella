@@ -409,3 +409,8 @@ class Sella(Optimizer):
                                "{:>12.4f} {:>12.4f}\n"
                                .format(name, self.nsteps, T, e, fmax, cmax,
                                        self.delta, self.rho))
+        # Flush for immediate output visibility, but skip for ASE's Log class
+        # which auto-flushes and emits FutureWarning if flush() is called
+        if (hasattr(self.logfile, 'flush') and
+                type(self.logfile).__name__ != 'Log'):
+            self.logfile.flush()
