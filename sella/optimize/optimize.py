@@ -446,6 +446,11 @@ class Sella(Optimizer):
                         self.delta_cell = max(s_cell_mag * self.sigma_dec,
                                               self.delta_min)
                     # Otherwise keep delta_cell stable
+
+                # Cap delta_cell relative to delta to keep DOF balanced
+                # Cell can't get too far ahead of internal relaxation
+                max_cell_ratio = 10.0
+                self.delta_cell = min(self.delta_cell, max_cell_ratio * self.delta)
         else:
             self.rho = 1.
 
