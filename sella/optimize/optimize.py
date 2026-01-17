@@ -456,6 +456,11 @@ class Sella(Optimizer):
         This can help when simultaneous optimization of internal coordinates
         and cell parameters leads to poor convergence due to coupling issues.
 
+        Instead of physically freezing DOFs (which breaks gradient calculations),
+        this method projects out certain DOF from the gradient during each phase:
+        - Phase 1: Zero out cell gradient, optimize only internal/atomic DOF
+        - Phase 2: Zero out internal gradient, optimize only cell DOF
+
         Parameters
         ----------
         fmax : float
@@ -473,7 +478,6 @@ class Sella(Optimizer):
             True if optimization converged.
         """
         import numpy as np
-        from ase.constraints import FixAtoms
 
         if not self.optimize_cell:
             raise ValueError(
@@ -483,56 +487,62 @@ class Sella(Optimizer):
         if smax is None:
             smax = fmax
 
-        atoms = self.atoms
+        # Check if PES supports alternating (needs n_internal or n_cart attribute)
+        pes = self.pes
+        if hasattr(pes, 'n_internal'):
+            n_pos = pes.n_internal  # CellInternalPES
+        elif hasattr(pes, 'n_cart'):
+            n_pos = pes.n_cart  # CellCartesianPES
+        else:
+            raise ValueError(
+                "run_alternating requires CellInternalPES or CellCartesianPES"
+            )
 
         for cycle in range(max_cycles):
             print(f"\n{'='*60}")
             print(f"ALTERNATING CYCLE {cycle + 1}")
             print(f"{'='*60}")
 
-            # Phase 1: Optimize internal coordinates with frozen cell
-            print(f"\n--- Phase 1: Optimizing atoms (cell frozen) ---")
-            atoms.constraints = []
+            # Phase 1: Optimize internal/atomic DOFs only (project out cell)
+            print(f"\n--- Phase 1: Optimizing atoms (cell projected out) ---")
+            pes.gradient_mask = np.concatenate([
+                np.ones(n_pos),
+                np.zeros(pes.n_cell_dof)
+            ])
 
-            dyn1 = Sella(
-                atoms,
-                order=self.ord,
-                internal=self.user_internal,
-                optimize_cell=False,  # Freeze cell
-                logfile=self.logfile,
-            )
-            dyn1.run(fmax=fmax, steps=steps_per_phase)
+            self.initialized = False  # Reset optimizer state
+            self.delta = 0.1  # Reset trust radius
+            self.run(fmax=fmax, steps=steps_per_phase)
 
-            # Phase 2: Optimize cell with frozen atoms
-            print(f"\n--- Phase 2: Optimizing cell (atoms frozen) ---")
-            atoms.constraints = [FixAtoms(indices=range(len(atoms)))]
+            # Phase 2: Optimize cell DOFs only (project out atoms)
+            print(f"\n--- Phase 2: Optimizing cell (atoms projected out) ---")
+            pes.gradient_mask = np.concatenate([
+                np.zeros(n_pos),
+                np.ones(pes.n_cell_dof)
+            ])
 
-            dyn2 = Sella(
-                atoms,
-                order=0,
-                internal=False,
-                optimize_cell=True,
-                refine_initial_hessian=1,
-                logfile=self.logfile,
-            )
-            dyn2.run(fmax=smax, steps=steps_per_phase)
+            self.initialized = False  # Reset optimizer state
+            self.delta = 0.1  # Reset trust radius
+            self.run(fmax=smax, steps=steps_per_phase)
 
-            # Remove constraints and check convergence
-            atoms.constraints = []
+            # Remove mask and check convergence
+            pes.gradient_mask = None
 
-            # Recompute forces and stress
-            forces = atoms.get_forces()
-            fmax_current = np.sqrt((forces**2).sum(axis=1).max())
-            stress = atoms.get_stress()
-            smax_current = np.abs(stress[:3]).max()  # xx, yy, zz components
-            energy = atoms.get_potential_energy()
+            # Check convergence with full gradient
+            if self.optimize_cell:
+                conv, fmax_current, cmax_current, smax_current = pes.converged(fmax, smax=smax)
+            else:
+                conv, fmax_current, cmax_current = pes.converged(fmax)
+                smax_current = 0.0
+
+            energy = pes.get_f()
 
             print(f"\n--- Cycle {cycle + 1} Summary ---")
             print(f"Energy: {energy:.6f} eV")
             print(f"fmax:   {fmax_current:.4f} eV/Å")
             print(f"smax:   {smax_current:.4f} eV/Å³")
 
-            if fmax_current < fmax and smax_current < smax:
+            if conv:
                 print(f"\n{'='*60}")
                 print("CONVERGED!")
                 print(f"{'='*60}")
