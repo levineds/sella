@@ -354,7 +354,7 @@ class PES:
         df_pred = self.get_df_pred(dx_initial, g0, B0)
         dg_actual = self.get_g() - g_par
         df_actual = self.get_f() - f0
-        if df_pred is None:
+        if df_pred is None or abs(df_pred) < 1e-14:
             ratio = None
         else:
             ratio = df_actual / df_pred

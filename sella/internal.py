@@ -2467,7 +2467,9 @@ class Internals(BaseInternals):
         else:
             ndof = 3 * (self.natoms + self.ndummies) - 6
 
-        if ndeloc != ndof:
+        # Only warn if expected DOF is positive (skip degenerate cases like
+        # single atoms where ndof = 3 - 6 = -3)
+        if ndof > 0 and ndeloc != ndof:
             warnings.warn(
                 f'{ndeloc} coords found! Expected {ndof}.'
             )
