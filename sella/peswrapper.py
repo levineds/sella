@@ -359,14 +359,7 @@ class PES:
         else:
             ratio = df_actual / df_pred
 
-        # Only update Hessian if the step quality (ratio = actual/predicted energy change)
-        # is reasonable. Skip update when ratio indicates a poor step:
-        # - ratio <= 0.1: step was much worse than predicted (or went uphill)
-        # - ratio >= 3.0: prediction was very inaccurate
-        # Skipping bad updates prevents Hessian oscillation when optimizer alternates
-        # between overshooting in opposite directions.
-        if ratio is None or 0.1 < ratio < 3.0:
-            self._update_H(dx_final, dg_actual)
+        self._update_H(dx_final, dg_actual)
 
         if diag:
             if self.hessian_function is not None:
