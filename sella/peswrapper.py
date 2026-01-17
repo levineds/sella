@@ -1020,8 +1020,12 @@ class CellInternalPES(InternalPES):
         if refine_level >= 1:
             # Level 1: Refine cell-related blocks
             H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
-            H0_full[:, self.n_internal:] = H_cell_cols
-            H0_full[self.n_internal:, :] = H_cell_cols.T
+            # Set internal-cell coupling (and its transpose for symmetry)
+            H0_full[:self.n_internal, self.n_internal:] = H_cell_cols[:self.n_internal, :]
+            H0_full[self.n_internal:, :self.n_internal] = H_cell_cols[:self.n_internal, :].T
+            # Set cell-cell block with explicit symmetrization
+            H_cell_cell = H_cell_cols[self.n_internal:, :]
+            H0_full[self.n_internal:, self.n_internal:] = (H_cell_cell + H_cell_cell.T) / 2
 
         if refine_level >= 2:
             # Level 2: Also refine translation and rotation blocks
@@ -1723,8 +1727,12 @@ class CellCartesianPES(PES):
         if refine_level >= 1:
             # Level 1: Refine cell-related blocks
             H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
-            H0_full[:, self.n_cart:] = H_cell_cols
-            H0_full[self.n_cart:, :] = H_cell_cols.T
+            # Set Cartesian-cell coupling (and its transpose for symmetry)
+            H0_full[:self.n_cart, self.n_cart:] = H_cell_cols[:self.n_cart, :]
+            H0_full[self.n_cart:, :self.n_cart] = H_cell_cols[:self.n_cart, :].T
+            # Set cell-cell block with explicit symmetrization
+            H_cell_cell = H_cell_cols[self.n_cart:, :]
+            H0_full[self.n_cart:, self.n_cart:] = (H_cell_cell + H_cell_cell.T) / 2
 
         if refine_level == 0:
             # No refinement: use diagonal guess for cell block
