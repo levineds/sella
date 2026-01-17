@@ -1560,11 +1560,7 @@ class CellInternalPES(InternalPES):
     def get_g(self) -> np.ndarray:
         """Get combined gradient (internal + cell)."""
         self._update()
-        g = self.curr['g'].copy()
-        # Apply gradient mask if set (for alternating optimization)
-        if getattr(self, 'gradient_mask', None) is not None:
-            g = g * self.gradient_mask
-        return g
+        return self.curr['g'].copy()
 
     def _update(self, feval: bool = True):
         """Update current state including cell gradient."""
@@ -2083,11 +2079,7 @@ class CellCartesianPES(PES):
     def get_g(self) -> np.ndarray:
         """Get combined gradient (Cartesian + cell)."""
         self._update()
-        g = self.curr['g'].copy()
-        # Apply gradient mask if set (for alternating optimization)
-        if getattr(self, 'gradient_mask', None) is not None:
-            g = g * self.gradient_mask
-        return g
+        return self.curr['g'].copy()
 
     def _update(self, feval: bool = True):
         """Update current state including cell gradient."""
