@@ -208,6 +208,11 @@ class Sella(Optimizer):
         self.refine_hessian_every = refine_hessian_every
         self.nsteps_since_refine = 0
 
+        # Separate trust radius for cell optimization
+        if optimize_cell:
+            self.delta_cell = delta0 if delta0 is not None else 0.1
+            self.rho_cell = 1.0
+
     def initialize_pes(
         self,
         atoms: Atoms,
@@ -322,10 +327,36 @@ class Sella(Optimizer):
         self.pes.save()
         all_valid = False
         x0 = self.pes.get_x()
+
+        # For cell optimization, use a combined trust radius for the solver,
+        # then enforce separate constraints on internal and cell portions
+        if self.optimize_cell and hasattr(self, 'delta_cell'):
+            n_cell = self.pes.n_cell_dof
+            effective_delta = max(self.delta, self.delta_cell)
+        else:
+            n_cell = 0
+            effective_delta = self.delta
+
         while not all_valid:
             s, smag = self.rs(
-                self.pes, self.ord, self.delta, method=self.method
+                self.pes, self.ord, effective_delta, method=self.method
             ).get_s()
+
+            # Enforce separate trust radii on internal and cell portions
+            if n_cell > 0:
+                s_int = s[:-n_cell]
+                s_cell = s[-n_cell:]
+
+                # Scale internal portion if it exceeds delta
+                s_int_mag = np.linalg.norm(s_int)
+                if s_int_mag > self.delta:
+                    s[:-n_cell] = s_int * (self.delta / s_int_mag)
+
+                # Scale cell portion if it exceeds delta_cell
+                s_cell_mag = np.linalg.norm(s_cell)
+                if s_cell_mag > self.delta_cell:
+                    s[-n_cell:] = s_cell * (self.delta_cell / s_cell_mag)
+
             self.pes.set_x(x0 + s)
             all_valid = self.pes.cons.validate_inequalities()
             self.pes._update_basis()
@@ -384,6 +415,32 @@ class Sella(Optimizer):
             elif 1./self.rho_inc < rho < self.rho_inc:
                 self.delta = max(self.sigma_inc * smag, self.delta)
             self.rho = rho
+
+            # Update cell trust radius separately based on smax improvement
+            if self.optimize_cell and hasattr(self, 'delta_cell'):
+                n_cell = self.pes.n_cell_dof
+                s_cell_mag = np.linalg.norm(s[-n_cell:])
+
+                # Get current smax (use default threshold if fmax not set)
+                fmax_val = getattr(self, 'fmax', None) or 0.05
+                smax_target = self.smax if self.smax is not None else fmax_val
+                _, _, _, smax_current = self.pes.converged(fmax_val, smax=smax_target)
+
+                # Compare to previous smax
+                prev_smax = getattr(self, '_prev_smax', smax_current)
+                smax_improved = smax_current < prev_smax * 0.999  # Small margin
+                self._prev_smax = smax_current
+
+                if s_cell_mag > 0:
+                    if smax_improved:
+                        # Cell is making progress, grow trust radius
+                        self.delta_cell = max(self.sigma_inc * s_cell_mag,
+                                              self.delta_cell)
+                    elif rho < 0:
+                        # Bad step overall, shrink cell trust radius
+                        self.delta_cell = max(s_cell_mag * self.sigma_dec,
+                                              self.delta_min)
+                    # Otherwise keep delta_cell stable
         else:
             self.rho = 1.
 
@@ -414,15 +471,17 @@ class Sella(Optimizer):
             T = strftime("%H:%M:%S", localtime())
             name = self.__class__.__name__
             buf = " " * len(name)
+            delta_cell = getattr(self, 'delta_cell', self.delta)
             if self.nsteps == 0:
                 self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
-                                   "{:>12s} {:>12s} {:>12s}\n"
+                                   "{:>12s} {:>8s} {:>8s} {:>12s}\n"
                                    .format("Step", "Time", "Energy", "fmax",
-                                           "smax", "cmax", "rtrust", "rho"))
+                                           "smax", "cmax", "rtrust", "ctrust",
+                                           "rho"))
             self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
-                               "{:>12.4f} {:>12.4f} {:>12.4f}\n"
+                               "{:>12.4f} {:>8.4f} {:>8.4f} {:>12.4f}\n"
                                .format(name, self.nsteps, T, e, fmax, smax_actual,
-                                       cmax, self.delta, self.rho))
+                                       cmax, self.delta, delta_cell, self.rho))
         else:
             _, fmax, cmax = self.pes.converged(self.fmax)
             e = self.pes.get_f()
