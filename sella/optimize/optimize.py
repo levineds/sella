@@ -72,6 +72,7 @@ class Sella(Optimizer):
         allow_fragments: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
+        cell_step_scale: float = 1.0,
         **kwargs
     ):
         """Initialize Sella optimizer.
@@ -106,6 +107,11 @@ class Sella(Optimizer):
             - 3: Refine full internal Hessian (2 * n_internal force calls, expensive!)
         save_hessian : str, optional
             Path to save the initial Hessian as .npy file for analysis.
+        cell_step_scale : float, optional
+            Scaling factor for cell step size relative to internal coordinates.
+            Values > 1 make cell take larger steps; < 1 makes smaller steps.
+            Useful when cell optimization converges slower than internal coords.
+            Default is 1.0.
         """
         if order == 0:
             default = _default_kwargs['minimum']
@@ -115,6 +121,10 @@ class Sella(Optimizer):
         # Validate cell optimization parameters
         self.optimize_cell = optimize_cell
         self.smax = smax
+        self.cell_step_scale = cell_step_scale
+        self._adaptive_cell_scale = 1.0  # Internal adaptive scaling
+        self._prev_smax = None
+        self._smax_stall_count = 0
         if optimize_cell:
             if order != 0:
                 raise ValueError(
@@ -314,6 +324,14 @@ class Sella(Optimizer):
             s, smag = self.rs(
                 self.pes, self.ord, self.delta, method=self.method
             ).get_s()
+            # Scale cell portion of step with adaptive + manual scaling
+            if self.optimize_cell:
+                n_cell = getattr(self.pes, 'n_cell_dof', 0)
+                if n_cell > 0:
+                    total_scale = self.cell_step_scale * self._adaptive_cell_scale
+                    if total_scale != 1.0:
+                        s[-n_cell:] *= total_scale
+                        smag = np.linalg.norm(s)
             self.pes.set_x(x0 + s)
             all_valid = self.pes.cons.validate_inequalities()
             self.pes._update_basis()
@@ -374,6 +392,25 @@ class Sella(Optimizer):
             self.rho = rho
         else:
             self.rho = 1.
+
+        # Adaptive cell step scaling: increase if smax is stalling, decrease if improving
+        if self.optimize_cell:
+            smax_tol = self.smax if self.smax is not None else getattr(self, 'fmax', 0.05)
+            _, _, _, smax_actual = self.pes.converged(0.05, smax=smax_tol)
+            if self._prev_smax is not None:
+                # Check if smax improved by at least 5%
+                if smax_actual > 0.95 * self._prev_smax:
+                    self._smax_stall_count += 1
+                else:
+                    # smax is improving - decrease scale back toward 1.0
+                    self._smax_stall_count = 0
+                    if self._adaptive_cell_scale > 1.0:
+                        self._adaptive_cell_scale = max(self._adaptive_cell_scale * 0.9, 1.0)
+                # If stalled for 5+ steps, increase cell step scale
+                if self._smax_stall_count >= 5:
+                    self._adaptive_cell_scale = min(self._adaptive_cell_scale * 1.2, 5.0)
+                    self._smax_stall_count = 0
+            self._prev_smax = smax_actual
 
     def converged(self, forces=None):
         # fmax might be None if converged() is called before run()

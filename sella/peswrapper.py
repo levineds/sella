@@ -1037,7 +1037,7 @@ class CellInternalPES(InternalPES):
 
         if refine_level == 0:
             # No refinement: use diagonal guess for cell block
-            h0_cell = 70.0
+            h0_cell = 1.0
             H0_full[self.n_internal:, self.n_internal:] = h0_cell * np.eye(self.n_cell_dof)
 
         # Save Hessian if requested
@@ -1794,7 +1794,7 @@ class CellCartesianPES(PES):
 
         if refine_level == 0:
             # No refinement: use diagonal guess for cell block
-            h0_cell = 70.0
+            h0_cell = 1.0
             H0_full[self.n_cart:, self.n_cart:] = h0_cell * np.eye(self.n_cell_dof)
 
         # Save Hessian if requested
