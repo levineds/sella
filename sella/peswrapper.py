@@ -1047,21 +1047,28 @@ class CellInternalPES(InternalPES):
         cell0 = self.atoms.get_cell().array.copy()
         pos0 = self.atoms.positions.copy()
 
+        n_evals = 2 * self.n_cell_dof
+        print(f"Refining initial Hessian: 0/{n_evals} force calls", end="", flush=True)
+
         for i in range(self.n_cell_dof):
             # Displace cell parameter +delta
             x_plus = x0.copy()
             x_plus[self.n_internal + i] += delta
             self.set_x(x_plus)
             _, g_plus = self.eval()
+            print(f"\rRefining initial Hessian: {2*i + 1}/{n_evals} force calls", end="", flush=True)
 
             # Displace cell parameter -delta
             x_minus = x0.copy()
             x_minus[self.n_internal + i] -= delta
             self.set_x(x_minus)
             _, g_minus = self.eval()
+            print(f"\rRefining initial Hessian: {2*i + 2}/{n_evals} force calls", end="", flush=True)
 
             # Central difference
             H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
+
+        print()  # Newline after progress
 
         # Restore original state
         self.atoms.positions = pos0
@@ -1636,21 +1643,28 @@ class CellCartesianPES(PES):
         cell0 = self.atoms.get_cell().array.copy()
         pos0 = self.atoms.positions.copy()
 
+        n_evals = 2 * self.n_cell_dof
+        print(f"Refining initial Hessian: 0/{n_evals} force calls", end="", flush=True)
+
         for i in range(self.n_cell_dof):
             # Displace cell parameter +delta
             x_plus = x0.copy()
             x_plus[self.n_cart + i] += delta
             self.set_x(x_plus)
             _, g_plus = self.eval()
+            print(f"\rRefining initial Hessian: {2*i + 1}/{n_evals} force calls", end="", flush=True)
 
             # Displace cell parameter -delta
             x_minus = x0.copy()
             x_minus[self.n_cart + i] -= delta
             self.set_x(x_minus)
             _, g_minus = self.eval()
+            print(f"\rRefining initial Hessian: {2*i + 2}/{n_evals} force calls", end="", flush=True)
 
             # Central difference
             H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
+
+        print()  # Newline after progress
 
         # Restore original state
         self.atoms.positions = pos0
