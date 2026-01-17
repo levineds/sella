@@ -956,8 +956,9 @@ class CellInternalPES(InternalPES):
         refine_initial_hessian : bool or int
             Level of Hessian refinement via finite differences:
             - False or 0: No refinement (default)
-            - True or 1: Refine cell-related blocks only
-            - 2: Refine cell + translation/rotation blocks (for molecular crystals)
+            - True or 1: Refine cell-related blocks only (2 * n_cell_dof evals)
+            - 2: Also refine translation/rotation blocks (adds 2 * n_tric evals)
+            - 3: Refine full internal Hessian (2 * n_internal evals, expensive!)
         save_hessian : str, optional
             Path to save the initial Hessian as .npy file for analysis.
         """
@@ -1034,6 +1035,12 @@ class CellInternalPES(InternalPES):
             for i, idx in enumerate(tric_indices):
                 H0_full[:, idx] = H_tric_cols[:, i]
                 H0_full[idx, :] = H_tric_cols[:, i]
+
+        if refine_level >= 3:
+            # Level 3: Refine full internal Hessian (expensive!)
+            H_int_cols = self._compute_internal_hessian_columns(hessian_delta)
+            # Symmetrize and set the internal-internal block
+            H0_full[:self.n_internal, :self.n_internal] = (H_int_cols + H_int_cols.T) / 2
 
         if refine_level == 0:
             # No refinement: use diagonal guess for cell block
@@ -1186,6 +1193,64 @@ class CellInternalPES(InternalPES):
         self.curr['g'] = None
 
         return H_cols
+
+    def _compute_internal_hessian_columns(self, delta: float) -> np.ndarray:
+        """Compute full internal-internal Hessian block via finite differences.
+
+        This is expensive: requires 2 * n_internal force evaluations.
+        Only use when a highly accurate initial Hessian is needed.
+
+        Parameters
+        ----------
+        delta : float
+            Finite difference step size.
+
+        Returns
+        -------
+        H_int : ndarray
+            Array of shape (n_internal, n_internal) containing the internal Hessian.
+        """
+        H_int = np.zeros((self.n_internal, self.n_internal))
+
+        # Save current state
+        x0 = self.get_x()
+        cell0 = self.atoms.get_cell().array.copy()
+        pos0 = self.atoms.positions.copy()
+
+        n_evals = 2 * self.n_internal
+        print(f"Refining internal Hessian: 0/{n_evals} force calls", end="", flush=True)
+
+        for i in range(self.n_internal):
+            # Displace internal coordinate +delta
+            x_plus = x0.copy()
+            x_plus[i] += delta
+            self.set_x(x_plus)
+            _, g_plus = self.eval()
+
+            # Displace internal coordinate -delta
+            x_minus = x0.copy()
+            x_minus[i] -= delta
+            self.set_x(x_minus)
+            _, g_minus = self.eval()
+
+            # Central difference - only internal part
+            H_int[:, i] = (g_plus[:self.n_internal] - g_minus[:self.n_internal]) / (2 * delta)
+
+            # Progress update every 10 columns or at the end
+            if (i + 1) % 10 == 0 or i == self.n_internal - 1:
+                print(f"\rRefining internal Hessian: {2*(i+1)}/{n_evals} force calls", end="", flush=True)
+
+        print()  # Newline after progress
+
+        # Restore original state
+        self.atoms.positions = pos0
+        self.atoms.set_cell(cell0, scale_atoms=False)
+        # Clear cached values to force recomputation
+        self.curr['x'] = None
+        self.curr['f'] = None
+        self.curr['g'] = None
+
+        return H_int
 
     def get_x(self) -> np.ndarray:
         """Return combined internal coordinates + cell parameters.

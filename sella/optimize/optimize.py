@@ -103,6 +103,7 @@ class Sella(Optimizer):
             - True or 1: Refine cell-related blocks only (2 * n_cell_dof force calls)
             - 2: Also refine translation/rotation blocks for molecular crystals
               (adds 2 * n_tric force calls, where n_tric = n_fragments * 6)
+            - 3: Refine full internal Hessian (2 * n_internal force calls, expensive!)
         save_hessian : str, optional
             Path to save the initial Hessian as .npy file for analysis.
         """
