@@ -919,6 +919,10 @@ class CellInternalPES(InternalPES):
         Default is all True (full cell optimization).
     scalar_pressure : float, optional
         External pressure in eV/Å³. Default is 0.
+    scale_atoms : bool, optional
+        If True, scale atomic positions when cell changes (fractional coords fixed).
+        If False, keep Cartesian positions fixed when cell changes.
+        Default is False, which decouples atomic and cell DOF for easier optimization.
     refine_initial_hessian : bool, optional
         If True, compute cell-coordinate coupling and cell-cell Hessian blocks
         via finite differences. This requires additional force evaluations
@@ -936,6 +940,7 @@ class CellInternalPES(InternalPES):
         exp_cell_factor: float = None,
         cell_mask: np.ndarray = None,
         scalar_pressure: float = 0.0,
+        scale_atoms: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         hessian_delta: float = 1e-5,
         save_hessian: str = None,
@@ -946,6 +951,9 @@ class CellInternalPES(InternalPES):
 
         Parameters
         ----------
+        scale_atoms : bool
+            If True, scale atomic positions when cell changes (correct gradient).
+            If False, keep Cartesian positions fixed (decoupled optimization).
         refine_initial_hessian : bool or int
             Level of Hessian refinement via finite differences:
             - False or 0: No refinement (default)
@@ -971,6 +979,9 @@ class CellInternalPES(InternalPES):
 
         # External pressure
         self.scalar_pressure = scalar_pressure
+
+        # Whether to scale atoms when cell changes
+        self.scale_atoms = scale_atoms
 
         # Flag to control get_x behavior during parent initialization
         # When True, get_x returns only internal coords (for parent __init__)
@@ -1319,16 +1330,14 @@ class CellInternalPES(InternalPES):
     def _set_cell_from_log_deform(self, log_deform_scaled: np.ndarray) -> None:
         """Set cell from scaled log-deformation gradient.
 
-        Uses scale_atoms=False to keep Cartesian positions fixed when cell
-        changes. While this doesn't exactly match the stress tensor definition
-        (which assumes fractional coordinates are fixed), it decouples the
-        atomic and cell DOF, making optimization easier. The gradient mismatch
-        is small for small steps, and the Hessian adapts to the actual behavior.
+        Uses self.scale_atoms to control whether atomic positions scale with cell.
+        - scale_atoms=True: fractional coords fixed (matches stress definition)
+        - scale_atoms=False: Cartesian coords fixed (decouples cell/atom DOF)
         """
         log_deform = log_deform_scaled / self.exp_cell_factor
         F = expm(log_deform.real)
         new_cell = self.orig_cell @ F.T
-        self.atoms.set_cell(new_cell, scale_atoms=False)
+        self.atoms.set_cell(new_cell, scale_atoms=self.scale_atoms)
 
     def _masked_cell_params(self) -> np.ndarray:
         """Get cell parameters as flat array (only free DOF)."""
@@ -1536,17 +1545,7 @@ class CellInternalPES(InternalPES):
         return f, np.concatenate([g_internal, g_cell])
 
     def _stress_to_cell_gradient(self, stress_voigt: np.ndarray) -> np.ndarray:
-        """Convert stress tensor to gradient w.r.t. cell parameters.
-
-        The stress tensor gives dE/dε assuming atoms scale with the cell
-        (fractional coordinates fixed). Since we use scale_atoms=False,
-        we need to add a correction for the energy change from NOT moving
-        the atoms when the cell changes.
-
-        The correction is: Σ f_i ⊗ r_i (outer product of force and position)
-        This accounts for the work that would be done by forces if atoms
-        were to move with the cell strain.
-        """
+        """Convert stress tensor to gradient w.r.t. cell parameters."""
         volume = self.atoms.get_volume()
         stress_3x3 = voigt_6_to_full_3x3_stress(stress_voigt)
 
@@ -1554,18 +1553,8 @@ class CellInternalPES(InternalPES):
         if self.scalar_pressure != 0.0:
             stress_3x3 += self.scalar_pressure * np.eye(3)
 
-        # Gradient w.r.t. cell = V * stress (positive because gradient = -force)
-        # This is the opposite sign from ASE's "force" = -V * stress
+        # Gradient w.r.t. cell = V * stress
         g_cell_3x3 = volume * stress_3x3
-
-        # Correction for scale_atoms=False: subtract force-position virial term
-        # The stress assumes atoms scale with the cell (fractional coords fixed).
-        # When atoms DON'T scale, the work that would be done by forces is not done,
-        # so we subtract that contribution from the gradient.
-        forces = self.atoms.get_forces()
-        positions = self.atoms.get_positions()
-        correction = forces.T @ positions  # 3x3 matrix: Σ f_i ⊗ r_i
-        g_cell_3x3 = g_cell_3x3 - correction
 
         # Apply cell mask
         g_cell_masked = g_cell_3x3 * self.cell_mask
@@ -1761,6 +1750,10 @@ class CellCartesianPES(PES):
         Default is all True (full cell optimization).
     scalar_pressure : float, optional
         External pressure in eV/Å³. Default is 0.
+    scale_atoms : bool, optional
+        If True, scale atomic positions when cell changes (fractional coords fixed).
+        If False, keep Cartesian positions fixed when cell changes.
+        Default is False, which decouples atomic and cell DOF for easier optimization.
     refine_initial_hessian : bool or int, optional
         Level of Hessian refinement via finite differences:
         - False or 0: No refinement (default)
@@ -1779,6 +1772,7 @@ class CellCartesianPES(PES):
         exp_cell_factor: float = None,
         cell_mask: np.ndarray = None,
         scalar_pressure: float = 0.0,
+        scale_atoms: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         hessian_delta: float = 1e-5,
         save_hessian: str = None,
@@ -1789,6 +1783,9 @@ class CellCartesianPES(PES):
 
         Parameters
         ----------
+        scale_atoms : bool
+            If True, scale atomic positions when cell changes (correct gradient).
+            If False, keep Cartesian positions fixed (decoupled optimization).
         refine_initial_hessian : bool or int
             Level of Hessian refinement via finite differences:
             - False or 0: No refinement (default)
@@ -1813,6 +1810,9 @@ class CellCartesianPES(PES):
 
         # External pressure
         self.scalar_pressure = scalar_pressure
+
+        # Whether to scale atoms when cell changes
+        self.scale_atoms = scale_atoms
 
         # Flag to control get_x behavior during parent initialization
         self._initializing = True
@@ -1996,16 +1996,14 @@ class CellCartesianPES(PES):
     def _set_cell_from_log_deform(self, log_deform_scaled: np.ndarray) -> None:
         """Set cell from scaled log-deformation gradient.
 
-        Uses scale_atoms=False to keep Cartesian positions fixed when cell
-        changes. While this doesn't exactly match the stress tensor definition
-        (which assumes fractional coordinates are fixed), it decouples the
-        atomic and cell DOF, making optimization easier. The gradient mismatch
-        is small for small steps, and the Hessian adapts to the actual behavior.
+        Uses self.scale_atoms to control whether atomic positions scale with cell.
+        - scale_atoms=True: fractional coords fixed (matches stress definition)
+        - scale_atoms=False: Cartesian coords fixed (decouples cell/atom DOF)
         """
         log_deform = log_deform_scaled / self.exp_cell_factor
         F = expm(log_deform.real)
         new_cell = self.orig_cell @ F.T
-        self.atoms.set_cell(new_cell, scale_atoms=False)
+        self.atoms.set_cell(new_cell, scale_atoms=self.scale_atoms)
 
     def _masked_cell_params(self) -> np.ndarray:
         """Get cell parameters as flat array (only free DOF)."""
