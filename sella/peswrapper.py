@@ -1538,11 +1538,14 @@ class CellInternalPES(InternalPES):
     def _stress_to_cell_gradient(self, stress_voigt: np.ndarray) -> np.ndarray:
         """Convert stress tensor to gradient w.r.t. cell parameters.
 
-        Following ASE's FrechetCellFilter formulation.
+        The stress tensor gives dE/dε assuming atoms scale with the cell
+        (fractional coordinates fixed). Since we use scale_atoms=False,
+        we need to add a correction for the energy change from NOT moving
+        the atoms when the cell changes.
 
-        ASE cell force = virial / cell_factor where virial = -V * stress
-        Since Sella uses gradients = -forces, we have:
-        gradient = -cell_force = -virial / cell_factor = V * stress / cell_factor
+        The correction is: Σ f_i ⊗ r_i (outer product of force and position)
+        This accounts for the work that would be done by forces if atoms
+        were to move with the cell strain.
         """
         volume = self.atoms.get_volume()
         stress_3x3 = voigt_6_to_full_3x3_stress(stress_voigt)
@@ -1554,6 +1557,14 @@ class CellInternalPES(InternalPES):
         # Gradient w.r.t. cell = V * stress (positive because gradient = -force)
         # This is the opposite sign from ASE's "force" = -V * stress
         g_cell_3x3 = volume * stress_3x3
+
+        # Correction for scale_atoms=False: add force-position virial term
+        # This converts the gradient from "fractional coords fixed" to
+        # "Cartesian coords fixed" which matches our set_cell behavior.
+        forces = self.atoms.get_forces()
+        positions = self.atoms.get_positions()
+        correction = forces.T @ positions  # 3x3 matrix
+        g_cell_3x3 = g_cell_3x3 + correction
 
         # Apply cell mask
         g_cell_masked = g_cell_3x3 * self.cell_mask
@@ -2069,7 +2080,14 @@ class CellCartesianPES(PES):
     def _stress_to_cell_gradient(self, stress_voigt: np.ndarray) -> np.ndarray:
         """Convert stress tensor to gradient w.r.t. cell parameters.
 
-        Following ASE's FrechetCellFilter formulation.
+        The stress tensor gives dE/dε assuming atoms scale with the cell
+        (fractional coordinates fixed). Since we use scale_atoms=False,
+        we need to add a correction for the energy change from NOT moving
+        the atoms when the cell changes.
+
+        The correction is: Σ f_i ⊗ r_i (outer product of force and position)
+        This accounts for the work that would be done by forces if atoms
+        were to move with the cell strain.
         """
         volume = self.atoms.get_volume()
         stress_3x3 = voigt_6_to_full_3x3_stress(stress_voigt)
@@ -2080,6 +2098,14 @@ class CellCartesianPES(PES):
 
         # Gradient w.r.t. cell = V * stress
         g_cell_3x3 = volume * stress_3x3
+
+        # Correction for scale_atoms=False: add force-position virial term
+        # This converts the gradient from "fractional coords fixed" to
+        # "Cartesian coords fixed" which matches our set_cell behavior.
+        forces = self.atoms.get_forces()
+        positions = self.atoms.get_positions()
+        correction = forces.T @ positions  # 3x3 matrix
+        g_cell_3x3 = g_cell_3x3 + correction
 
         # Apply cell mask
         g_cell_masked = g_cell_3x3 * self.cell_mask
