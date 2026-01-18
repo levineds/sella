@@ -1,0 +1,39 @@
+I believe there are multiple issues currently with TRICs. I will walk through my investigation and present my conclusions below.
+
+Currently, the way I have been told to turn on TRICs is by defining and passing an Internals object like so:
+
+ints = Internals(atoms, allow_fragments=True)
+ints.find_all_bonds()
+ints.find_all_angles()
+ints.find_all_dihedrals()
+opt = Sella(atoms, internal=ints)
+
+I tried this on the following structure:
+
+13
+Bi1 N3 O9
+Bi -0.168754 0.103309 -0.601068
+N -1.452579 0.996969 1.671974
+O -1.906613 1.312382 2.719561
+O -0.390479 0.236458 1.599985
+O -1.916359 1.339852 0.548706
+N 2.088604 1.559729 0.184556
+O 3.081561 2.106988 0.537575
+O 0.991304 2.160371 -0.042657
+O 2.046745 0.279049 -0.004926
+N -0.824031 -2.516641 0.135921
+O -1.024602 -3.638619 0.469313
+O 0.376482 -2.057305 -0.023988
+O -1.745220 -1.672049 -0.097571
+
+However, I noticed that my optimization proceeded identically to just providing internal=True. I dug deeper and found that no translation or rotation ICs were being added because the distance check is using the sum of the covalent radii multiplied by a scale=1.25 factor. Nitrogen's covalent radius is 0.71, Bismuth's is 1.48, so their sum is 2.19. The three shortest Bi-N distances in this cluster are 2.21, 2.3, and 2.3, so all just end up getting added as bonds due to the 125% scale factor. I set scale=1.0 locally to ensure that TRICs would be added.
+
+I then encountered an issue with an assertion error on line 399 of internal.py which enforces that a fragment having a rotation IC added must contain at least two atoms. This makes sense, as any individual atom is spherically symmetric. In this case, the single atom fragment is the Bi, which makes sense. Digging into the find_all_bonds function, I traced this issue back to the fact that the if self.allow_fragments and not first_run: break lines happens before the labels[nbonds == 0] = -1 line. If their order is reversed, then the Bi's label is correctly set to -1, which causes a translation IC to be added to it but avoids the addition of the rotation IC to the single atom fragment. So, regardless of anything else, I believe that lines 1374 and 1375 in internal.py should at least go above lines 1371 and 1372.
+
+With that change made locally, TRICs appear to be added successfully, but then a new problem emerges: peswrapper.py, line 454 yields RuntimeError: Geometry update ODE is taking too long to converge!. I further get a warning from internal.py line 1564 (line number might not be exact because of my edits) UserWarning: 39 coords found! Expected 33. I thought this might be due to the fact that I am passing in a predefined Internals object, which may prevent some number of internals from being trimmed, so I also tried just hardcoding allow_fragments=True in class Internals such that I could switch back to just passing internal=True and let Sella do its own auto_find_internals procedure - but now with TRICs being added. However, even with these changes, I observed identical behavior.
+
+So, to recap:
+
+The scale factor of 1.25 is questionable. It would at least be nice if the user could modify it without having to dig into the code.
+labels[nbonds == 0] = -1 needs to be moved upward in internal.py to avoid rotation ICs attempting to be added to single atoms.
+When TRICs are successfully added, the total number of ICs is too large and the geometry update ODE fails.

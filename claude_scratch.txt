@@ -1,0 +1,46 @@
+# Sella Performance Optimization Notes
+
+## Current State (consolidated-optimizations branch)
+- 13 commits ahead of origin/master
+- Performance: 6.6s vs 19.1s on origin/master (2.9x speedup, 65% reduction)
+
+## Key Optimizations Made
+1. Cache SparseInternalHessians - avoid reconstructing sparse hessian objects
+2. Cache cell transformations (tvecs) - cache ncvecs @ cell matrix multiplications
+3. Direct HVP computation - use jvp(grad(f)) instead of forming full Hessians
+4. Reuse Binv across ODE steps - avoid repeated SVD during ODE integration
+5. Cache ndof/natoms/ndummies properties - avoid 26k+ redundant len() calls
+6. QuasiNewton as default method - avoid expensive RFO eigendecompositions
+7. Lazy eigendecomposition in ApproximateHessian - only compute when accessed
+8. Share SVD between _calc_basis and _get_Binv - avoid duplicate SVD calls
+
+## Code Cleanup
+- Replaced verbose if/else blocks with conditional expressions
+- Restructured trust radius update to use proper if/else instead of if X: pass elif
+- Cache P.B is None check to avoid duplicate evaluation
+- Pass computed basis from _update() to _update_basis() to avoid recomputing
+- Extract _ensure_eigen_computed() helper to consolidate eigendecomposition logic
+- Vectorize O(n²) loop in SparseInternalHessian.asarray() using np.add.at
+
+## Commits on consolidated-optimizations branch
+21697c9 Code cleanup: simplify conditionals, consolidate duplicated logic, vectorize loop
+670ec2c Share SVD computation between _calc_basis and _get_Binv
+8d873b9 Make ApproximateHessian eigendecomposition lazy
+7b79b0c Use QuasiNewton as default method for minimizations
+b460450 Reuse Binv across ODE integration steps
+4183eaf Use direct HVP computation to avoid forming full Hessian matrices
+9ff935a Optimize ODE integration with cached computations
+f4f8e05 Cache cell transformations to avoid redundant matrix multiplications
+90040b0 Cache SparseInternalHessians and reduce redundant computations
+e2ef672 Fix QuasiNewton eigenvalue computation
+71e86c8 Add caching and improved convergence checking for internal coordinates
+48113e3 Vectorize internal coordinate calculations with JAX vmap
+aeca8b7 Vectorize sparse linear algebra operations
+
+## Key Files
+- sella/internal.py - Internal coordinates, HVP functions, jacobian, hessian
+- sella/peswrapper.py - PES wrapper, ODE integration, Binv caching
+- sella/optimize/stepper.py - QuasiNewton, RFO steppers
+- sella/optimize/restricted_step.py - Line search with trust region
+- sella/optimize/optimize.py - Main Sella optimizer, default settings
+- sella/linalg.py - ApproximateHessian, SparseInternalHessian classes

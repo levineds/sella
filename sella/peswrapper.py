@@ -1558,13 +1558,14 @@ class CellInternalPES(InternalPES):
         # This is the opposite sign from ASE's "force" = -V * stress
         g_cell_3x3 = volume * stress_3x3
 
-        # Correction for scale_atoms=False: add force-position virial term
-        # This converts the gradient from "fractional coords fixed" to
-        # "Cartesian coords fixed" which matches our set_cell behavior.
+        # Correction for scale_atoms=False: subtract force-position virial term
+        # The stress assumes atoms scale with the cell (fractional coords fixed).
+        # When atoms DON'T scale, the work that would be done by forces is not done,
+        # so we subtract that contribution from the gradient.
         forces = self.atoms.get_forces()
         positions = self.atoms.get_positions()
-        correction = forces.T @ positions  # 3x3 matrix
-        g_cell_3x3 = g_cell_3x3 + correction
+        correction = forces.T @ positions  # 3x3 matrix: Σ f_i ⊗ r_i
+        g_cell_3x3 = g_cell_3x3 - correction
 
         # Apply cell mask
         g_cell_masked = g_cell_3x3 * self.cell_mask
@@ -2099,13 +2100,14 @@ class CellCartesianPES(PES):
         # Gradient w.r.t. cell = V * stress
         g_cell_3x3 = volume * stress_3x3
 
-        # Correction for scale_atoms=False: add force-position virial term
-        # This converts the gradient from "fractional coords fixed" to
-        # "Cartesian coords fixed" which matches our set_cell behavior.
+        # Correction for scale_atoms=False: subtract force-position virial term
+        # The stress assumes atoms scale with the cell (fractional coords fixed).
+        # When atoms DON'T scale, the work that would be done by forces is not done,
+        # so we subtract that contribution from the gradient.
         forces = self.atoms.get_forces()
         positions = self.atoms.get_positions()
-        correction = forces.T @ positions  # 3x3 matrix
-        g_cell_3x3 = g_cell_3x3 + correction
+        correction = forces.T @ positions  # 3x3 matrix: Σ f_i ⊗ r_i
+        g_cell_3x3 = g_cell_3x3 - correction
 
         # Apply cell mask
         g_cell_masked = g_cell_3x3 * self.cell_mask

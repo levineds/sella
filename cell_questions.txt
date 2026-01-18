@@ -1,0 +1,44 @@
+POST 1: Any insights into using sella for cell vector optimization and its compatibility with external cell filters?
+Dear Sella developers and maintainers:
+
+I'm currently performing geometry relaxations for a periodic organic molecule system. The relaxation runs of desire should allow for changes in not only atomic positions but also cell dimensions and shape (i.e., lattice vector optimization), so as to release any significant internal stresses and strains introduced in the initial structure.
+
+Through testing, I noticed that when using the Sella alone for relaxation, the dimensions of the simulation cell do not change, and it seems that sella currently doesn't support the optimization of lattice vectors internally. Alternatively, I tried to combine Sella with external cell filters like the 'FrechetCellFilter' (an ase cell filter) to include cell vectors as optimization variables, but it appears incompatible.
+
+My questions are:
+Are there any settings in sella that I missed that actually permit cell shape and vector adjustments?
+If not, is sella compatible with any external cell filters that allow for lattice vector changes?
+
+RESPONSE: Hi Jo,
+
+Sella cannot at the moment optimize the cell dimensions.
+
+POST 2: FrechetCellFilter not compatible with Sella
+
+The wiki says:
+
+Sella provides an interface that is compatible with the ASE Optimizer class interface.
+
+Trying to input ase.filters.FrechetCellFilter with Sella, though, gives an error:
+
+  File "/app/src/peregrine/optimization/periodic_optimization.py", line 94, in optimize_periodic_geometry
+    optimizer = Sella(FrechetCellFilter(atoms), **sella_kwargs) if opt_settings.optimize_cell else Sella(atoms, **sella_kwargs)  # type: ignore [arg-type]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.pixi/envs/default/lib/python3.12/site-packages/sella/optimize/optimize.py", line 83, in __init__
+    self.initialize_pes(
+  File "/app/.pixi/envs/default/lib/python3.12/site-packages/sella/optimize/optimize.py", line 199, in initialize_pes
+    self.pes = PES(
+               ^^^^
+  File "/app/.pixi/envs/default/lib/python3.12/site-packages/sella/peswrapper.py", line 43, in __init__
+    constraints.fix_translation()
+  File "/app/.pixi/envs/default/lib/python3.12/site-packages/sella/internal.py", line 957, in fix_translation
+    index = np.arange(len(self.all_atoms), dtype=np.int32)
+                          ^^^^^^^^^^^^^^
+  File "/app/.pixi/envs/default/lib/python3.12/site-packages/sella/internal.py", line 639, in all_atoms
+    return self.atoms + self.dummies
+           ~~~~~~~~~~~^~~~~~~~~~~~~~
+TypeError: unsupported operand type(s) for +: 'FrechetCellFilter' and 'Atoms'
+Is there any way to optimize the lattice vectors with Sella?
+
+RESPONSE:
+Sella does not currently support optimization of lattice vectors. This was something I thought about at one point, but it's highly nontrivial due to how Sella internally represents the Cartesian atomic positions. It would also be quite complex to ensure that internal coordinates behave correctly in optimizations with variable unit cell size.
