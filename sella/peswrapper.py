@@ -1319,13 +1319,16 @@ class CellInternalPES(InternalPES):
     def _set_cell_from_log_deform(self, log_deform_scaled: np.ndarray) -> None:
         """Set cell from scaled log-deformation gradient.
 
-        Uses scale_atoms=True to match the stress tensor definition, which
-        assumes atoms move with the cell (fractional coordinates fixed).
+        Uses scale_atoms=False to keep Cartesian positions fixed when cell
+        changes. While this doesn't exactly match the stress tensor definition
+        (which assumes fractional coordinates are fixed), it decouples the
+        atomic and cell DOF, making optimization easier. The gradient mismatch
+        is small for small steps, and the Hessian adapts to the actual behavior.
         """
         log_deform = log_deform_scaled / self.exp_cell_factor
         F = expm(log_deform.real)
         new_cell = self.orig_cell @ F.T
-        self.atoms.set_cell(new_cell, scale_atoms=True)
+        self.atoms.set_cell(new_cell, scale_atoms=False)
 
     def _masked_cell_params(self) -> np.ndarray:
         """Get cell parameters as flat array (only free DOF)."""
@@ -1981,13 +1984,16 @@ class CellCartesianPES(PES):
     def _set_cell_from_log_deform(self, log_deform_scaled: np.ndarray) -> None:
         """Set cell from scaled log-deformation gradient.
 
-        Uses scale_atoms=True to match the stress tensor definition, which
-        assumes atoms move with the cell (fractional coordinates fixed).
+        Uses scale_atoms=False to keep Cartesian positions fixed when cell
+        changes. While this doesn't exactly match the stress tensor definition
+        (which assumes fractional coordinates are fixed), it decouples the
+        atomic and cell DOF, making optimization easier. The gradient mismatch
+        is small for small steps, and the Hessian adapts to the actual behavior.
         """
         log_deform = log_deform_scaled / self.exp_cell_factor
         F = expm(log_deform.real)
         new_cell = self.orig_cell @ F.T
-        self.atoms.set_cell(new_cell, scale_atoms=True)
+        self.atoms.set_cell(new_cell, scale_atoms=False)
 
     def _masked_cell_params(self) -> np.ndarray:
         """Get cell parameters as flat array (only free DOF)."""
