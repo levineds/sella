@@ -19,7 +19,7 @@ from ase.constraints import (
 )
 
 import jax.numpy as jnp
-from jax import jit, grad, jacfwd, jacrev, custom_jvp, vmap, jvp
+from jax import jit, grad, jacfwd, jacrev, custom_jvp, vmap, jvp, device_get
 
 from sella.linalg import (
     SparseInternalJacobian, SparseInternalHessian, SparseInternalHessians
@@ -180,6 +180,16 @@ _dihedral_cell_grad_single = jit(grad(_dihedral_with_cell, argnums=2))
 _bond_cell_grad_batched = jit(vmap(_bond_cell_grad_single, in_axes=(0, 0, None)))
 _angle_cell_grad_batched = jit(vmap(_angle_cell_grad_single, in_axes=(0, 0, None)))
 _dihedral_cell_grad_batched = jit(vmap(_dihedral_cell_grad_single, in_axes=(0, 0, None)))
+
+
+# =============================================================================
+# Block size for GPU/SIMD efficiency
+# =============================================================================
+# Padding arrays to multiples of BLOCK_SIZE improves GPU performance through
+# better warp-level parallelism and memory coalescing. Also reduces JAX JIT
+# recompilation when array sizes change.
+# =============================================================================
+BLOCK_SIZE = 64
 
 
 IVec = Tuple[int, int, int]
@@ -885,44 +895,93 @@ class BaseInternals:
             self._cache_version += 1
 
     def _build_batched_arrays(self) -> None:
-        """Build batched index arrays for vectorized computation."""
+        """Build batched index arrays for vectorized computation.
+
+        Arrays are padded to multiples of BLOCK_SIZE for GPU/SIMD efficiency.
+        Masks are stored to filter results back to actual sizes.
+        """
         if self._batched_arrays_valid:
             return
 
+        def pad_to_block(n: int) -> int:
+            """Round up to nearest multiple of BLOCK_SIZE."""
+            return ((n + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+
         # Build arrays for bonds
         bonds = self.internals['bonds']
-        if bonds:
+        n_bonds = len(bonds)
+        if n_bonds > 0:
+            n_bonds_padded = pad_to_block(n_bonds)
+            # Original (unpadded) arrays for indexing
             self._bond_indices = np.array([b.indices for b in bonds], dtype=np.int32)
             self._bond_ncvecs = np.array(
                 [b.kwargs['ncvecs'] for b in bonds], dtype=np.int32
             )
+            # Padded arrays for batch computation
+            self._bond_indices_padded = np.zeros((n_bonds_padded, 2), dtype=np.int32)
+            self._bond_ncvecs_padded = np.zeros((n_bonds_padded, 1, 3), dtype=np.int32)
+            self._bond_indices_padded[:n_bonds] = self._bond_indices
+            self._bond_ncvecs_padded[:n_bonds] = self._bond_ncvecs
+            self._bond_mask = np.zeros(n_bonds_padded, dtype=np.float64)
+            self._bond_mask[:n_bonds] = 1.0
+            self._n_bonds_actual = n_bonds
         else:
             self._bond_indices = np.empty((0, 2), dtype=np.int32)
             self._bond_ncvecs = np.empty((0, 1, 3), dtype=np.int32)
+            self._bond_indices_padded = np.empty((0, 2), dtype=np.int32)
+            self._bond_ncvecs_padded = np.empty((0, 1, 3), dtype=np.int32)
+            self._bond_mask = np.empty(0, dtype=np.float64)
+            self._n_bonds_actual = 0
 
         # Build arrays for angles
         angles = self.internals['angles']
-        if angles:
+        n_angles = len(angles)
+        if n_angles > 0:
+            n_angles_padded = pad_to_block(n_angles)
             self._angle_indices = np.array([a.indices for a in angles], dtype=np.int32)
             self._angle_ncvecs = np.array(
                 [a.kwargs['ncvecs'] for a in angles], dtype=np.int32
             )
+            self._angle_indices_padded = np.zeros((n_angles_padded, 3), dtype=np.int32)
+            self._angle_ncvecs_padded = np.zeros((n_angles_padded, 2, 3), dtype=np.int32)
+            self._angle_indices_padded[:n_angles] = self._angle_indices
+            self._angle_ncvecs_padded[:n_angles] = self._angle_ncvecs
+            self._angle_mask = np.zeros(n_angles_padded, dtype=np.float64)
+            self._angle_mask[:n_angles] = 1.0
+            self._n_angles_actual = n_angles
         else:
             self._angle_indices = np.empty((0, 3), dtype=np.int32)
             self._angle_ncvecs = np.empty((0, 2, 3), dtype=np.int32)
+            self._angle_indices_padded = np.empty((0, 3), dtype=np.int32)
+            self._angle_ncvecs_padded = np.empty((0, 2, 3), dtype=np.int32)
+            self._angle_mask = np.empty(0, dtype=np.float64)
+            self._n_angles_actual = 0
 
         # Build arrays for dihedrals
         dihedrals = self.internals['dihedrals']
-        if dihedrals:
+        n_dihedrals = len(dihedrals)
+        if n_dihedrals > 0:
+            n_dihedrals_padded = pad_to_block(n_dihedrals)
             self._dihedral_indices = np.array(
                 [d.indices for d in dihedrals], dtype=np.int32
             )
             self._dihedral_ncvecs = np.array(
                 [d.kwargs['ncvecs'] for d in dihedrals], dtype=np.int32
             )
+            self._dihedral_indices_padded = np.zeros((n_dihedrals_padded, 4), dtype=np.int32)
+            self._dihedral_ncvecs_padded = np.zeros((n_dihedrals_padded, 3, 3), dtype=np.int32)
+            self._dihedral_indices_padded[:n_dihedrals] = self._dihedral_indices
+            self._dihedral_ncvecs_padded[:n_dihedrals] = self._dihedral_ncvecs
+            self._dihedral_mask = np.zeros(n_dihedrals_padded, dtype=np.float64)
+            self._dihedral_mask[:n_dihedrals] = 1.0
+            self._n_dihedrals_actual = n_dihedrals
         else:
             self._dihedral_indices = np.empty((0, 4), dtype=np.int32)
             self._dihedral_ncvecs = np.empty((0, 3, 3), dtype=np.int32)
+            self._dihedral_indices_padded = np.empty((0, 4), dtype=np.int32)
+            self._dihedral_ncvecs_padded = np.empty((0, 3, 3), dtype=np.int32)
+            self._dihedral_mask = np.empty(0, dtype=np.float64)
+            self._n_dihedrals_actual = 0
 
         self._batched_arrays_valid = True
 
@@ -931,6 +990,8 @@ class BaseInternals:
 
         The tvecs (ncvecs @ cell) are constant for a given cell, so we cache
         them to avoid redundant matrix multiplications during ODE integration.
+
+        Returns both unpadded tvecs (for indexing) and padded tvecs (for batch ops).
         """
         cell_hash = cell.tobytes()
         if hasattr(self, '_tvecs_cache') and self._tvecs_cache.get('cell_hash') == cell_hash:
@@ -938,6 +999,8 @@ class BaseInternals:
 
         self._build_batched_arrays()
         tvecs = {}
+
+        # Unpadded tvecs (for result indexing)
         if len(self._bond_indices) > 0:
             tvecs['bonds'] = self._bond_ncvecs @ cell
         else:
@@ -953,6 +1016,22 @@ class BaseInternals:
         else:
             tvecs['dihedrals'] = np.empty((0, 3, 3), dtype=np.float64)
 
+        # Padded tvecs (for GPU-efficient batch computation)
+        if len(self._bond_indices_padded) > 0:
+            tvecs['bonds_padded'] = self._bond_ncvecs_padded @ cell
+        else:
+            tvecs['bonds_padded'] = np.empty((0, 1, 3), dtype=np.float64)
+
+        if len(self._angle_indices_padded) > 0:
+            tvecs['angles_padded'] = self._angle_ncvecs_padded @ cell
+        else:
+            tvecs['angles_padded'] = np.empty((0, 2, 3), dtype=np.float64)
+
+        if len(self._dihedral_indices_padded) > 0:
+            tvecs['dihedrals_padded'] = self._dihedral_ncvecs_padded @ cell
+        else:
+            tvecs['dihedrals_padded'] = np.empty((0, 3, 3), dtype=np.float64)
+
         self._tvecs_cache = {'cell_hash': cell_hash, 'tvecs': tvecs}
         return tvecs
 
@@ -961,29 +1040,35 @@ class BaseInternals:
         self._batched_arrays_valid = False
 
     def _compute_batched_values(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
-        """Compute all internal coordinate values using vectorized operations."""
+        """Compute all internal coordinate values using vectorized operations.
+
+        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
+        """
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
         result = {}
 
-        # Bonds
-        if len(self._bond_indices) > 0:
-            bond_pos = positions[self._bond_indices]  # (n_bonds, 2, 3)
-            result['bonds'] = np.asarray(_bond_value_batched(bond_pos, tvecs['bonds']))
+        # Bonds - use padded arrays for consistent JAX shapes
+        if self._n_bonds_actual > 0:
+            bond_pos = positions[self._bond_indices_padded]  # (n_padded, 2, 3)
+            values_padded = np.asarray(device_get(_bond_value_batched(bond_pos, tvecs['bonds_padded'])))
+            result['bonds'] = values_padded[:self._n_bonds_actual]
         else:
             result['bonds'] = np.empty(0)
 
         # Angles
-        if len(self._angle_indices) > 0:
-            angle_pos = positions[self._angle_indices]  # (n_angles, 3, 3)
-            result['angles'] = np.asarray(_angle_value_batched(angle_pos, tvecs['angles']))
+        if self._n_angles_actual > 0:
+            angle_pos = positions[self._angle_indices_padded]  # (n_padded, 3, 3)
+            values_padded = np.asarray(device_get(_angle_value_batched(angle_pos, tvecs['angles_padded'])))
+            result['angles'] = values_padded[:self._n_angles_actual]
         else:
             result['angles'] = np.empty(0)
 
         # Dihedrals
-        if len(self._dihedral_indices) > 0:
-            dihedral_pos = positions[self._dihedral_indices]  # (n_dihedrals, 4, 3)
-            result['dihedrals'] = np.asarray(_dihedral_value_batched(dihedral_pos, tvecs['dihedrals']))
+        if self._n_dihedrals_actual > 0:
+            dihedral_pos = positions[self._dihedral_indices_padded]  # (n_padded, 4, 3)
+            values_padded = np.asarray(device_get(_dihedral_value_batched(dihedral_pos, tvecs['dihedrals_padded'])))
+            result['dihedrals'] = values_padded[:self._n_dihedrals_actual]
         else:
             result['dihedrals'] = np.empty(0)
 
@@ -993,32 +1078,33 @@ class BaseInternals:
         """Compute all internal coordinate gradients using vectorized operations.
 
         Returns dict mapping coord type to (indices, gradients) tuples.
+        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
         """
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
         result = {}
 
-        # Bonds
-        if len(self._bond_indices) > 0:
-            bond_pos = positions[self._bond_indices]  # (n_bonds, 2, 3)
-            bond_grads = np.asarray(_bond_grad_batched(bond_pos, tvecs['bonds']))
-            result['bonds'] = (self._bond_indices, bond_grads)
+        # Bonds - use padded arrays
+        if self._n_bonds_actual > 0:
+            bond_pos = positions[self._bond_indices_padded]  # (n_padded, 2, 3)
+            grads_padded = np.asarray(device_get(_bond_grad_batched(bond_pos, tvecs['bonds_padded'])))
+            result['bonds'] = (self._bond_indices, grads_padded[:self._n_bonds_actual])
         else:
             result['bonds'] = (np.empty((0, 2), dtype=np.int32), np.empty((0, 2, 3)))
 
         # Angles
-        if len(self._angle_indices) > 0:
-            angle_pos = positions[self._angle_indices]
-            angle_grads = np.asarray(_angle_grad_batched(angle_pos, tvecs['angles']))
-            result['angles'] = (self._angle_indices, angle_grads)
+        if self._n_angles_actual > 0:
+            angle_pos = positions[self._angle_indices_padded]
+            grads_padded = np.asarray(device_get(_angle_grad_batched(angle_pos, tvecs['angles_padded'])))
+            result['angles'] = (self._angle_indices, grads_padded[:self._n_angles_actual])
         else:
             result['angles'] = (np.empty((0, 3), dtype=np.int32), np.empty((0, 3, 3)))
 
         # Dihedrals
-        if len(self._dihedral_indices) > 0:
-            dihedral_pos = positions[self._dihedral_indices]
-            dihedral_grads = np.asarray(_dihedral_grad_batched(dihedral_pos, tvecs['dihedrals']))
-            result['dihedrals'] = (self._dihedral_indices, dihedral_grads)
+        if self._n_dihedrals_actual > 0:
+            dihedral_pos = positions[self._dihedral_indices_padded]
+            grads_padded = np.asarray(device_get(_dihedral_grad_batched(dihedral_pos, tvecs['dihedrals_padded'])))
+            result['dihedrals'] = (self._dihedral_indices, grads_padded[:self._n_dihedrals_actual])
         else:
             result['dihedrals'] = (np.empty((0, 4), dtype=np.int32), np.empty((0, 4, 3)))
 
@@ -1028,32 +1114,33 @@ class BaseInternals:
         """Compute all internal coordinate hessians using vectorized operations.
 
         Returns dict mapping coord type to (indices, hessians) tuples.
+        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
         """
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
         result = {}
 
-        # Bonds
-        if len(self._bond_indices) > 0:
-            bond_pos = positions[self._bond_indices]
-            bond_hess = np.asarray(_bond_hess_batched(bond_pos, tvecs['bonds']))
-            result['bonds'] = (self._bond_indices, bond_hess)
+        # Bonds - use padded arrays
+        if self._n_bonds_actual > 0:
+            bond_pos = positions[self._bond_indices_padded]
+            hess_padded = np.asarray(device_get(_bond_hess_batched(bond_pos, tvecs['bonds_padded'])))
+            result['bonds'] = (self._bond_indices, hess_padded[:self._n_bonds_actual])
         else:
             result['bonds'] = (np.empty((0, 2), dtype=np.int32), np.empty((0, 2, 3, 2, 3)))
 
         # Angles
-        if len(self._angle_indices) > 0:
-            angle_pos = positions[self._angle_indices]
-            angle_hess = np.asarray(_angle_hess_batched(angle_pos, tvecs['angles']))
-            result['angles'] = (self._angle_indices, angle_hess)
+        if self._n_angles_actual > 0:
+            angle_pos = positions[self._angle_indices_padded]
+            hess_padded = np.asarray(device_get(_angle_hess_batched(angle_pos, tvecs['angles_padded'])))
+            result['angles'] = (self._angle_indices, hess_padded[:self._n_angles_actual])
         else:
             result['angles'] = (np.empty((0, 3), dtype=np.int32), np.empty((0, 3, 3, 3, 3)))
 
         # Dihedrals
-        if len(self._dihedral_indices) > 0:
-            dihedral_pos = positions[self._dihedral_indices]
-            dihedral_hess = np.asarray(_dihedral_hess_batched(dihedral_pos, tvecs['dihedrals']))
-            result['dihedrals'] = (self._dihedral_indices, dihedral_hess)
+        if self._n_dihedrals_actual > 0:
+            dihedral_pos = positions[self._dihedral_indices_padded]
+            hess_padded = np.asarray(device_get(_dihedral_hess_batched(dihedral_pos, tvecs['dihedrals_padded'])))
+            result['dihedrals'] = (self._dihedral_indices, hess_padded[:self._n_dihedrals_actual])
         else:
             result['dihedrals'] = (np.empty((0, 4), dtype=np.int32), np.empty((0, 4, 3, 4, 3)))
 
@@ -1064,32 +1151,36 @@ class BaseInternals:
 
         Returns dict mapping coord type to cell gradient arrays.
         Each gradient has shape (n_coords, 3, 3) for d(coord)/d(cell).
+        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
         """
         self._build_batched_arrays()
         cell_jax = jnp.asarray(cell, dtype=np.float64)
         result = {}
 
-        # Bonds - need positions and ncvecs (not tvecs) for cell gradient
-        if len(self._bond_indices) > 0:
-            bond_pos = jnp.asarray(positions[self._bond_indices], dtype=np.float64)
-            bond_ncvecs = jnp.asarray(self._bond_ncvecs, dtype=np.float64)
-            result['bonds'] = np.asarray(_bond_cell_grad_batched(bond_pos, bond_ncvecs, cell_jax))
+        # Bonds - use padded arrays for consistent JAX shapes
+        if self._n_bonds_actual > 0:
+            bond_pos = jnp.asarray(positions[self._bond_indices_padded], dtype=np.float64)
+            bond_ncvecs = jnp.asarray(self._bond_ncvecs_padded, dtype=np.float64)
+            grads_padded = np.asarray(device_get(_bond_cell_grad_batched(bond_pos, bond_ncvecs, cell_jax)))
+            result['bonds'] = grads_padded[:self._n_bonds_actual]
         else:
             result['bonds'] = np.empty((0, 3, 3))
 
         # Angles
-        if len(self._angle_indices) > 0:
-            angle_pos = jnp.asarray(positions[self._angle_indices], dtype=np.float64)
-            angle_ncvecs = jnp.asarray(self._angle_ncvecs, dtype=np.float64)
-            result['angles'] = np.asarray(_angle_cell_grad_batched(angle_pos, angle_ncvecs, cell_jax))
+        if self._n_angles_actual > 0:
+            angle_pos = jnp.asarray(positions[self._angle_indices_padded], dtype=np.float64)
+            angle_ncvecs = jnp.asarray(self._angle_ncvecs_padded, dtype=np.float64)
+            grads_padded = np.asarray(device_get(_angle_cell_grad_batched(angle_pos, angle_ncvecs, cell_jax)))
+            result['angles'] = grads_padded[:self._n_angles_actual]
         else:
             result['angles'] = np.empty((0, 3, 3))
 
         # Dihedrals
-        if len(self._dihedral_indices) > 0:
-            dihedral_pos = jnp.asarray(positions[self._dihedral_indices], dtype=np.float64)
-            dihedral_ncvecs = jnp.asarray(self._dihedral_ncvecs, dtype=np.float64)
-            result['dihedrals'] = np.asarray(_dihedral_cell_grad_batched(dihedral_pos, dihedral_ncvecs, cell_jax))
+        if self._n_dihedrals_actual > 0:
+            dihedral_pos = jnp.asarray(positions[self._dihedral_indices_padded], dtype=np.float64)
+            dihedral_ncvecs = jnp.asarray(self._dihedral_ncvecs_padded, dtype=np.float64)
+            grads_padded = np.asarray(device_get(_dihedral_cell_grad_batched(dihedral_pos, dihedral_ncvecs, cell_jax)))
+            result['dihedrals'] = grads_padded[:self._n_dihedrals_actual]
         else:
             result['dihedrals'] = np.empty((0, 3, 3))
 
@@ -1507,7 +1598,7 @@ class BaseInternals:
             bond_pos = positions[active_idx]  # (n_active, 2, 3)
             bond_tvecs = tvecs['bonds'][bonds_active]  # (n_active, 1, 3)
             v_sub = v_atoms[active_idx]  # (n_active, 2, 3)
-            hvp = np.asarray(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub))  # (n_active, 2, 3)
+            hvp = np.asarray(device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub)))  # (n_active, 2, 3)
             # Scatter back to full space
             for i in range(len(active_idx)):
                 row = np.zeros(self.ndof)
@@ -1520,7 +1611,7 @@ class BaseInternals:
             angle_pos = positions[active_idx]  # (n_active, 3, 3)
             angle_tvecs = tvecs['angles'][angles_active]  # (n_active, 2, 3)
             v_sub = v_atoms[active_idx]  # (n_active, 3, 3)
-            hvp = np.asarray(_angle_hvp_batched(angle_pos, angle_tvecs, v_sub))  # (n_active, 3, 3)
+            hvp = np.asarray(device_get(_angle_hvp_batched(angle_pos, angle_tvecs, v_sub)))  # (n_active, 3, 3)
             for i in range(len(active_idx)):
                 row = np.zeros(self.ndof)
                 row.reshape((-1, 3))[active_idx[i]] = hvp[i]
@@ -1532,7 +1623,7 @@ class BaseInternals:
             dih_pos = positions[active_idx]  # (n_active, 4, 3)
             dih_tvecs = tvecs['dihedrals'][dihedrals_active]  # (n_active, 3, 3)
             v_sub = v_atoms[active_idx]  # (n_active, 4, 3)
-            hvp = np.asarray(_dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub))  # (n_active, 4, 3)
+            hvp = np.asarray(device_get(_dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)))  # (n_active, 4, 3)
             for i in range(len(active_idx)):
                 row = np.zeros(self.ndof)
                 row.reshape((-1, 3))[active_idx[i]] = hvp[i]
@@ -1558,7 +1649,7 @@ class BaseInternals:
                 axis = coord.kwargs['axis']
                 refpos = coord.kwargs['refpos']
                 # Use direct HVP computation (O(N) instead of O(N²))
-                hvp = np.asarray(_rotation_hvp_jit(pos, axis, refpos, v_sub))
+                hvp = np.asarray(device_get(_rotation_hvp_jit(pos, axis, refpos, v_sub)))
                 row = np.zeros(self.ndof)
                 row.reshape((-1, 3))[idx] = hvp
                 results.append(row)
