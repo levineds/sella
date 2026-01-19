@@ -1593,12 +1593,23 @@ class BaseInternals:
                 results.append(np.zeros(self.ndof))
 
         # Bonds - use batched HVP
-        if bonds_active.any() and len(self._bond_indices) > 0:
-            active_idx = self._bond_indices[bonds_active]
-            bond_pos = positions[active_idx]  # (n_active, 2, 3)
-            bond_tvecs = tvecs['bonds'][bonds_active]  # (n_active, 1, 3)
-            v_sub = v_atoms[active_idx]  # (n_active, 2, 3)
-            hvp = np.asarray(device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub)))  # (n_active, 2, 3)
+        # Use padded arrays when all bonds are active for consistent JAX shapes
+        if bonds_active.any() and self._n_bonds_actual > 0:
+            if bonds_active.all():
+                # All bonds active - use padded arrays to avoid recompilation
+                bond_pos = positions[self._bond_indices_padded]  # (n_padded, 2, 3)
+                bond_tvecs = tvecs['bonds_padded']  # (n_padded, 1, 3)
+                v_sub = v_atoms[self._bond_indices_padded]  # (n_padded, 2, 3)
+                hvp_padded = np.asarray(device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub)))
+                hvp = hvp_padded[:self._n_bonds_actual]  # (n_actual, 2, 3)
+                active_idx = self._bond_indices
+            else:
+                # Only some bonds active - use variable-sized array
+                active_idx = self._bond_indices[bonds_active]
+                bond_pos = positions[active_idx]  # (n_active, 2, 3)
+                bond_tvecs = tvecs['bonds'][bonds_active]  # (n_active, 1, 3)
+                v_sub = v_atoms[active_idx]  # (n_active, 2, 3)
+                hvp = np.asarray(device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub)))
             # Scatter back to full space
             for i in range(len(active_idx)):
                 row = np.zeros(self.ndof)
@@ -1606,24 +1617,46 @@ class BaseInternals:
                 results.append(row)
 
         # Angles - use batched HVP
-        if angles_active.any() and len(self._angle_indices) > 0:
-            active_idx = self._angle_indices[angles_active]
-            angle_pos = positions[active_idx]  # (n_active, 3, 3)
-            angle_tvecs = tvecs['angles'][angles_active]  # (n_active, 2, 3)
-            v_sub = v_atoms[active_idx]  # (n_active, 3, 3)
-            hvp = np.asarray(device_get(_angle_hvp_batched(angle_pos, angle_tvecs, v_sub)))  # (n_active, 3, 3)
+        # Use padded arrays when all angles are active for consistent JAX shapes
+        if angles_active.any() and self._n_angles_actual > 0:
+            if angles_active.all():
+                # All angles active - use padded arrays to avoid recompilation
+                angle_pos = positions[self._angle_indices_padded]  # (n_padded, 3, 3)
+                angle_tvecs = tvecs['angles_padded']  # (n_padded, 2, 3)
+                v_sub = v_atoms[self._angle_indices_padded]  # (n_padded, 3, 3)
+                hvp_padded = np.asarray(device_get(_angle_hvp_batched(angle_pos, angle_tvecs, v_sub)))
+                hvp = hvp_padded[:self._n_angles_actual]  # (n_actual, 3, 3)
+                active_idx = self._angle_indices
+            else:
+                # Only some angles active - use variable-sized array
+                active_idx = self._angle_indices[angles_active]
+                angle_pos = positions[active_idx]  # (n_active, 3, 3)
+                angle_tvecs = tvecs['angles'][angles_active]  # (n_active, 2, 3)
+                v_sub = v_atoms[active_idx]  # (n_active, 3, 3)
+                hvp = np.asarray(device_get(_angle_hvp_batched(angle_pos, angle_tvecs, v_sub)))
             for i in range(len(active_idx)):
                 row = np.zeros(self.ndof)
                 row.reshape((-1, 3))[active_idx[i]] = hvp[i]
                 results.append(row)
 
         # Dihedrals - use batched HVP
-        if dihedrals_active.any() and len(self._dihedral_indices) > 0:
-            active_idx = self._dihedral_indices[dihedrals_active]
-            dih_pos = positions[active_idx]  # (n_active, 4, 3)
-            dih_tvecs = tvecs['dihedrals'][dihedrals_active]  # (n_active, 3, 3)
-            v_sub = v_atoms[active_idx]  # (n_active, 4, 3)
-            hvp = np.asarray(device_get(_dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)))  # (n_active, 4, 3)
+        # Use padded arrays when all dihedrals are active for consistent JAX shapes
+        if dihedrals_active.any() and self._n_dihedrals_actual > 0:
+            if dihedrals_active.all():
+                # All dihedrals active - use padded arrays to avoid recompilation
+                dih_pos = positions[self._dihedral_indices_padded]  # (n_padded, 4, 3)
+                dih_tvecs = tvecs['dihedrals_padded']  # (n_padded, 3, 3)
+                v_sub = v_atoms[self._dihedral_indices_padded]  # (n_padded, 4, 3)
+                hvp_padded = np.asarray(device_get(_dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)))
+                hvp = hvp_padded[:self._n_dihedrals_actual]  # (n_actual, 4, 3)
+                active_idx = self._dihedral_indices
+            else:
+                # Only some dihedrals active - use variable-sized array
+                active_idx = self._dihedral_indices[dihedrals_active]
+                dih_pos = positions[active_idx]  # (n_active, 4, 3)
+                dih_tvecs = tvecs['dihedrals'][dihedrals_active]  # (n_active, 3, 3)
+                v_sub = v_atoms[active_idx]  # (n_active, 4, 3)
+                hvp = np.asarray(device_get(_dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)))
             for i in range(len(active_idx)):
                 row = np.zeros(self.ndof)
                 row.reshape((-1, 3))[active_idx[i]] = hvp[i]
@@ -2599,13 +2632,15 @@ class Internals(BaseInternals):
             return None
 
         # Use vectorized computation to check all angles at once
+        # Use padded arrays for consistent JAX shapes (avoids recompilation)
         self._build_batched_arrays()
-        if len(self._angle_indices) > 0:
+        if self._n_angles_actual > 0:
             positions = self.all_positions
             cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
             tvecs = self._get_cached_tvecs(cell)
-            angle_pos = positions[self._angle_indices]
-            angle_vals = np.asarray(_angle_value_batched(angle_pos, tvecs['angles']))
+            angle_pos = positions[self._angle_indices_padded]
+            angle_vals_padded = np.asarray(_angle_value_batched(angle_pos, tvecs['angles_padded']))
+            angle_vals = angle_vals_padded[:self._n_angles_actual]
 
             # Find bad angles
             bad_mask = ~((self.atol < angle_vals) & (angle_vals < np.pi - self.atol))
