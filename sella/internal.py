@@ -2544,15 +2544,19 @@ class Internals(BaseInternals):
             except DuplicateInternalError:
                 continue
 
-        # Second, add improper dihedrals for atoms with 3+ neighbors that don't
+        # Second, add improper dihedrals for atoms with 3 or 4 neighbors that don't
         # have any proper dihedral passing through them. This is needed because:
         # 1. At planar geometries, bond/angle derivatives vanish for out-of-plane motion
         # 2. Even starting non-planar, the geometry may planarize during optimization
         # 3. Improper dihedrals capture the out-of-plane (umbrella) mode
+
+
+        # Note this does add some redundancy to the internals but it also makes it
+        # so that the Jacobian is well-conditioned in the case of planar systems,
+        # such as nitrate.
         #
         # We only add impropers when no proper dihedral exists through the atom,
-        # which avoids redundancy for ring systems like benzene where proper
-        # dihedrals already capture out-of-plane motion.
+        # which avoids excessive unnecessary additional internals.
 
         # First, find which atoms have proper dihedrals through them
         dihedral_centers = set()
@@ -2616,9 +2620,7 @@ class Internals(BaseInternals):
         else:
             ndof = 3 * (self.natoms + self.ndummies) - 6
 
-        # Only warn if expected DOF is positive (skip degenerate cases like
-        # single atoms where ndof = 3 - 6 = -3)
-        if ndof > 0 and ndeloc != ndof:
+        if ndeloc != ndof:
             warnings.warn(
                 f'{ndeloc} coords found! Expected {ndof}.'
             )

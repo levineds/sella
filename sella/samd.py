@@ -59,7 +59,7 @@ def velocity_rescaling(func, x0, ngen, T0, Tf, dt, *args, schedule=T_linear, v0=
     for i in range(ngen):
         old_f = f
         old_g = g.copy()
-        
+
         x += dt * v - 0.5 * dt**2 * g
         f, g = func(x, *args, **kwargs)
 
@@ -90,7 +90,7 @@ def csvr(func, x0, ngen, T0, Tf, dt, *args, schedule=T_linear, v0=None, **kwargs
     for i in range(ngen):
         old_f = f
         old_g = g.copy()
-        
+
         x += dt * v - 0.5 * dt**2 * g
         f, g = func(x, *args, **kwargs)
 
