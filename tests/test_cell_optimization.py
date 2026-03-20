@@ -428,11 +428,13 @@ class TestCellCartesianGradient:
         g_cell_numeric = np.zeros(pes.n_cell_dof)
 
         for i in range(pes.n_cell_dof):
+            pes.set_x(x0)  # Restore before each probe
             x_plus = x0.copy()
             x_plus[pes.n_cart + i] += delta
             pes.set_x(x_plus)
             e_plus, _ = pes.eval()
 
+            pes.set_x(x0)  # Restore before -delta
             x_minus = x0.copy()
             x_minus[pes.n_cart + i] -= delta
             pes.set_x(x_minus)
@@ -461,11 +463,13 @@ class TestCellCartesianGradient:
         g_cart_numeric = np.zeros(pes.n_cart)
 
         for i in range(pes.n_cart):
+            pes.set_x(x0)  # Restore before each probe
             x_plus = x0.copy()
             x_plus[i] += delta
             pes.set_x(x_plus)
             e_plus, _ = pes.eval()
 
+            pes.set_x(x0)  # Restore before -delta
             x_minus = x0.copy()
             x_minus[i] -= delta
             pes.set_x(x_minus)
@@ -645,11 +649,13 @@ class TestCellGradient:
         g_cell_numeric = np.zeros(pes.n_cell_dof)
 
         for i in range(pes.n_cell_dof):
+            pes.set_x(x0)  # Restore before each probe
             x_plus = x0.copy()
             x_plus[pes.n_internal + i] += delta
             pes.set_x(x_plus)
             e_plus, _ = pes.eval()
 
+            pes.set_x(x0)  # Restore before -delta
             x_minus = x0.copy()
             x_minus[pes.n_internal + i] -= delta
             pes.set_x(x_minus)
@@ -1168,11 +1174,13 @@ class TestRigidFragments:
         g_cell_numeric = np.zeros(pes.n_cell_dof)
 
         for i in range(pes.n_cell_dof):
+            pes.set_x(x0)  # Restore before each probe
             x_plus = x0.copy()
             x_plus[pes.n_internal + i] += delta
             pes.set_x(x_plus)
             e_plus, _ = pes.eval()
 
+            pes.set_x(x0)  # Restore before -delta
             x_minus = x0.copy()
             x_minus[pes.n_internal + i] -= delta
             pes.set_x(x_minus)
@@ -1217,11 +1225,13 @@ class TestRigidFragments:
         g_cell_numeric = np.zeros(pes.n_cell_dof)
 
         for i in range(pes.n_cell_dof):
+            pes.set_x(x0)  # Restore before each probe
             x_plus = x0.copy()
             x_plus[pes.n_internal + i] += delta
             pes.set_x(x_plus)
             e_plus, _ = pes.eval()
 
+            pes.set_x(x0)  # Restore before -delta
             x_minus = x0.copy()
             x_minus[pes.n_internal + i] -= delta
             pes.set_x(x_minus)

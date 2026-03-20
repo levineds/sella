@@ -1160,12 +1160,20 @@ class CellInternalPES(InternalPES):
         print(f"Refining initial Hessian: 0/{n_evals} force calls", end="", flush=True)
 
         for i in range(self.n_cell_dof):
+            # Restore before each probe pair
+            self.atoms.positions = pos0.copy()
+            self.atoms.set_cell(cell0, scale_atoms=False)
+
             # Displace cell parameter +delta
             x_plus = x0.copy()
             x_plus[self.n_internal + i] += delta
             self.set_x(x_plus)
             _, g_plus = self.eval()
             print(f"\rRefining initial Hessian: {2*i + 1}/{n_evals} force calls", end="", flush=True)
+
+            # Restore before -delta
+            self.atoms.positions = pos0.copy()
+            self.atoms.set_cell(cell0, scale_atoms=False)
 
             # Displace cell parameter -delta
             x_minus = x0.copy()
@@ -1233,12 +1241,20 @@ class CellInternalPES(InternalPES):
         print(f"Refining TRIC Hessian: 0/{n_evals} force calls", end="", flush=True)
 
         for i, idx in enumerate(tric_indices):
+            # Restore before each probe pair
+            self.atoms.positions = pos0.copy()
+            self.atoms.set_cell(cell0, scale_atoms=False)
+
             # Displace TRIC parameter +delta
             x_plus = x0.copy()
             x_plus[idx] += delta
             self.set_x(x_plus)
             _, g_plus = self.eval()
             print(f"\rRefining TRIC Hessian: {2*i + 1}/{n_evals} force calls", end="", flush=True)
+
+            # Restore before -delta
+            self.atoms.positions = pos0.copy()
+            self.atoms.set_cell(cell0, scale_atoms=False)
 
             # Displace TRIC parameter -delta
             x_minus = x0.copy()
@@ -1289,11 +1305,19 @@ class CellInternalPES(InternalPES):
         print(f"Refining internal Hessian: 0/{n_evals} force calls", end="", flush=True)
 
         for i in range(self.n_internal):
+            # Restore before each probe pair
+            self.atoms.positions = pos0.copy()
+            self.atoms.set_cell(cell0, scale_atoms=False)
+
             # Displace internal coordinate +delta
             x_plus = x0.copy()
             x_plus[i] += delta
             self.set_x(x_plus)
             _, g_plus = self.eval()
+
+            # Restore before -delta
+            self.atoms.positions = pos0.copy()
+            self.atoms.set_cell(cell0, scale_atoms=False)
 
             # Displace internal coordinate -delta
             x_minus = x0.copy()
@@ -1347,9 +1371,8 @@ class CellInternalPES(InternalPES):
     def _set_cell_from_log_deform(self, log_deform_scaled: np.ndarray) -> None:
         """Set cell from scaled log-deformation gradient.
 
-        When rigid_fragments is False (no molecular fragments), scales atomic
-        positions with cell (fixed fractional coords), matching the virial
-        stress definition.
+        When rigid_fragments is False, scales atomic positions with cell
+        (fixed fractional coords), matching the virial stress definition.
 
         When rigid_fragments is True, keeps Cartesian positions fixed here.
         The rigid fragment CoM translation in set_x() then moves each fragment
