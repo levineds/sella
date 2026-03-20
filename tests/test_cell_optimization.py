@@ -1118,16 +1118,6 @@ class TestRigidFragments:
         pes = CellInternalPES(atoms, internals, rigid_fragments=False)
         assert pes.rigid_fragments is False
 
-    def test_rigid_fragments_forces_scale_atoms_false(self):
-        """Test that rigid_fragments forces scale_atoms=False."""
-        atoms = self._make_two_water_crystal()
-        internals = Internals(atoms, allow_fragments=True)
-
-        # Even if scale_atoms=True is requested, rigid_fragments overrides it
-        pes = CellInternalPES(atoms, internals, rigid_fragments=True,
-                              scale_atoms=True)
-        assert pes.scale_atoms is False
-
     def test_fragment_groups_correct_atoms(self):
         """Test that fragment groups contain the correct atom indices."""
         atoms = self._make_two_water_crystal()
@@ -1269,12 +1259,8 @@ class TestRigidFragments:
         # Skip translations (those change with cell), check bonds/angles
         assert_allclose(q0[n_trans:], q1[n_trans:], atol=1e-3)
 
-    def test_monoatomic_rigid_fragments_same_as_scale_atoms(self):
-        """For monoatomic crystals, rigid_fragments should give same gradient as scale_atoms=True.
-
-        When each atom is its own fragment, Δr=0, so the correction vanishes
-        and we get the same result as scale_atoms=True.
-        """
+    def test_monoatomic_rigid_fragments_trivial(self):
+        """For monoatomic crystals, Δr=0 so rigid_fragments correction vanishes."""
         atoms = bulk('Cu', 'fcc', a=3.6)
         atoms.calc = EMT()
 

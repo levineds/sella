@@ -72,7 +72,6 @@ class Sella(Optimizer):
         allow_fragments: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
-        scale_atoms: bool = False,
         **kwargs
     ):
         """Initialize Sella optimizer.
@@ -107,10 +106,6 @@ class Sella(Optimizer):
             - 3: Refine full internal Hessian (2 * n_internal force calls, expensive!)
         save_hessian : str, optional
             Path to save the initial Hessian as .npy file for analysis.
-        scale_atoms : bool, optional
-            If True, scale atomic positions when cell changes (fractional coords fixed).
-            If False, keep Cartesian positions fixed when cell changes.
-            Default is False, which decouples atomic and cell DOF for easier optimization.
         """
         if order == 0:
             default = _default_kwargs['minimum']
@@ -218,7 +213,6 @@ class Sella(Optimizer):
         allow_fragments: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
-        scale_atoms: bool = False,
         **kwargs
     ):
         if internal:
@@ -252,7 +246,6 @@ class Sella(Optimizer):
                     exp_cell_factor=exp_cell_factor,
                     cell_mask=cell_mask,
                     scalar_pressure=scalar_pressure,
-                    scale_atoms=scale_atoms,
                     refine_initial_hessian=refine_initial_hessian,
                     save_hessian=save_hessian,
                     **kwargs
@@ -285,7 +278,6 @@ class Sella(Optimizer):
                     exp_cell_factor=exp_cell_factor,
                     cell_mask=cell_mask,
                     scalar_pressure=scalar_pressure,
-                    scale_atoms=scale_atoms,
                     refine_initial_hessian=refine_initial_hessian,
                     save_hessian=save_hessian,
                     **kwargs
