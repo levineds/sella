@@ -1,7 +1,7 @@
 from typing import Union, Callable
 
 import numpy as np
-from scipy.linalg import eigh, expm, logm
+from scipy.linalg import eigh, expm, expm_frechet, logm
 from scipy.integrate import LSODA
 from ase import Atoms
 from ase.utils import basestring
@@ -1336,7 +1336,7 @@ class CellInternalPES(InternalPES):
         """
         log_deform = log_deform_scaled / self.exp_cell_factor
         F = expm(log_deform.real)
-        new_cell = self.orig_cell @ F.T
+        new_cell = F @ self.orig_cell
         self.atoms.set_cell(new_cell, scale_atoms=self.scale_atoms)
 
     def _masked_cell_params(self) -> np.ndarray:
@@ -1545,7 +1545,18 @@ class CellInternalPES(InternalPES):
         return f, np.concatenate([g_internal, g_cell])
 
     def _stress_to_cell_gradient(self, stress_voigt: np.ndarray) -> np.ndarray:
-        """Convert stress tensor to gradient w.r.t. cell parameters."""
+        """Convert stress tensor to gradient w.r.t. log-deformation cell parameters.
+
+        Uses the Frechet derivative of the matrix exponential to correctly
+        transform dE/dF into dE/dU = dE/d(log F).
+
+        The virial stress V*σ relates to dE/dC via (ASE row-vector convention):
+            V*σ = dE/dC^T @ C - f^T @ r
+
+        For internal coordinates, the stress at fixed fractional coords gives:
+            dE/dC = C^{-T} @ V*σ
+            dE/dF = dE/dC @ C₀^T  (chain rule through cell = F @ C₀)
+        """
         volume = self.atoms.get_volume()
         stress_3x3 = voigt_6_to_full_3x3_stress(stress_voigt)
 
@@ -1553,17 +1564,27 @@ class CellInternalPES(InternalPES):
         if self.scalar_pressure != 0.0:
             stress_3x3 += self.scalar_pressure * np.eye(3)
 
-        # Gradient w.r.t. cell = V * stress
-        g_cell_3x3 = volume * stress_3x3
+        # dE/dF at fixed fractional coordinates
+        # dE/dC = C^{-T} @ V*σ, then dE/dF = dE/dC @ C₀^T
+        C = self.atoms.get_cell().array
+        dEdF = np.linalg.inv(C.T) @ (volume * stress_3x3) @ self.orig_cell.T
 
-        # Apply cell mask
-        g_cell_masked = g_cell_3x3 * self.cell_mask
+        # Convert dE/dF to dE/dU via Frechet derivative of expm
+        F = self._get_deformation_gradient()
+        U = logm(F).real
+        g_cell_3x3 = np.zeros((3, 3))
+        for mu in range(3):
+            for nu in range(3):
+                E = np.zeros((3, 3))
+                E[mu, nu] = 1.0
+                expm_der = expm_frechet(U, E, compute_expm=False)
+                g_cell_3x3[mu, nu] = np.sum(expm_der * dEdF)
 
-        # Scale by exp_cell_factor (inverse of the scaling in get_x)
-        g_cell_full = g_cell_masked / self.exp_cell_factor
+        # Apply cell mask and scale
+        g_cell_3x3 = g_cell_3x3 * self.cell_mask
+        g_cell_3x3 = g_cell_3x3 / self.exp_cell_factor
 
-        # Return only free DOF
-        return g_cell_full[self.cell_mask]
+        return g_cell_3x3[self.cell_mask]
 
     def get_g(self) -> np.ndarray:
         """Get combined gradient (internal + cell)."""
@@ -2002,7 +2023,7 @@ class CellCartesianPES(PES):
         """
         log_deform = log_deform_scaled / self.exp_cell_factor
         F = expm(log_deform.real)
-        new_cell = self.orig_cell @ F.T
+        new_cell = F @ self.orig_cell
         self.atoms.set_cell(new_cell, scale_atoms=self.scale_atoms)
 
     def _masked_cell_params(self) -> np.ndarray:
@@ -2065,28 +2086,32 @@ class CellCartesianPES(PES):
         if self.scalar_pressure != 0.0:
             f += self.scalar_pressure * self.atoms.get_volume()
 
-        # Cartesian gradient (no Jacobian needed)
+        # Cartesian gradient: Sella works in actual Cartesian positions
+        # (not the undeformed frame), so no F transformation needed
         forces = self.atoms.get_forces()
         g_cart = -forces.ravel()
 
         # Stress tensor -> cell gradient
         stress = self.atoms.get_stress()  # 6-component Voigt, eV/Å³
-        g_cell = self._stress_to_cell_gradient(stress)
+        g_cell = self._stress_to_cell_gradient(stress, forces)
 
         self.write_traj()
         return f, np.concatenate([g_cart, g_cell])
 
-    def _stress_to_cell_gradient(self, stress_voigt: np.ndarray) -> np.ndarray:
-        """Convert stress tensor to gradient w.r.t. cell parameters.
+    def _stress_to_cell_gradient(self, stress_voigt: np.ndarray,
+                                 forces: np.ndarray) -> np.ndarray:
+        """Convert stress tensor to gradient w.r.t. log-deformation cell parameters.
 
-        The stress tensor gives dE/dε assuming atoms scale with the cell
-        (fractional coordinates fixed). Since we use scale_atoms=False,
-        we need to add a correction for the energy change from NOT moving
-        the atoms when the cell changes.
+        Uses the Frechet derivative of the matrix exponential to correctly
+        transform dE/dF into dE/dU = dE/d(log F).
 
-        The correction is: Σ f_i ⊗ r_i (outer product of force and position)
-        This accounts for the work that would be done by forces if atoms
-        were to move with the cell strain.
+        The virial stress V*σ relates to dE/dC via (ASE row-vector convention):
+            V*σ = dE/dC^T @ C - f^T @ r
+
+        So dE/dC = C^{-T} @ (V*σ + r^T @ f)  at fixed Cartesian positions, or
+           dE/dC = C^{-T} @ V*σ              at fixed fractional positions.
+
+        Then dE/dF = dE/dC @ C₀^T via chain rule through cell = F @ C₀.
         """
         volume = self.atoms.get_volume()
         stress_3x3 = voigt_6_to_full_3x3_stress(stress_voigt)
@@ -2095,26 +2120,37 @@ class CellCartesianPES(PES):
         if self.scalar_pressure != 0.0:
             stress_3x3 += self.scalar_pressure * np.eye(3)
 
-        # Gradient w.r.t. cell = V * stress
-        g_cell_3x3 = volume * stress_3x3
+        C = self.atoms.get_cell().array
+        C_inv_T = np.linalg.inv(C.T)
 
-        # Correction for scale_atoms=False: subtract force-position virial term
-        # The stress assumes atoms scale with the cell (fractional coords fixed).
-        # When atoms DON'T scale, the work that would be done by forces is not done,
-        # so we subtract that contribution from the gradient.
-        forces = self.atoms.get_forces()
+        # V*σ from the virial stress
+        virial = volume * stress_3x3
+
+        # In CellCartesianPES, positions are always set independently after
+        # cell changes (set_x overrides any position scaling), so we always
+        # need the fixed-Cartesian gradient: dE/dC = C^{-T} @ (V*σ + r^T @ f)
         positions = self.atoms.get_positions()
-        correction = forces.T @ positions  # 3x3 matrix: Σ f_i ⊗ r_i
-        g_cell_3x3 = g_cell_3x3 - correction
+        dEdC = C_inv_T @ (virial + positions.T @ forces)
 
-        # Apply cell mask
-        g_cell_masked = g_cell_3x3 * self.cell_mask
+        # Chain rule: cell = F @ C₀, so dE/dF = dE/dC @ C₀^T
+        dEdF = dEdC @ self.orig_cell.T
 
-        # Scale by exp_cell_factor (inverse of the scaling in get_x)
-        g_cell_full = g_cell_masked / self.exp_cell_factor
+        # Convert dE/dF to dE/dU via Frechet derivative of expm
+        F = self._get_deformation_gradient()
+        U = logm(F).real
+        g_cell_3x3 = np.zeros((3, 3))
+        for mu in range(3):
+            for nu in range(3):
+                E = np.zeros((3, 3))
+                E[mu, nu] = 1.0
+                expm_der = expm_frechet(U, E, compute_expm=False)
+                g_cell_3x3[mu, nu] = np.sum(expm_der * dEdF)
 
-        # Return only free DOF
-        return g_cell_full[self.cell_mask]
+        # Apply cell mask and scale
+        g_cell_3x3 = g_cell_3x3 * self.cell_mask
+        g_cell_3x3 = g_cell_3x3 / self.exp_cell_factor
+
+        return g_cell_3x3[self.cell_mask]
 
     def get_g(self) -> np.ndarray:
         """Get combined gradient (Cartesian + cell)."""
