@@ -1414,7 +1414,17 @@ class CellInternalPES(InternalPES):
 
         This is more complex than InternalPES.set_x because:
         1. We first update the cell (which changes internal coord values)
-        2. Then update atomic positions to match target internal coords
+        2. Then apply only the internal coordinate *step* (dq) on top
+
+        The cell change moves atoms according to the mode:
+        - rigid_fragments=True: scale_atoms=False + CoM translation
+          (preserves intramolecular geometry)
+        - rigid_fragments=False: scale_atoms=True
+          (atoms scale with cell, changing bonds/angles)
+
+        In both cases, the internal coord solver only applies the dq
+        displacement requested by the optimizer, NOT the full q_target.
+        This ensures the gradient is consistent with the actual displacement.
 
         Returns
         -------
@@ -1425,7 +1435,9 @@ class CellInternalPES(InternalPES):
         dx_initial = target - x0
 
         # Split target into internal and cell parts
-        q_target = target[:self.n_internal]
+        # dq is the internal coordinate step the optimizer requested
+        q0 = x0[:self.n_internal]
+        dq = target[:self.n_internal] - q0
         cell_target = target[self.n_internal:]
 
         # Get initial cell params
@@ -1436,7 +1448,7 @@ class CellInternalPES(InternalPES):
             pos_before = self.atoms.get_positions().copy()
             cell_before = self.atoms.get_cell().array.copy()
 
-        # Update cell
+        # Update cell (scales atoms if rigid_fragments=False)
         self._set_masked_cell_params(cell_target)
 
         # Rigid fragment mode: translate fragment CoMs to maintain
@@ -1450,6 +1462,12 @@ class CellInternalPES(InternalPES):
                 com_frac = com_old @ cell_before_inv
                 com_new = com_frac @ cell_after
                 self.atoms.positions[group] += (com_new - com_old)
+
+        # Read back internal coords AFTER the cell change moved atoms.
+        # The solver targets q_after_cell + dq, not the raw q_target.
+        # This ensures we don't undo the atom motion from the cell change.
+        q_after_cell = self.int.calc()
+        q_target = q_after_cell + dq
 
         # If there are no internal coordinates, we're done
         if self.n_internal == 0:
