@@ -941,6 +941,7 @@ class CellInternalPES(InternalPES):
         cell_mask: np.ndarray = None,
         scalar_pressure: float = 0.0,
         scale_atoms: bool = False,
+        rigid_fragments: bool = None,
         refine_initial_hessian: Union[bool, int] = False,
         hessian_delta: float = 1e-5,
         save_hessian: str = None,
@@ -954,6 +955,12 @@ class CellInternalPES(InternalPES):
         scale_atoms : bool
             If True, scale atomic positions when cell changes (correct gradient).
             If False, keep Cartesian positions fixed (decoupled optimization).
+        rigid_fragments : bool, optional
+            If True, cell changes translate fragment centers of mass to maintain
+            fractional CoM positions while preserving intramolecular geometry.
+            This zeroes out cell-intramolecular Hessian coupling while keeping
+            physical cell-TRIC coupling. Auto-detected: defaults to True when
+            internals have translations (allow_fragments=True), else False.
         refine_initial_hessian : bool or int
             Level of Hessian refinement via finite differences:
             - False or 0: No refinement (default)
@@ -980,7 +987,11 @@ class CellInternalPES(InternalPES):
         # External pressure
         self.scalar_pressure = scalar_pressure
 
-        # Whether to scale atoms when cell changes
+        # Store rigid_fragments request; auto-detection deferred until after
+        # parent init populates translations via find_all_bonds()
+        self._rigid_fragments_request = rigid_fragments
+
+        # Whether to scale atoms when cell changes (may be overridden below)
         self.scale_atoms = scale_atoms
 
         # Flag to control get_x behavior during parent initialization
@@ -989,10 +1000,24 @@ class CellInternalPES(InternalPES):
         self.n_internal = None  # Will be set by parent
 
         # Initialize parent class - this will set up internal coords
+        # (including finding bonds/angles/translations if auto_find_internals)
         InternalPES.__init__(self, atoms, internals, *args, H0=H0, **kwargs)
 
         # Now parent is initialized. Store internal-only dimension.
         self.n_internal = self.dim  # Parent set dim to internal coords count
+
+        # Rigid fragment mode: auto-detect from translations in internals
+        # (must be after parent init, which calls find_all_bonds and adds translations)
+        if self._rigid_fragments_request is None:
+            self.rigid_fragments = bool(self.int.internals.get('translations', []))
+        else:
+            self.rigid_fragments = self._rigid_fragments_request
+
+        if self.rigid_fragments:
+            # Extract fragment atom groups from Translation coordinates
+            self.fragment_groups = self._extract_fragment_groups(self.int)
+            # Force scale_atoms=False — we handle position updates ourselves
+            self.scale_atoms = False
 
         # Update dimension to include cell DOF
         self.dim = self.n_internal + self.n_cell_dof
@@ -1350,6 +1375,43 @@ class CellInternalPES(InternalPES):
         log_deform[self.cell_mask] = params
         self._set_cell_from_log_deform(log_deform)
 
+    @staticmethod
+    def _extract_fragment_groups(internals):
+        """Extract fragment atom groups from Translation coordinates.
+
+        Each fragment has 3 Translation coordinates (dim=0,1,2).
+        We use dim=0 to identify one Translation per fragment and
+        extract the atom indices.
+
+        Returns
+        -------
+        list of ndarray
+            Each element is an array of atom indices for one fragment.
+        """
+        groups = []
+        for trans in internals.internals.get('translations', []):
+            if trans.kwargs['dim'] == 0:  # One per fragment (x-dim)
+                groups.append(np.array(trans.indices))
+        return groups
+
+    def _compute_delta_r(self):
+        """Compute positions relative to fragment center of mass.
+
+        Returns Δr = r - r_CoM_expanded, where each atom's position is
+        relative to its fragment's geometric center. Uses geometric center
+        (unweighted mean) for consistency with how TRICs define translations.
+
+        Returns
+        -------
+        delta_r : ndarray, shape (n_atoms, 3)
+        """
+        positions = self.atoms.get_positions()
+        delta_r = positions.copy()
+        for group in self.fragment_groups:
+            com = positions[group].mean(axis=0)
+            delta_r[group] -= com
+        return delta_r
+
     def set_x(self, target: np.ndarray):
         """Set internal coordinates and cell parameters.
 
@@ -1372,8 +1434,25 @@ class CellInternalPES(InternalPES):
         # Get initial cell params
         cell_params0 = self._masked_cell_params()
 
+        # Save state before cell change for rigid fragment mode
+        if self.rigid_fragments:
+            pos_before = self.atoms.get_positions().copy()
+            cell_before = self.atoms.get_cell().array.copy()
+
         # Update cell
         self._set_masked_cell_params(cell_target)
+
+        # Rigid fragment mode: translate fragment CoMs to maintain
+        # fractional positions after cell change
+        if self.rigid_fragments:
+            cell_after = self.atoms.get_cell().array
+            cell_before_inv = np.linalg.inv(cell_before)
+            for group in self.fragment_groups:
+                com_old = pos_before[group].mean(axis=0)
+                # Convert old CoM to fractional, then to new Cartesian
+                com_frac = com_old @ cell_before_inv
+                com_new = com_frac @ cell_after
+                self.atoms.positions[group] += (com_new - com_old)
 
         # If there are no internal coordinates, we're done
         if self.n_internal == 0:
@@ -1539,12 +1618,12 @@ class CellInternalPES(InternalPES):
 
         # Stress tensor -> cell gradient
         stress = self.atoms.get_stress()  # 6-component Voigt, eV/Å³
-        g_cell = self._stress_to_cell_gradient(stress)
+        g_cell = self._stress_to_cell_gradient(stress, forces=forces)
 
         self.write_traj()
         return f, np.concatenate([g_internal, g_cell])
 
-    def _stress_to_cell_gradient(self, stress_voigt: np.ndarray) -> np.ndarray:
+    def _stress_to_cell_gradient(self, stress_voigt: np.ndarray, forces: np.ndarray = None) -> np.ndarray:
         """Convert stress tensor to gradient w.r.t. log-deformation cell parameters.
 
         Uses the Frechet derivative of the matrix exponential to correctly
@@ -1553,9 +1632,17 @@ class CellInternalPES(InternalPES):
         The virial stress V*σ relates to dE/dC via (ASE row-vector convention):
             V*σ = dE/dC^T @ C - f^T @ r
 
-        For internal coordinates, the stress at fixed fractional coords gives:
-            dE/dC = C^{-T} @ V*σ
-            dE/dF = dE/dC @ C₀^T  (chain rule through cell = F @ C₀)
+        For different atom-motion modes (where Δr = r - r_CoM_expanded):
+            scale_atoms=True:   dE/dC = C^{-T} @ V*σ                    @ C₀^T
+            rigid_fragments:    dE/dC = C^{-T} @ (V*σ + Δr^T @ f)       @ C₀^T
+            scale_atoms=False:  dE/dC = C^{-T} @ (V*σ + r^T  @ f)       @ C₀^T
+
+        Parameters
+        ----------
+        stress_voigt : ndarray
+            6-component Voigt stress tensor.
+        forces : ndarray, optional
+            Atomic forces, shape (n_atoms, 3). Required when rigid_fragments=True.
         """
         volume = self.atoms.get_volume()
         stress_3x3 = voigt_6_to_full_3x3_stress(stress_voigt)
@@ -1564,10 +1651,20 @@ class CellInternalPES(InternalPES):
         if self.scalar_pressure != 0.0:
             stress_3x3 += self.scalar_pressure * np.eye(3)
 
-        # dE/dF at fixed fractional coordinates
-        # dE/dC = C^{-T} @ V*σ, then dE/dF = dE/dC @ C₀^T
+        # The virial V*σ is the base term
+        virial = volume * stress_3x3
+
+        if self.rigid_fragments and forces is not None:
+            # Rigid fragment mode: use Δr^T @ f correction
+            # Δr = positions relative to fragment CoM
+            delta_r = self._compute_delta_r()
+            virial_corrected = virial + delta_r.T @ forces
+        else:
+            virial_corrected = virial
+
+        # dE/dC = C^{-T} @ virial_corrected, then dE/dF = dE/dC @ C₀^T
         C = self.atoms.get_cell().array
-        dEdF = np.linalg.inv(C.T) @ (volume * stress_3x3) @ self.orig_cell.T
+        dEdF = np.linalg.inv(C.T) @ virial_corrected @ self.orig_cell.T
 
         # Convert dE/dF to dE/dU via Frechet derivative of expm
         F = self._get_deformation_gradient()

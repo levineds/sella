@@ -1075,5 +1075,245 @@ class TestRefineInitialHessian:
         assert pes.neval == 6
 
 
+class TestRigidFragments:
+    """Test rigid fragment mode for molecular crystal cell optimization."""
+
+    def _make_two_water_crystal(self, cell_diag=7.0):
+        """Create two water molecules in a periodic box."""
+        water1 = molecule('H2O')
+        water2 = molecule('H2O')
+        water1.positions += [1.0, 1.0, 1.0]
+        water2.positions += [4.0, 4.0, 4.0]
+        atoms = water1 + water2
+        atoms.set_cell([cell_diag, cell_diag, cell_diag])
+        atoms.pbc = True
+        atoms.calc = LennardJones()
+        return atoms
+
+    def test_rigid_fragments_auto_detected(self):
+        """Test that rigid_fragments is auto-detected from allow_fragments."""
+        atoms = self._make_two_water_crystal()
+        internals = Internals(atoms, allow_fragments=True)
+
+        pes = CellInternalPES(atoms, internals)
+        assert pes.rigid_fragments is True
+        assert hasattr(pes, 'fragment_groups')
+        assert len(pes.fragment_groups) == 2  # Two water molecules
+
+    def test_rigid_fragments_not_detected_without_fragments(self):
+        """Test that rigid_fragments is False when no translations exist."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+        internals = Internals(atoms)
+
+        pes = CellInternalPES(atoms, internals)
+        assert pes.rigid_fragments is False
+
+    def test_rigid_fragments_explicit_override(self):
+        """Test that rigid_fragments can be explicitly set."""
+        atoms = self._make_two_water_crystal()
+        internals = Internals(atoms, allow_fragments=True)
+
+        # Explicitly disable
+        pes = CellInternalPES(atoms, internals, rigid_fragments=False)
+        assert pes.rigid_fragments is False
+
+    def test_rigid_fragments_forces_scale_atoms_false(self):
+        """Test that rigid_fragments forces scale_atoms=False."""
+        atoms = self._make_two_water_crystal()
+        internals = Internals(atoms, allow_fragments=True)
+
+        # Even if scale_atoms=True is requested, rigid_fragments overrides it
+        pes = CellInternalPES(atoms, internals, rigid_fragments=True,
+                              scale_atoms=True)
+        assert pes.scale_atoms is False
+
+    def test_fragment_groups_correct_atoms(self):
+        """Test that fragment groups contain the correct atom indices."""
+        atoms = self._make_two_water_crystal()
+        internals = Internals(atoms, allow_fragments=True)
+
+        pes = CellInternalPES(atoms, internals)
+
+        # Each group should have 3 atoms (water has O, H, H)
+        for group in pes.fragment_groups:
+            assert len(group) == 3
+
+        # All atoms should be covered
+        all_atoms = np.sort(np.concatenate(pes.fragment_groups))
+        assert_allclose(all_atoms, np.arange(6))
+
+    def test_compute_delta_r(self):
+        """Test that _compute_delta_r gives positions relative to fragment CoM."""
+        atoms = self._make_two_water_crystal()
+        internals = Internals(atoms, allow_fragments=True)
+
+        pes = CellInternalPES(atoms, internals)
+        delta_r = pes._compute_delta_r()
+
+        # For each fragment, the mean of delta_r should be zero
+        for group in pes.fragment_groups:
+            assert_allclose(delta_r[group].mean(axis=0), 0, atol=1e-12)
+
+    def test_rigid_fragment_cell_gradient_numerical(self):
+        """Test rigid fragment cell gradient matches numerical finite difference.
+
+        This is the key correctness test: the analytical cell gradient with
+        rigid fragment mode should match the energy change when we actually
+        move fragment CoMs to maintain fractional positions.
+        """
+        atoms = self._make_two_water_crystal()
+        internals = Internals(atoms, allow_fragments=True)
+
+        pes = CellInternalPES(atoms, internals)
+        assert pes.rigid_fragments is True
+
+        # Get analytical gradient
+        _, g = pes.eval()
+        g_cell = g[pes.n_internal:]
+
+        # Numerical gradient via finite difference on cell parameters
+        delta = 1e-6
+        x0 = pes.get_x()
+        g_cell_numeric = np.zeros(pes.n_cell_dof)
+
+        for i in range(pes.n_cell_dof):
+            x_plus = x0.copy()
+            x_plus[pes.n_internal + i] += delta
+            pes.set_x(x_plus)
+            e_plus, _ = pes.eval()
+
+            x_minus = x0.copy()
+            x_minus[pes.n_internal + i] -= delta
+            pes.set_x(x_minus)
+            e_minus, _ = pes.eval()
+
+            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
+
+        pes.set_x(x0)
+
+        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
+
+    def test_rigid_fragment_cell_gradient_nonorthogonal(self):
+        """Test rigid fragment gradient with non-orthogonal cell."""
+        water1 = molecule('H2O')
+        water2 = molecule('H2O')
+        water1.positions += [1.0, 1.0, 1.0]
+        water2.positions += [4.0, 4.0, 4.0]
+        atoms = water1 + water2
+
+        # Non-orthogonal cell (triclinic)
+        cell = np.array([
+            [7.0, 0.5, 0.3],
+            [0.0, 6.8, 0.4],
+            [0.0, 0.0, 7.2],
+        ])
+        atoms.set_cell(cell)
+        atoms.pbc = True
+        atoms.calc = LennardJones()
+
+        internals = Internals(atoms, allow_fragments=True)
+
+        pes = CellInternalPES(atoms, internals)
+        assert pes.rigid_fragments is True
+
+        # Get analytical gradient
+        _, g = pes.eval()
+        g_cell = g[pes.n_internal:]
+
+        # Numerical gradient
+        delta = 1e-6
+        x0 = pes.get_x()
+        g_cell_numeric = np.zeros(pes.n_cell_dof)
+
+        for i in range(pes.n_cell_dof):
+            x_plus = x0.copy()
+            x_plus[pes.n_internal + i] += delta
+            pes.set_x(x_plus)
+            e_plus, _ = pes.eval()
+
+            x_minus = x0.copy()
+            x_minus[pes.n_internal + i] -= delta
+            pes.set_x(x_minus)
+            e_minus, _ = pes.eval()
+
+            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
+
+        pes.set_x(x0)
+
+        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
+
+    def test_intramolecular_geometry_preserved_after_cell_step(self):
+        """Test that intramolecular geometry is preserved after a cell-only step."""
+        atoms = self._make_two_water_crystal()
+        internals = Internals(atoms, allow_fragments=True)
+
+        pes = CellInternalPES(atoms, internals)
+
+        # Record initial bond lengths and angles
+        q0 = internals.calc()
+        x0 = pes.get_x()
+
+        # Apply a cell-only displacement (change cell params, keep internal targets)
+        x_target = x0.copy()
+        x_target[pes.n_internal:] += 0.01  # Small uniform cell strain
+
+        pes.set_x(x_target)
+
+        # Get new internal coordinates
+        q1 = internals.calc()
+
+        # Internal coords (bonds, angles) should be close to original
+        # The internal coord solver handles the small residual
+        n_trans = internals.ntrans
+        # Skip translations (those change with cell), check bonds/angles
+        assert_allclose(q0[n_trans:], q1[n_trans:], atol=1e-3)
+
+    def test_monoatomic_rigid_fragments_same_as_scale_atoms(self):
+        """For monoatomic crystals, rigid_fragments should give same gradient as scale_atoms=True.
+
+        When each atom is its own fragment, Δr=0, so the correction vanishes
+        and we get the same result as scale_atoms=True.
+        """
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        # Create internals with allow_fragments - each atom is its own "fragment"
+        internals_frag = Internals(atoms, allow_fragments=True)
+        has_translations = bool(internals_frag.internals.get('translations', []))
+
+        if not has_translations:
+            # No fragments detected for monoatomic - this is expected
+            # Just verify rigid_fragments defaults to False
+            pes = CellInternalPES(atoms, internals_frag)
+            assert pes.rigid_fragments is False
+            return
+
+        # If fragments are detected, verify Δr=0 behavior
+        pes_rigid = CellInternalPES(atoms, internals_frag, rigid_fragments=True)
+        delta_r = pes_rigid._compute_delta_r()
+        assert_allclose(delta_r, 0, atol=1e-12)
+
+    def test_rigid_fragments_sella_integration(self):
+        """Test rigid fragments through the Sella API."""
+        atoms = self._make_two_water_crystal()
+
+        opt = Sella(
+            atoms,
+            internal=True,
+            order=0,
+            optimize_cell=True,
+            allow_fragments=True,
+            logfile=None,
+        )
+
+        assert isinstance(opt.pes, CellInternalPES)
+        assert opt.pes.rigid_fragments is True
+
+        # Take a few steps to verify no errors
+        for _ in range(3):
+            opt.step()
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
