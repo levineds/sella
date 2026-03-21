@@ -2076,12 +2076,20 @@ class CellCartesianPES(PES):
         print(f"Refining initial Hessian: 0/{n_evals} force calls", end="", flush=True)
 
         for i in range(self.n_cell_dof):
+            # Restore state before each FD probe
+            self.atoms.positions = pos0.copy()
+            self.atoms.set_cell(cell0, scale_atoms=False)
+
             # Displace cell parameter +delta
             x_plus = x0.copy()
             x_plus[self.n_cart + i] += delta
             self.set_x(x_plus)
             _, g_plus = self.eval()
             print(f"\rRefining initial Hessian: {2*i + 1}/{n_evals} force calls", end="", flush=True)
+
+            # Restore before -delta
+            self.atoms.positions = pos0.copy()
+            self.atoms.set_cell(cell0, scale_atoms=False)
 
             # Displace cell parameter -delta
             x_minus = x0.copy()
