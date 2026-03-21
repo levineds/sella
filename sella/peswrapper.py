@@ -17,6 +17,69 @@ from sella.eigensolvers import rayleigh_ritz
 from sella.internal import Internals, Constraints, DuplicateInternalError
 
 
+def _niggli_hessian_transform(atoms, orig_cell, exp_cell_factor, cell_mask):
+    """Compute the Hessian transformation matrix for Niggli reduction.
+
+    The cell DOF are parameterized as elements of L = logm(F) * factor where
+    F = cell @ inv(orig_cell). Niggli reduction changes the lattice basis,
+    so the Hessian must be transformed from the old L-parameterization to the
+    new one. This computes T such that H_new = T^T @ H_old @ T.
+
+    The transformation is derived from the chain rule through the cell-element
+    space: J_old maps old L-perturbations to cell perturbations (via Frechet
+    derivative of expm), J_new maps new L-perturbations (at L=0, since
+    orig_cell is reset). Then T = J_old^{-1} @ J_new.
+
+    Parameters
+    ----------
+    atoms : Atoms
+        The atoms object. Niggli reduction is applied in-place.
+    orig_cell : ndarray, shape (3, 3)
+        The old reference cell (before reduction).
+    exp_cell_factor : float
+        Scaling factor for the log-deformation parameterization.
+    cell_mask : ndarray, shape (3, 3), dtype bool
+        Mask selecting which cell DOF are free.
+
+    Returns
+    -------
+    T_masked : ndarray, shape (n_cell_dof, n_cell_dof)
+        Transformation matrix for the masked cell DOF.
+    """
+    # Compute old Jacobian: J_old[ab, ij] = d(cell_ab)/d(L_ij)
+    # at the current (pre-reduction) L value
+    F_old = atoms.get_cell().array @ np.linalg.inv(orig_cell)
+    X_old = logm(F_old).real / exp_cell_factor  # unscaled log-deformation
+
+    J_old = np.zeros((9, 9))
+    for idx in range(9):
+        i, j = divmod(idx, 3)
+        E = np.zeros((3, 3))
+        E[i, j] = 1.0 / exp_cell_factor
+        dF = expm_frechet(X_old, E, compute_expm=False)
+        dC = dF @ orig_cell  # d(cell)/d(L_ij)
+        J_old[:, idx] = dC.ravel()
+
+    # Apply Niggli reduction
+    niggli_reduce(atoms)
+    orig_cell_new = atoms.get_cell().array.copy()
+
+    # New Jacobian at L=0: d(cell_ab)/d(L_ij) = (1/factor) * delta_ai * O_jb
+    # In matrix form: J_new = (1/factor) * kron(I_3, orig_cell_new.T)
+    J_new = np.kron(np.eye(3), orig_cell_new.T) / exp_cell_factor
+
+    # T maps new L-perturbations to old L-perturbations (same physical cell change)
+    # δL_old = T @ δL_new, so H_new = T^T @ H_old @ T
+    T_full = np.linalg.solve(J_old, J_new)
+
+    # Project to masked DOF: T_masked = M @ T_full @ M^T
+    mask_flat = cell_mask.ravel()
+    mask_indices = np.where(mask_flat)[0]
+    T_masked = T_full[np.ix_(mask_indices, mask_indices)]
+
+    return T_masked
+
+
 class PES:
     def __init__(
         self,
@@ -1081,8 +1144,9 @@ class CellInternalPES(InternalPES):
 
         When the unit cell becomes highly skewed during optimization, this
         remaps to the most compact (Niggli-reduced) cell and resets the
-        log-deformation reference. The cell block of the Hessian is reset
-        since curvature information is no longer valid in the new basis.
+        log-deformation reference. The cell block of the Hessian is
+        transformed to the new parameterization basis via the Jacobian of
+        the log-deformation map.
 
         Parameters
         ----------
@@ -1100,16 +1164,21 @@ class CellInternalPES(InternalPES):
         if max_deviation <= angle_threshold:
             return False
 
-        niggli_reduce(self.atoms)
-
-        self.orig_cell = self.atoms.get_cell().array.copy()
-
-        # Reset cell block of Hessian (old curvature is in wrong basis)
         H = self.H.B.copy()
         n = self.n_internal
-        H[n:, :] = 0.0
-        H[:, n:] = 0.0
-        H[n:, n:] = np.eye(self.n_cell_dof)
+        T_masked = _niggli_hessian_transform(
+            self.atoms, self.orig_cell, self.exp_cell_factor, self.cell_mask
+        )
+
+        # Transform cell-cell block: H_new = T^T @ H_old @ T
+        H_cell_new = T_masked.T @ H[n:, n:] @ T_masked
+        H[n:, n:] = H_cell_new
+
+        # Transform coupling blocks
+        H[:n, n:] = H[:n, n:] @ T_masked
+        H[n:, :n] = T_masked.T @ H[n:, :n]
+
+        self.orig_cell = self.atoms.get_cell().array.copy()
         self.set_H(H, initialized=True)
 
         # Reset cached state so next evaluation recomputes everything
@@ -2062,8 +2131,9 @@ class CellCartesianPES(PES):
 
         When the unit cell becomes highly skewed during optimization, this
         remaps to the most compact (Niggli-reduced) cell and resets the
-        log-deformation reference. The cell block of the Hessian is reset
-        since curvature information is no longer valid in the new basis.
+        log-deformation reference. The cell block of the Hessian is
+        transformed to the new parameterization basis via the Jacobian of
+        the log-deformation map.
 
         Parameters
         ----------
@@ -2081,16 +2151,21 @@ class CellCartesianPES(PES):
         if max_deviation <= angle_threshold:
             return False
 
-        niggli_reduce(self.atoms)
-
-        self.orig_cell = self.atoms.get_cell().array.copy()
-
-        # Reset cell block of Hessian (old curvature is in wrong basis)
         H = self.H.B.copy()
         n = self.n_cart
-        H[n:, :] = 0.0
-        H[:, n:] = 0.0
-        H[n:, n:] = np.eye(self.n_cell_dof)
+        T_masked = _niggli_hessian_transform(
+            self.atoms, self.orig_cell, self.exp_cell_factor, self.cell_mask
+        )
+
+        # Transform cell-cell block: H_new = T^T @ H_old @ T
+        H_cell_new = T_masked.T @ H[n:, n:] @ T_masked
+        H[n:, n:] = H_cell_new
+
+        # Transform coupling blocks
+        H[:n, n:] = H[:n, n:] @ T_masked
+        H[n:, :n] = T_masked.T @ H[n:, :n]
+
+        self.orig_cell = self.atoms.get_cell().array.copy()
         self.set_H(H, initialized=True)
 
         # Reset cached state so next evaluation recomputes everything

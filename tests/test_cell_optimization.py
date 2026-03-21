@@ -1387,16 +1387,19 @@ class TestNiggliReduction:
         reduced = pes2.maybe_niggli_reduce()
         assert not reduced, "Should not reduce a cubic cell"
 
-    def test_niggli_resets_hessian_cell_block(self):
-        """After Niggli reduction, cell block of Hessian is reset."""
+    def test_niggli_transforms_hessian_cell_block(self):
+        """After Niggli reduction, cell block of Hessian is transformed."""
         atoms = bulk('Cu', 'fcc', a=3.6, cubic=True)
         atoms.calc = EMT()
 
         pes = CellCartesianPES(atoms, eta=1e-4)
+        n = pes.n_cart
 
-        # Manually set Hessian to something non-trivial
+        # Set Hessian to identity for cell block to track the transformation
         H = pes.H.B.copy()
-        H[:] = 42.0
+        H[n:, n:] = np.eye(pes.n_cell_dof)
+        H[:n, n:] = 0.0
+        H[n:, :n] = 0.0
         pes.set_H(H, initialized=True)
 
         # Shear the cell to trigger reduction
@@ -1407,14 +1410,14 @@ class TestNiggliReduction:
 
         pes.maybe_niggli_reduce()
 
-        # Cell-cell block should be identity, coupling blocks should be zero
         H_new = pes.H.B
-        n = pes.n_cart
-        assert_allclose(H_new[n:, n:], np.eye(pes.n_cell_dof))
-        assert_allclose(H_new[n:, :n], 0.0)
-        assert_allclose(H_new[:n, n:], 0.0)
+        # Cell block should be transformed (T^T @ I @ T = T^T @ T), symmetric
+        H_cell = H_new[n:, n:]
+        assert_allclose(H_cell, H_cell.T, atol=1e-10)
+        # Should not be identity (transformation is non-trivial for skewed cell)
+        assert not np.allclose(H_cell, np.eye(pes.n_cell_dof), atol=0.1)
         # Cartesian block should be preserved
-        assert_allclose(H_new[:n, :n], 42.0 * np.ones((n, n)))
+        assert_allclose(H_new[:n, :n], H[:n, :n])
 
     def test_niggli_in_sella_step(self):
         """Niggli reduction integrates with Sella.step() without crashing."""
