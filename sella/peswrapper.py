@@ -4,6 +4,7 @@ import numpy as np
 from scipy.linalg import eigh, expm, expm_frechet, logm
 from scipy.integrate import LSODA
 from ase import Atoms
+from ase.build import niggli_reduce
 from ase.utils import basestring
 from ase.visualize import view
 from ase.calculators.singlepoint import SinglePointCalculator
@@ -1075,6 +1076,48 @@ class CellInternalPES(InternalPES):
 
         self.set_H(H0_full, initialized=False)
 
+    def maybe_niggli_reduce(self, angle_threshold=30.0):
+        """Apply Niggli reduction if cell angles deviate too far from 90 deg.
+
+        When the unit cell becomes highly skewed during optimization, this
+        remaps to the most compact (Niggli-reduced) cell and resets the
+        log-deformation reference. The cell block of the Hessian is reset
+        since curvature information is no longer valid in the new basis.
+
+        Parameters
+        ----------
+        angle_threshold : float
+            Maximum deviation from 90 deg before triggering reduction.
+            Default 30 means reduction triggers when any angle < 60 or > 120.
+
+        Returns
+        -------
+        bool
+            True if reduction was applied.
+        """
+        angles = self.atoms.get_cell().angles()
+        max_deviation = max(abs(a - 90.0) for a in angles)
+        if max_deviation <= angle_threshold:
+            return False
+
+        niggli_reduce(self.atoms)
+
+        self.orig_cell = self.atoms.get_cell().array.copy()
+
+        # Reset cell block of Hessian (old curvature is in wrong basis)
+        H = self.H.B.copy()
+        n = self.n_internal
+        H[n:, :] = 0.0
+        H[:, n:] = 0.0
+        H[n:, n:] = np.eye(self.n_cell_dof)
+        self.set_H(H, initialized=True)
+
+        # Reset cached state so next evaluation recomputes everything
+        self.curr = dict(x=None, f=None, g=None)
+        self.last = self.curr.copy()
+
+        return True
+
     def save(self):
         """Save current state including cell."""
         InternalPES.save(self)
@@ -1515,15 +1558,23 @@ class CellInternalPES(InternalPES):
         else:
             res = self._set_x_ode_internal(q_target)
 
+        # Get old cell gradient for parallel transport (needed for correct
+        # BFGS secant condition on the cell block of the Hessian)
+        g_old = self.curr.get('g', None)
+        if g_old is not None:
+            g_old_cell = g_old[self.n_internal:].copy()
+        else:
+            g_old_cell = np.zeros(self.n_cell_dof)
+
         if res is None:
             # Fallback: just do parent set_x ignoring cell
             dx_int, _, g_int = InternalPES.set_x(self, q_target)
             dx_final = np.concatenate([dx_int, cell_target - cell_params0])
-            g_final = np.concatenate([g_int, np.zeros(self.n_cell_dof)])
+            g_final = np.concatenate([g_int, g_old_cell])
         else:
             dx_int_initial, dx_int_final, g_int = res
             dx_final = np.concatenate([dx_int_final, cell_target - cell_params0])
-            g_final = np.concatenate([g_int, np.zeros(self.n_cell_dof)])
+            g_final = np.concatenate([g_int, g_old_cell])
 
         return dx_initial, dx_final, g_final
 
@@ -2005,6 +2056,48 @@ class CellCartesianPES(PES):
             print(f"Initial Hessian saved to {save_hessian}")
 
         self.set_H(H0_full, initialized=False)
+
+    def maybe_niggli_reduce(self, angle_threshold=30.0):
+        """Apply Niggli reduction if cell angles deviate too far from 90 deg.
+
+        When the unit cell becomes highly skewed during optimization, this
+        remaps to the most compact (Niggli-reduced) cell and resets the
+        log-deformation reference. The cell block of the Hessian is reset
+        since curvature information is no longer valid in the new basis.
+
+        Parameters
+        ----------
+        angle_threshold : float
+            Maximum deviation from 90 deg before triggering reduction.
+            Default 30 means reduction triggers when any angle < 60 or > 120.
+
+        Returns
+        -------
+        bool
+            True if reduction was applied.
+        """
+        angles = self.atoms.get_cell().angles()
+        max_deviation = max(abs(a - 90.0) for a in angles)
+        if max_deviation <= angle_threshold:
+            return False
+
+        niggli_reduce(self.atoms)
+
+        self.orig_cell = self.atoms.get_cell().array.copy()
+
+        # Reset cell block of Hessian (old curvature is in wrong basis)
+        H = self.H.B.copy()
+        n = self.n_cart
+        H[n:, :] = 0.0
+        H[:, n:] = 0.0
+        H[n:, n:] = np.eye(self.n_cell_dof)
+        self.set_H(H, initialized=True)
+
+        # Reset cached state so next evaluation recomputes everything
+        self.curr = dict(x=None, f=None, g=None)
+        self.last = self.curr.copy()
+
+        return True
 
     def save(self):
         """Save current state including cell."""

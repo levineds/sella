@@ -375,6 +375,12 @@ class Sella(Optimizer):
         else:
             self.rho = 1.
 
+        # Apply Niggli reduction if cell becomes too skewed
+        if self.optimize_cell and self.pes.maybe_niggli_reduce():
+            print("Sella: Applied Niggli reduction to reduce cell skewness")
+            self.initialized = False
+            self.rho = 1.
+
     def converged(self, forces=None):
         # fmax might be None if converged() is called before run()
         fmax = getattr(self, 'fmax', None) or 0.05  # Default threshold

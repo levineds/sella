@@ -1311,5 +1311,128 @@ class TestRigidFragments:
             opt.step()
 
 
+class TestNiggliReduction:
+    """Tests for periodic Niggli reduction during cell optimization."""
+
+    def test_niggli_triggers_on_skewed_cell_cartesian(self):
+        """CellCartesianPES.maybe_niggli_reduce fires when angles are extreme."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        pes = CellCartesianPES(atoms, eta=1e-4)
+
+        # Shear the cell to create a skewed angle
+        cell = atoms.get_cell().array.copy()
+        cell[1, 0] += 3.0  # Large off-diagonal shear
+        atoms.set_cell(cell, scale_atoms=True)
+        pes.orig_cell = atoms.get_cell().array.copy()
+
+        # Shear further so cell relative to orig_cell is identity but
+        # the cell itself is skewed
+        angles = atoms.get_cell().angles()
+        assert min(angles) < 60.0 or max(angles) > 120.0, (
+            f"Test setup: cell should be skewed, got angles {angles}"
+        )
+
+        reduced = pes.maybe_niggli_reduce()
+        assert reduced, "Niggli reduction should have been triggered"
+
+        # After reduction, angles should be closer to 90
+        new_angles = atoms.get_cell().angles()
+        new_max_dev = max(abs(a - 90.0) for a in new_angles)
+        assert new_max_dev <= 30.0 + 1e-10, (
+            f"After Niggli reduction, angles should be near 90, got {new_angles}"
+        )
+
+        # orig_cell should be updated
+        assert_allclose(pes.orig_cell, atoms.get_cell().array)
+
+    def test_niggli_triggers_on_skewed_cell_internal(self):
+        """CellInternalPES.maybe_niggli_reduce fires when angles are extreme."""
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals=internals, eta=1e-4)
+
+        # Shear the cell
+        cell = atoms.get_cell().array.copy()
+        cell[1, 0] += 6.0
+        atoms.set_cell(cell, scale_atoms=False)
+        pes.orig_cell = atoms.get_cell().array.copy()
+
+        angles = atoms.get_cell().angles()
+        assert min(angles) < 60.0 or max(angles) > 120.0
+
+        reduced = pes.maybe_niggli_reduce()
+        assert reduced
+
+        new_angles = atoms.get_cell().angles()
+        new_max_dev = max(abs(a - 90.0) for a in new_angles)
+        assert new_max_dev < 30.0, f"Angles after reduction: {new_angles}"
+
+    def test_niggli_does_not_trigger_on_good_cell(self):
+        """No reduction when cell angles are fine."""
+        atoms = bulk('Cu', 'fcc', a=3.6)
+        atoms.calc = EMT()
+
+        pes = CellCartesianPES(atoms, eta=1e-4)
+
+        # Cubic cell — angles are all 60 or 90 depending on conventional vs primitive
+        # Use conventional cell to get 90 degree angles
+        atoms2 = bulk('Cu', 'fcc', a=3.6, cubic=True)
+        atoms2.calc = EMT()
+        pes2 = CellCartesianPES(atoms2, eta=1e-4)
+
+        reduced = pes2.maybe_niggli_reduce()
+        assert not reduced, "Should not reduce a cubic cell"
+
+    def test_niggli_resets_hessian_cell_block(self):
+        """After Niggli reduction, cell block of Hessian is reset."""
+        atoms = bulk('Cu', 'fcc', a=3.6, cubic=True)
+        atoms.calc = EMT()
+
+        pes = CellCartesianPES(atoms, eta=1e-4)
+
+        # Manually set Hessian to something non-trivial
+        H = pes.H.B.copy()
+        H[:] = 42.0
+        pes.set_H(H, initialized=True)
+
+        # Shear the cell to trigger reduction
+        cell = atoms.get_cell().array.copy()
+        cell[1, 0] += 5.0
+        atoms.set_cell(cell, scale_atoms=True)
+        pes.orig_cell = atoms.get_cell().array.copy()
+
+        pes.maybe_niggli_reduce()
+
+        # Cell-cell block should be identity, coupling blocks should be zero
+        H_new = pes.H.B
+        n = pes.n_cart
+        assert_allclose(H_new[n:, n:], np.eye(pes.n_cell_dof))
+        assert_allclose(H_new[n:, :n], 0.0)
+        assert_allclose(H_new[:n, n:], 0.0)
+        # Cartesian block should be preserved
+        assert_allclose(H_new[:n, :n], 42.0 * np.ones((n, n)))
+
+    def test_niggli_in_sella_step(self):
+        """Niggli reduction integrates with Sella.step() without crashing."""
+        atoms = bulk('Cu', 'fcc', a=3.6, cubic=True)
+        atoms.calc = EMT()
+
+        opt = Sella(atoms, order=0, optimize_cell=True, logfile=None)
+
+        # Shear the cell to extreme angles
+        cell = atoms.get_cell().array.copy()
+        cell[1, 0] += 5.0
+        atoms.set_cell(cell, scale_atoms=True)
+        opt.pes.orig_cell = atoms.get_cell().array.copy()
+
+        # Run a few steps — should not crash even if Niggli fires
+        for _ in range(3):
+            opt.step()
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
