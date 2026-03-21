@@ -1160,7 +1160,7 @@ class CellInternalPES(InternalPES):
         print(f"Refining initial Hessian: 0/{n_evals} force calls", end="", flush=True)
 
         for i in range(self.n_cell_dof):
-            # Restore before each probe pair
+            # Restore state before each FD probe to ensure path-independence
             self.atoms.positions = pos0.copy()
             self.atoms.set_cell(cell0, scale_atoms=False)
 
@@ -1241,22 +1241,18 @@ class CellInternalPES(InternalPES):
         print(f"Refining TRIC Hessian: 0/{n_evals} force calls", end="", flush=True)
 
         for i, idx in enumerate(tric_indices):
-            # Restore before each probe pair
+            # Displace TRIC parameter +delta
             self.atoms.positions = pos0.copy()
             self.atoms.set_cell(cell0, scale_atoms=False)
-
-            # Displace TRIC parameter +delta
             x_plus = x0.copy()
             x_plus[idx] += delta
             self.set_x(x_plus)
             _, g_plus = self.eval()
             print(f"\rRefining TRIC Hessian: {2*i + 1}/{n_evals} force calls", end="", flush=True)
 
-            # Restore before -delta
+            # Displace TRIC parameter -delta
             self.atoms.positions = pos0.copy()
             self.atoms.set_cell(cell0, scale_atoms=False)
-
-            # Displace TRIC parameter -delta
             x_minus = x0.copy()
             x_minus[idx] -= delta
             self.set_x(x_minus)
@@ -1305,21 +1301,17 @@ class CellInternalPES(InternalPES):
         print(f"Refining internal Hessian: 0/{n_evals} force calls", end="", flush=True)
 
         for i in range(self.n_internal):
-            # Restore before each probe pair
+            # Displace internal coordinate +delta
             self.atoms.positions = pos0.copy()
             self.atoms.set_cell(cell0, scale_atoms=False)
-
-            # Displace internal coordinate +delta
             x_plus = x0.copy()
             x_plus[i] += delta
             self.set_x(x_plus)
             _, g_plus = self.eval()
 
-            # Restore before -delta
+            # Displace internal coordinate -delta
             self.atoms.positions = pos0.copy()
             self.atoms.set_cell(cell0, scale_atoms=False)
-
-            # Displace internal coordinate -delta
             x_minus = x0.copy()
             x_minus[i] -= delta
             self.set_x(x_minus)
