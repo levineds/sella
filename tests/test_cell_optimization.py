@@ -1421,7 +1421,8 @@ class TestNiggliReduction:
         atoms = bulk('Cu', 'fcc', a=3.6, cubic=True)
         atoms.calc = EMT()
 
-        opt = Sella(atoms, order=0, optimize_cell=True, logfile=None)
+        opt = Sella(atoms, order=0, optimize_cell=True, niggli=True,
+                    logfile=None)
 
         # Shear the cell to extreme angles
         cell = atoms.get_cell().array.copy()

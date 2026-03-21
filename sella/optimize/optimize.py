@@ -70,6 +70,7 @@ class Sella(Optimizer):
         scalar_pressure: float = 0.0,
         smax: float = None,
         allow_fragments: bool = False,
+        niggli: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
         **kwargs
@@ -97,6 +98,11 @@ class Sella(Optimizer):
             If True, allow disconnected molecular fragments when using internal
             coordinates. Adds translation and rotation coordinates (TRICs) for
             each fragment. Useful for molecular crystals. Default is False.
+        niggli : bool, optional
+            If True, apply Niggli reduction during cell optimization when cell
+            angles deviate more than 30 deg from 90 deg. This remaps to the
+            most compact unit cell and resets the Hessian cell block.
+            Default is False.
         refine_initial_hessian : bool or int, optional
             Level of Hessian refinement via finite differences:
             - False or 0: No refinement (default)
@@ -114,6 +120,7 @@ class Sella(Optimizer):
 
         # Validate cell optimization parameters
         self.optimize_cell = optimize_cell
+        self.niggli = niggli
         self.smax = smax
         if optimize_cell:
             if order != 0:
@@ -376,7 +383,7 @@ class Sella(Optimizer):
             self.rho = 1.
 
         # Apply Niggli reduction if cell becomes too skewed
-        if self.optimize_cell and self.pes.maybe_niggli_reduce():
+        if self.optimize_cell and self.niggli and self.pes.maybe_niggli_reduce():
             print("Sella: Applied Niggli reduction to reduce cell skewness")
             self.initialized = False
             self.rho = 1.
