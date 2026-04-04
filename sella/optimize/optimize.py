@@ -73,6 +73,7 @@ class Sella(Optimizer):
         niggli: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
+        hessian_update: str = 'auto',
         **kwargs
     ):
         """Initialize Sella optimizer.
@@ -112,6 +113,12 @@ class Sella(Optimizer):
             - 3: Refine full internal Hessian (2 * n_internal force calls, expensive!)
         save_hessian : str, optional
             Path to save the initial Hessian as .npy file for analysis.
+        hessian_update : str, optional
+            Quasi-Newton Hessian update method. Options:
+            - 'auto' (default): Use 'BFGS' for order=0, 'TS-BFGS' for order>=1
+            - 'TS-BFGS': Always use TS-BFGS (needs eigendecomposition each step)
+            - 'BFGS': Always use standard BFGS (no eigendecomposition needed)
+            - 'PSB', 'SR1', 'DFP': Other supported update methods
         """
         if order == 0:
             default = _default_kwargs['minimum']
@@ -142,6 +149,13 @@ class Sella(Optimizer):
             # Register trajectory for cleanup when close() is called
             self.closelater(trajectory)
 
+        # Resolve hessian_update method
+        if hessian_update == 'auto':
+            resolved_hessian_update = 'BFGS' if order == 0 else 'TS-BFGS'
+        else:
+            resolved_hessian_update = hessian_update
+        self._hessian_update = resolved_hessian_update
+
         asetraj = None
         self.peskwargs = kwargs.copy()
         self.user_internal = internal
@@ -161,6 +175,7 @@ class Sella(Optimizer):
             allow_fragments=allow_fragments,
             refine_initial_hessian=refine_initial_hessian,
             save_hessian=save_hessian,
+            hessian_update=resolved_hessian_update,
             **kwargs
         )
 
@@ -220,6 +235,7 @@ class Sella(Optimizer):
         allow_fragments: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
+        hessian_update: str = 'TS-BFGS',
         **kwargs
     ):
         if internal:
@@ -255,6 +271,7 @@ class Sella(Optimizer):
                     scalar_pressure=scalar_pressure,
                     refine_initial_hessian=refine_initial_hessian,
                     save_hessian=save_hessian,
+                    hessian_update=hessian_update,
                     **kwargs
                 )
             else:
@@ -266,6 +283,7 @@ class Sella(Optimizer):
                     v0=v0,
                     auto_find_internals=auto_find_internals,
                     hessian_function=hessian_function,
+                    hessian_update=hessian_update,
                     **kwargs
                 )
         else:
@@ -287,6 +305,7 @@ class Sella(Optimizer):
                     scalar_pressure=scalar_pressure,
                     refine_initial_hessian=refine_initial_hessian,
                     save_hessian=save_hessian,
+                    hessian_update=hessian_update,
                     **kwargs
                 )
             else:
@@ -297,6 +316,7 @@ class Sella(Optimizer):
                 eta=eta,
                 v0=v0,
                 hessian_function=hessian_function,
+                hessian_update=hessian_update,
                 **kwargs
             )
         self.trajectory = self.pes.traj
@@ -376,6 +396,7 @@ class Sella(Optimizer):
                 cell_mask=getattr(self.pes, 'cell_mask', None),
                 exp_cell_factor=getattr(self.pes, 'exp_cell_factor', None),
                 scalar_pressure=getattr(self.pes, 'scalar_pressure', 0.0),
+                hessian_update=self._hessian_update,
             )
             self.initialized = False
             self.rho = 1
