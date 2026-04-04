@@ -804,9 +804,11 @@ class BaseInternals:
         self._ndof = 3 * (self._natoms + self._ndummies)
 
         self.internals = {key: [] for key in self._names}
+        self._internals_set = {key: set() for key in self._names}
         self._active = {key: [] for key in self._names}
         self.cell = None
         self.rcell = None
+        self._rcell_reciprocal_T = None
         self.op = None
 
         # Batched arrays for vectorized computation (built lazily)
@@ -1692,6 +1694,195 @@ class BaseInternals:
             return np.vstack(results)
         return np.empty((0, ndof))
 
+    def hessian_rdot_vecs(self, v: np.ndarray, *us: np.ndarray):
+        """Compute (H_i @ v) · u for all active internal coordinates.
+
+        Equivalent to ``[hessian_rdot(v) @ u for u in us]`` but avoids
+        materializing the dense (n_coords, ndof) matrix.  Each element *i*
+        of a result vector is the dot product of coordinate *i*'s
+        Hessian-vector product row with *u*.
+
+        Args:
+            v: Vector of shape (ndof,) — the HVP direction.
+            *us: One or more vectors of shape (ndof,) to contract with.
+
+        Returns:
+            Tuple of arrays, each of shape (n_active_coords,).
+        """
+        self._cache_check()
+        positions = self.all_positions
+        cell = (self.atoms.cell.array if hasattr(self.atoms.cell, 'array')
+                else np.asarray(self.atoms.cell))
+        self._build_batched_arrays()
+        tvecs = self._get_cached_tvecs(cell)
+
+        v_atoms = v.reshape((-1, 3))
+        u_atoms_list = [u.reshape((-1, 3)) for u in us]
+        n_us = len(us)
+
+        # Active mask bookkeeping (same as hessian_rdot)
+        active_mask = self._active_mask
+        n_trans = len(self.internals['translations'])
+        n_bonds = len(self.internals['bonds'])
+        n_angles = len(self.internals['angles'])
+        n_dihedrals = len(self.internals['dihedrals'])
+        n_other = len(self.internals['other'])
+        n_rot = len(self.internals['rotations'])
+
+        start = 0
+        trans_active = active_mask[start:start + n_trans]
+        start += n_trans
+        bonds_active = np.array(active_mask[start:start + n_bonds], dtype=bool)
+        start += n_bonds
+        angles_active = np.array(active_mask[start:start + n_angles], dtype=bool)
+        start += n_angles
+        dihedrals_active = np.array(
+            active_mask[start:start + n_dihedrals], dtype=bool
+        )
+        start += n_dihedrals
+        other_active = active_mask[start:start + n_other]
+        start += n_other
+        rot_active = active_mask[start:start + n_rot]
+
+        # Collect per-coordinate-type result fragments for each u
+        results = [[] for _ in range(n_us)]
+
+        # --- Translations: Hessian is zero → dot product is zero ---
+        n_active_trans = sum(trans_active)
+        if n_active_trans > 0:
+            z = np.zeros(n_active_trans)
+            for r in results:
+                r.append(z)
+
+        # --- Bonds ---
+        if bonds_active.any() and self._n_bonds_actual > 0:
+            if bonds_active.all():
+                bond_pos = positions[self._bond_indices_padded]
+                bond_tvecs = tvecs['bonds_padded']
+                v_sub = v_atoms[self._bond_indices_padded]
+                hvp_padded = np.asarray(
+                    device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub))
+                )
+                hvp = hvp_padded[:self._n_bonds_actual]
+                active_idx = self._bond_indices
+            else:
+                active_idx = self._bond_indices[bonds_active]
+                bond_pos = positions[active_idx]
+                bond_tvecs = tvecs['bonds'][bonds_active]
+                v_sub = v_atoms[active_idx]
+                hvp = np.asarray(
+                    device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub))
+                )
+            for k, u_atoms in enumerate(u_atoms_list):
+                u_gathered = u_atoms[active_idx]  # (n_bonds, 2, 3)
+                results[k].append(
+                    np.sum(hvp * u_gathered, axis=(1, 2))
+                )
+
+        # --- Angles ---
+        if angles_active.any() and self._n_angles_actual > 0:
+            if angles_active.all():
+                angle_pos = positions[self._angle_indices_padded]
+                angle_tvecs = tvecs['angles_padded']
+                v_sub = v_atoms[self._angle_indices_padded]
+                hvp_padded = np.asarray(
+                    device_get(
+                        _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
+                    )
+                )
+                hvp = hvp_padded[:self._n_angles_actual]
+                active_idx = self._angle_indices
+            else:
+                active_idx = self._angle_indices[angles_active]
+                angle_pos = positions[active_idx]
+                angle_tvecs = tvecs['angles'][angles_active]
+                v_sub = v_atoms[active_idx]
+                hvp = np.asarray(
+                    device_get(
+                        _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
+                    )
+                )
+            for k, u_atoms in enumerate(u_atoms_list):
+                u_gathered = u_atoms[active_idx]  # (n_angles, 3, 3)
+                results[k].append(
+                    np.sum(hvp * u_gathered, axis=(1, 2))
+                )
+
+        # --- Dihedrals ---
+        if dihedrals_active.any() and self._n_dihedrals_actual > 0:
+            if dihedrals_active.all():
+                dih_pos = positions[self._dihedral_indices_padded]
+                dih_tvecs = tvecs['dihedrals_padded']
+                v_sub = v_atoms[self._dihedral_indices_padded]
+                hvp_padded = np.asarray(
+                    device_get(
+                        _dihedral_hvp_batched(
+                            dih_pos, dih_tvecs, v_sub
+                        )
+                    )
+                )
+                hvp = hvp_padded[:self._n_dihedrals_actual]
+                active_idx = self._dihedral_indices
+            else:
+                active_idx = self._dihedral_indices[dihedrals_active]
+                dih_pos = positions[active_idx]
+                dih_tvecs = tvecs['dihedrals'][dihedrals_active]
+                v_sub = v_atoms[active_idx]
+                hvp = np.asarray(
+                    device_get(
+                        _dihedral_hvp_batched(
+                            dih_pos, dih_tvecs, v_sub
+                        )
+                    )
+                )
+            for k, u_atoms in enumerate(u_atoms_list):
+                u_gathered = u_atoms[active_idx]  # (n_dihedrals, 4, 3)
+                results[k].append(
+                    np.sum(hvp * u_gathered, axis=(1, 2))
+                )
+
+        # --- Other (typically few coords, loop is fine) ---
+        atoms = self.light_atoms
+        for i, coord in enumerate(self.internals['other']):
+            if other_active[i]:
+                hess = np.array(coord.calc_hessian(atoms))
+                idx = np.array(coord.indices)
+                v_sub = v_atoms[idx]
+                hvp = np.einsum('aibj,bj->ai', hess, v_sub)
+                for k, u_atoms in enumerate(u_atoms_list):
+                    u_sub = u_atoms[idx]
+                    results[k].append(
+                        np.array([np.sum(hvp * u_sub)])
+                    )
+
+        # --- Rotations ---
+        for i, coord in enumerate(self.internals['rotations']):
+            if rot_active[i]:
+                idx = np.array(coord.indices)
+                pos = positions[idx]
+                v_sub = v_atoms[idx]
+                axis = coord.kwargs['axis']
+                refpos = coord.kwargs['refpos']
+                hvp = np.asarray(
+                    device_get(
+                        _rotation_hvp_jit(pos, axis, refpos, v_sub)
+                    )
+                )
+                for k, u_atoms in enumerate(u_atoms_list):
+                    u_sub = u_atoms[idx]
+                    results[k].append(
+                        np.array([np.sum(hvp * u_sub)])
+                    )
+
+        # Concatenate fragments for each u
+        out = []
+        for r in results:
+            if r:
+                out.append(np.concatenate(r))
+            else:
+                out.append(np.empty(0))
+        return tuple(out)
+
     def wrap(self, vec: np.ndarray) -> np.ndarray:
         """Wraps an internal coord. displacement vector into a valid domain."""
         # TODO: make this more robust to the addition of other arbitrary
@@ -1718,7 +1909,8 @@ class BaseInternals:
                 complete_cell(self.cell), pbc=pbc
             )
             self.rcell = Cell(rcell)
-        dx_sc = dx @ self.rcell.reciprocal().T
+            self._rcell_reciprocal_T = self.rcell.reciprocal().T
+        dx_sc = dx @ self._rcell_reciprocal_T
         offset = np.zeros(3, dtype=np.int32)
         for _ in range(2):
             offset += pbc * ((dx_sc - offset) // 1.).astype(np.int32)
@@ -2144,6 +2336,7 @@ class Internals(BaseInternals):
         )
         for name in self._names:
             new.internals[name] = self.internals[name].copy()
+            new._internals_set[name] = self._internals_set[name].copy()
             new.forbidden[name] = self.forbidden[name].copy()
             new._active[name] = self._active[name].copy()
         return new
@@ -2227,12 +2420,14 @@ class Internals(BaseInternals):
         else:
             ncvecs = self._get_ncvecs(indices, ncvecs, mic)
             new = kind(indices, ncvecs=ncvecs)
+        key = (tuple(new.indices), tuple(map(tuple, new.kwargs['ncvecs'])))
         if (
-            new in self.internals[name]
+            key in self._internals_set[name]
             or new in self.forbidden[name]
         ):
             raise DuplicateInternalError
         self.internals[name].append(new)
+        self._internals_set[name].add(key)
         self._active[name].append(True)
 
     add_bond = partialmethod(_add_internal, Bond, 'bonds')
@@ -2321,6 +2516,80 @@ class Internals(BaseInternals):
                 labels[j] = label
                 Internals.flood_fill(j, nbonds, c10y, labels, label)
 
+    def _find_bonds_vectorized(self, labels, scale, rcov):
+        """Vectorized bond search across all candidate atom pairs.
+
+        Returns a list of (i, j, ts) tuples for bonds that pass the
+        distance threshold, where ts is the integer translation vector.
+        """
+        natoms = self.natoms
+        pos = self.atoms.positions
+        cell = self.atoms.cell.array
+        pbc = self.atoms.pbc
+
+        # Ensure cell/rcell/op are cached
+        if self.cell is None or not np.all(self.cell == self.atoms.cell):
+            self.cell = self.atoms.cell.array.copy()
+            rcell, self.op = minkowski_reduce(
+                complete_cell(self.cell), pbc=pbc
+            )
+            self.rcell = Cell(rcell)
+            self._rcell_reciprocal_T = self.rcell.reciprocal().T
+
+        # 1. Generate all candidate pairs (i <= j)
+        ii, jj = np.triu_indices(natoms, k=0)
+        # Skip pairs in the same labeled fragment
+        same_frag = (labels[ii] == labels[jj]) & (labels[ii] != -1)
+        keep = ~same_frag
+        ii, jj = ii[keep], jj[keep]
+
+        if len(ii) == 0:
+            return []
+
+        # 2. All pairwise displacements
+        dx = pos[jj] - pos[ii]  # (n_pairs, 3)
+
+        # 3. Pair-dependent offsets (vectorized _get_neighbors logic)
+        dx_sc = dx @ self._rcell_reciprocal_T
+        offset = np.zeros(dx_sc.shape, dtype=np.int32)
+        for _ in range(2):
+            offset += (pbc * ((dx_sc - offset) // 1.)).astype(np.int32)
+
+        # 4. Base translation vectors from PBC dimensions
+        ranges = [np.arange(-1 * p, p + 1) for p in pbc]
+        base_ts = np.array(
+            list(product(*ranges)), dtype=np.int32
+        )  # (n_ts, 3)
+
+        # 5. Shifted translations and Cartesian vectors
+        shifted = base_ts[None, :, :] - offset[:, None, :]  # (n_pairs, n_ts, 3)
+        tvecs_cart = (shifted @ self.op) @ cell  # (n_pairs, n_ts, 3)
+
+        # 6. Distances
+        dists = np.linalg.norm(
+            dx[:, None, :] + tvecs_cart, axis=2
+        )  # (n_pairs, n_ts)
+
+        # 7. Covalent radius threshold
+        thresholds = scale * (rcov[ii] + rcov[jj])
+        bond_mask = dists <= thresholds[:, None]
+
+        # 8. Exclude self-bonds (i==j) with zero translation
+        self_bond = (ii == jj)
+        zero_ts = np.all(shifted @ self.op == 0, axis=2)
+        bond_mask &= ~(self_bond[:, None] & zero_ts)
+
+        # 9. Collect hits
+        pair_idx, ts_idx = np.nonzero(bond_mask)
+        op = self.op
+        results = []
+        for k in range(len(pair_idx)):
+            p = pair_idx[k]
+            t = ts_idx[k]
+            ts = (shifted[p, t] @ op).astype(np.int32)
+            results.append((int(ii[p]), int(jj[p]), ts))
+        return results
+
     def find_all_bonds(
         self,
         nbond_cart_thr: int = 6,
@@ -2364,32 +2633,19 @@ class Internals(BaseInternals):
             if self.allow_fragments and not first_run:
                 break
 
-            for i, j in cwr(range(self.natoms), 2):
-                # do not add a bond between atoms belonging to the same
-                # bonding network fragment
-                if labels[i] == labels[j] and labels[i] != -1:
+            candidates = self._find_bonds_vectorized(
+                labels, scale, rcov
+            )
+            for i, j, ts in candidates:
+                try:
+                    self.add_bond((i, j), ts)
+                except DuplicateInternalError:
                     continue
-                dx = self.atoms.positions[j] - self.atoms.positions[i]
-                for ts in self._get_neighbors(dx):
-                    # self-bonding is only allowed if a non-zero periodic
-                    # translation vector is used
-                    if i == j and np.all(ts == np.array((0, 0, 0))):
-                        continue
-                    dist = np.linalg.norm(dx + ts @ self.atoms.cell)
-                    if dist <= scale * (rcov[i] + rcov[j]):
-                        # try to add the bond. it doesn't matter if the
-                        # bond already exists.
-                        try:
-                            self.add_bond((i, j), ts)
-                        except DuplicateInternalError:
-                            continue
-                        if nbonds[i] < max_bonds and nbonds[j] < max_bonds:
-                            c10y[i, nbonds[i]] = j
-                            nbonds[i] += 1
-                            c10y[j, nbonds[j]] = i
-                            nbonds[j] += 1
-                        else:
-                            pass
+                if nbonds[i] < max_bonds and nbonds[j] < max_bonds:
+                    c10y[i, nbonds[i]] = j
+                    nbonds[i] += 1
+                    c10y[j, nbonds[j]] = i
+                    nbonds[j] += 1
             first_run = False
             scale *= 1.05
 
@@ -2524,25 +2780,40 @@ class Internals(BaseInternals):
                             )
 
     def find_all_dihedrals(self) -> None:
-        # First, find proper dihedrals from angle combinations
-        for a1, a2 in combinations(self.internals['angles'], 2):
-            try:
-                new = a1 + a2
-            except NoValidInternalError:
-                continue
-            # this is a dihedral that has the same exact atom as both
-            # the first and last atom.
-            if (
-                new.indices[0] == new.indices[3]
-                and np.all(
-                    np.sum(new.kwargs['ncvecs'], axis=0) == np.array((0, 0, 0))
-                )
-            ):
-                continue
-            try:
-                self.add_dihedral(new)
-            except DuplicateInternalError:
-                continue
+        # First, find proper dihedrals from angle combinations.
+        # Group angles by their bond edges so we only try pairs that
+        # share a bond (required for __add__ to succeed).
+        edge_to_angles = {}
+        for angle in self.internals['angles']:
+            i, j, k = angle.indices
+            for edge_key in ((min(i, j), max(i, j)), (min(j, k), max(j, k))):
+                edge_to_angles.setdefault(edge_key, []).append(angle)
+
+        seen_pairs = set()
+        for angles_on_edge in edge_to_angles.values():
+            for a1, a2 in combinations(angles_on_edge, 2):
+                pair_key = (id(a1), id(a2))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                try:
+                    new = a1 + a2
+                except NoValidInternalError:
+                    continue
+                # this is a dihedral that has the same exact atom as both
+                # the first and last atom.
+                if (
+                    new.indices[0] == new.indices[3]
+                    and np.all(
+                        np.sum(new.kwargs['ncvecs'], axis=0)
+                        == np.array((0, 0, 0))
+                    )
+                ):
+                    continue
+                try:
+                    self.add_dihedral(new)
+                except DuplicateInternalError:
+                    continue
 
         # Second, add improper dihedrals for atoms with 3 or 4 neighbors that don't
         # have any proper dihedral passing through them. This is needed because:

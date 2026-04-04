@@ -700,7 +700,7 @@ class InternalPES(PES):
             if cons is None:
                 cons = self.cons
             B = internal.jacobian()
-            Ui, Si, VTi = np.linalg.svd(B)
+            Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
             nnred = np.sum(Si > 1e-6)
             Unred = Ui[:, :nnred]
             Vnred = VTi[:nnred].T
@@ -722,7 +722,7 @@ class InternalPES(PES):
         internal = self.int
         cons = self.cons
         B = internal.jacobian()
-        Ui, Si, VTi = np.linalg.svd(B)
+        Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
         nnred = np.sum(Si > 1e-6)
         Unred = Ui[:, :nnred]
         Vnred = VTi[:nnred].T
@@ -847,9 +847,11 @@ class InternalPES(PES):
         D_rdot = self.int.hessian_rdot(dxdt)
         # Reuse Binv from ODE initialization to avoid repeated SVD
         Binv = self._ode_Binv
-        D_tmp = -Binv @ D_rdot
-        dydt[1] = D_tmp @ dxdt
-        dydt[2] = D_tmp @ g
+        # Use associativity: (Binv @ D_rdot) @ v = Binv @ (D_rdot @ v)
+        # This avoids forming the (ndof, ndof) matrix D_tmp, replacing one
+        # O(ndof^2 * n_int) matmul with two O(ndof * n_int) matvecs.
+        dydt[1] = -Binv @ (D_rdot @ dxdt)
+        dydt[2] = -Binv @ (D_rdot @ g)
 
         return dydt.ravel()
 
@@ -889,7 +891,7 @@ class InternalPES(PES):
         ncart = 3 * len(self.atoms)
         # Get Jacobian and calculate redundant and non-redundant spaces
         B = self.int.jacobian()[:, :ncart]
-        Ui, Si, VTi = np.linalg.svd(B)
+        Ui, Si, VTi = np.linalg.svd(B, full_matrices=True)
         nnred = np.sum(Si > 1e-6)
         Unred = Ui[:, :nnred]
         Ured = Ui[:, nnred:]
