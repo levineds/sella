@@ -157,10 +157,18 @@ class PES:
         self.hessian_function = hessian_function
 
         # Cache for _calc_basis to avoid redundant SVD computations
-        self._basis_cache = dict(pos_hash=None, result=None)
+        self._basis_cache = dict(state_hash=None, result=None)
 
     apos = property(lambda self: self.atoms.positions.copy())
     dpos = property(lambda self: None)
+
+    def _state_hash(self) -> bytes:
+        """Hash of all state that affects cached computations."""
+        h = self.atoms.positions.tobytes()
+        cell = self.atoms.cell
+        if cell is not None and cell.any():
+            h += cell.array.tobytes()
+        return h
 
     def save(self):
         self.savepoint = dict(apos=self.apos, dpos=self.dpos)
@@ -223,8 +231,8 @@ class PES:
 
     def _calc_basis(self):
         # Check if cached result is valid
-        pos_hash = self.atoms.positions.tobytes()
-        if self._basis_cache['pos_hash'] == pos_hash:
+        state_hash = self._state_hash()
+        if self._basis_cache['state_hash'] == state_hash:
             return self._basis_cache['result']
 
         drdx = self.get_drdx()
@@ -236,7 +244,7 @@ class PES:
         result = (drdx, Ucons, Unred, Ufree)
 
         # Cache the result
-        self._basis_cache['pos_hash'] = pos_hash
+        self._basis_cache['state_hash'] = state_hash
         self._basis_cache['result'] = result
         return result
 
@@ -487,29 +495,33 @@ class InternalPES(PES):
         self.iterative_stepper = iterative_stepper
 
         # Cache for Jacobian pseudo-inverse
-        self._pinv_cache = dict(version=None, pinv=None)
+        self._pinv_cache = dict(state_hash=None, pinv=None)
+
+        # Cache for constraint Hessian
+        self._Hc_cache = dict(state_hash=None, result=None)
 
     dpos = property(lambda self: self.dummies.positions.copy())
+
+    def _state_hash(self) -> bytes:
+        h = super()._state_hash()
+        h += self.dummies.positions.tobytes()
+        return h
 
     # =========================================================================
     # Cache optimization: Store and reuse Jacobian pseudo-inverse
     # =========================================================================
-    # Computing pinv(B) is expensive. Cache it and use the internal coordinate
-    # system's _cache_version counter to detect when positions have changed.
-    # =========================================================================
 
     def _get_Binv(self):
         """Get cached pseudo-inverse of internal Jacobian."""
-        B = self.int.jacobian()
-        # Use cache version counter to detect changes
-        version = self.int._cache_version
-        if (self._pinv_cache.get('version') == version and
-                self._pinv_cache.get('pinv') is not None):
+        state_hash = self._state_hash()
+        if (self._pinv_cache['state_hash'] == state_hash and
+                self._pinv_cache['pinv'] is not None):
             return self._pinv_cache['pinv']
 
+        B = self.int.jacobian()
         Binv = np.linalg.pinv(B)
 
-        self._pinv_cache['version'] = version
+        self._pinv_cache['state_hash'] = state_hash
         self._pinv_cache['pinv'] = Binv
         return Binv
 
@@ -680,12 +692,19 @@ class InternalPES(PES):
 
     # Hessian of the constraints
     def get_Hc(self):
+        state_hash = self._state_hash()
+        if self._Hc_cache['state_hash'] == state_hash:
+            return self._Hc_cache['result']
+
         D_cons = self.cons.hessian().ldot(self.curr['L'])
         Binv_int = self._get_Binv()
         B_cons = self.cons.jacobian()
         L_int = self.curr['L'] @ B_cons @ Binv_int
         D_int = self.int.hessian().ldot(L_int)
         Hc = Binv_int.T @ (D_cons - D_int) @ Binv_int
+
+        self._Hc_cache['state_hash'] = state_hash
+        self._Hc_cache['result'] = Hc
         return Hc
 
     def get_drdx(self):
@@ -714,9 +733,8 @@ class InternalPES(PES):
             return drdx, Ucons, Unred, Ufree
 
         # Check if cached result is valid
-        pos_hash = (self.atoms.positions.tobytes() +
-                    self.dummies.positions.tobytes())
-        if self._basis_cache['pos_hash'] == pos_hash:
+        state_hash = self._state_hash()
+        if self._basis_cache['state_hash'] == state_hash:
             return self._basis_cache['result']
 
         internal = self.int
@@ -728,12 +746,6 @@ class InternalPES(PES):
         Vnred = VTi[:nnred].T
         Siinv = np.diag(1 / Si[:nnred])
 
-        # Compute pinv from SVD components and cache it for _get_Binv
-        # pinv(B) = V @ diag(1/S) @ U.T
-        Binv = Vnred @ Siinv @ Unred.T
-        self._pinv_cache['version'] = internal._cache_version
-        self._pinv_cache['pinv'] = Binv
-
         drdxnred = cons.jacobian() @ Vnred @ Siinv
         drdx = drdxnred @ Unred.T
         Uc, Sc, VTc = np.linalg.svd(drdxnred)
@@ -743,7 +755,7 @@ class InternalPES(PES):
         result = (drdx, Ucons, Unred, Ufree)
 
         # Cache the result
-        self._basis_cache['pos_hash'] = pos_hash
+        self._basis_cache['state_hash'] = state_hash
         self._basis_cache['result'] = result
         return result
 
@@ -2482,8 +2494,8 @@ class CellCartesianPES(PES):
         """
         # Compute Cartesian basis directly (not via parent, since parent uses self.dim)
         # This mirrors PES._calc_basis but uses n_cart instead of self.dim
-        pos_hash = self.atoms.positions.tobytes()
-        if self._basis_cache['pos_hash'] == pos_hash:
+        state_hash = self._state_hash()
+        if self._basis_cache['state_hash'] == state_hash:
             return self._basis_cache['result']
 
         drdx_cart = self.cons.jacobian()  # Constraint Jacobian for Cartesian coords
@@ -2517,7 +2529,7 @@ class CellCartesianPES(PES):
         result = drdx, Ucons, Unred, Ufree
 
         # Cache the result
-        self._basis_cache['pos_hash'] = pos_hash
+        self._basis_cache['state_hash'] = state_hash
         self._basis_cache['result'] = result
         return result
 
