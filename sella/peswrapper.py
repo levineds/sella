@@ -93,10 +93,8 @@ class PES:
         proj_trans: bool = None,
         proj_rot: bool = None,
         hessian_function: Callable[[Atoms], np.ndarray] = None,
-        hessian_update: str = 'TS-BFGS',
     ) -> None:
         self.atoms = atoms
-        self._hessian_update = hessian_update
         if constraints is None:
             constraints = Constraints(self.atoms)
         if proj_trans is None:
@@ -212,7 +210,6 @@ class PES:
         return self.H
 
     def set_H(self, target, *args, **kwargs):
-        kwargs.setdefault('update_method', self._hessian_update)
         self.H = ApproximateHessian(
             self.dim, self.ncart, target, *args, **kwargs
         )

@@ -56,8 +56,7 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None):
         d, _ = S.shape
         B = lam0 * np.eye(d)
 
-    needs_eigen = method in ('TS-BFGS', 'BFGS_auto')
-    if needs_eigen and (lams is None or vecs is None):
+    if lams is None or vecs is None:
         lams, vecs = eigh(B)
 
     if method == 'BFGS_auto':

@@ -228,14 +228,8 @@ class ApproximateHessian(LinearOperator):
             self.set_B(B)
             return
 
-        needs_eigen = self.update_method in ('TS-BFGS', 'BFGS_auto')
-        if needs_eigen:
-            lams, vecs = self.evals, self.evecs  # triggers eigh
-        else:
-            lams, vecs = None, None  # skip eigh
-
         self.set_B(update_H(B, dx, dg, method=self.update_method,
-                            symm=self.symm, lams=lams, vecs=vecs))
+                            symm=self.symm, lams=self.evals, vecs=self.evecs))
 
     def project(self, U):
         """Project B into the subspace defined by U."""
