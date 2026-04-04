@@ -315,17 +315,26 @@ class Sella(Optimizer):
         self.pes.cons.disable_satisfied_inequalities()
         self.pes._update_basis()
         self.pes.save()
-        all_valid = False
         x0 = self.pes.get_x()
-        while not all_valid:
+
+        has_ineq = self.pes.cons.has_inequalities()
+        if has_ineq:
+            all_valid = False
+            while not all_valid:
+                s, smag = self.rs(
+                    self.pes, self.ord, self.delta, method=self.method
+                ).get_s()
+                self.pes.set_x(x0 + s)
+                all_valid = self.pes.cons.validate_inequalities()
+                if not all_valid:
+                    self.pes._update_basis()
+                self.pes.restore()
+            self.pes._update_basis()
+        else:
             s, smag = self.rs(
                 self.pes, self.ord, self.delta, method=self.method
             ).get_s()
-            self.pes.set_x(x0 + s)
-            all_valid = self.pes.cons.validate_inequalities()
-            self.pes._update_basis()
-            self.pes.restore()
-        self.pes._update_basis()
+
         return s, smag
 
     def step(self):

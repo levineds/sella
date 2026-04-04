@@ -2053,6 +2053,14 @@ class Constraints(BaseInternals):
             res[-self.nrotations:] = 0.
         return res
 
+    def has_inequalities(self) -> bool:
+        """Check if any inequality constraints (lt/gt) exist."""
+        for name in self._names:
+            for kind in self._kind[name]:
+                if kind in ('lt', 'gt'):
+                    return True
+        return False
+
     def disable_satisfied_inequalities(self) -> None:
         for name in self._names:
             for i, (coord, kind, target) in enumerate(zip(
