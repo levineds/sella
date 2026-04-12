@@ -1,7 +1,7 @@
 from typing import Union, Callable
 
 import numpy as np
-from scipy.linalg import eigh, expm, expm_frechet, logm, solve_triangular
+from scipy.linalg import eigh, expm, expm_frechet, logm, polar, solve_triangular
 from scipy.integrate import LSODA
 from ase import Atoms
 from ase.build import niggli_reduce
@@ -1694,16 +1694,21 @@ class CellInternalPES(InternalPES):
         self._set_masked_cell_params(cell_target)
 
         # Rigid fragment mode: translate fragment CoMs to maintain
-        # fractional positions after cell change
+        # fractional positions, and rotate fragments by R from polar
+        # decomposition of the incremental deformation gradient.
         if self.rigid_fragments:
             cell_after = self.atoms.get_cell().array
             cell_before_inv = np.linalg.inv(cell_before)
+            F_inc = cell_after @ cell_before_inv
+            R_inc, _ = polar(F_inc)
             for group in self.fragment_groups:
                 com_old = pos_before[group].mean(axis=0)
                 # Convert old CoM to fractional, then to new Cartesian
                 com_frac = com_old @ cell_before_inv
                 com_new = com_frac @ cell_after
-                self.atoms.positions[group] += (com_new - com_old)
+                # Rotate relative positions by R (row-vector: r_new = r @ R^T)
+                delta_r = pos_before[group] - com_old
+                self.atoms.positions[group] = com_new + delta_r @ R_inc.T
 
         # Read back internal coords AFTER the cell change moved atoms.
         # The solver targets q_after_cell + dq, not the raw q_target.
@@ -1925,7 +1930,29 @@ class CellInternalPES(InternalPES):
 
         # dE/dC = C^{-T} @ virial_corrected, then dE/dF = dE/dC @ C₀^T
         C = self.atoms.get_cell().array
-        dEdF = np.linalg.inv(C.T) @ virial_corrected @ self.orig_cell.T
+        C_inv_T = np.linalg.inv(C.T)
+        dEdF = C_inv_T @ virial_corrected @ self.orig_cell.T
+
+        if self.rigid_fragments and forces is not None:
+            # Rotation correction: fragments rotate by R from polar decomposition
+            # of F, so dE/dF gets an additional term from ∂R/∂F.
+            # rot_correction_mn = -Σ_{kl} (∂R_kl/∂F_mn) * [f^T @ Δr⁰]_kl
+            # where Δr⁰ = Δr @ R (back-rotated to reference frame)
+            F = self._get_deformation_gradient()
+            R_polar, _ = polar(F)
+            delta_r_ref = delta_r @ R_polar
+            M = forces.T @ delta_r_ref
+
+            eps = 1e-7
+            rot_correction = np.zeros((3, 3))
+            for m in range(3):
+                for n in range(3):
+                    F_pert = F.copy()
+                    F_pert[m, n] += eps
+                    R_pert, _ = polar(F_pert)
+                    dR = (R_pert - R_polar) / eps
+                    rot_correction[m, n] = -np.sum(dR * M)
+            dEdF += rot_correction
 
         # Convert dE/dF to dE/dU via Frechet derivative of expm
         F = self._get_deformation_gradient()
