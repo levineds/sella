@@ -570,7 +570,7 @@ class InternalPES(PES):
 
         # Check for rank deficiency via R diagonal
         rdiag = np.abs(np.diag(R))
-        if rdiag.min() < 1e-6 * rdiag.max():
+        if len(rdiag) > 0 and rdiag.min() < 1e-6 * rdiag.max():
             # Rank-deficient: fall back to SVD for safe truncation
             Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
             nnred = np.sum(Si > 1e-6)
@@ -595,7 +595,12 @@ class InternalPES(PES):
                 return entry['pinv']
 
         Q, R = self._get_jacobian_qr()
-        Binv = solve_triangular(R, Q.T)
+        if R.size == 0:
+            # No internal coordinates — return empty pseudo-inverse
+            ncart = 3 * len(self.atoms) + (3 * len(self.dummies) if self.dummies else 0)
+            Binv = np.empty((ncart, 0))
+        else:
+            Binv = solve_triangular(R, Q.T)
 
         idx = self._pinv_cache_next
         self._pinv_cache[idx] = dict(state_hash=state_hash, pinv=Binv)

@@ -669,15 +669,17 @@ class TestCellGradient:
 
     def test_cell_gradient_shape_molecular(self):
         """Test cell gradient has correct shape for molecular system."""
-        mol = molecule('H2O')
-        mol.center(vacuum=3.5)
+        water1 = molecule('H2O')
+        water2 = molecule('H2O')
+        water1.positions += [1.0, 1.0, 1.0]
+        water2.positions += [4.0, 4.0, 4.0]
+        mol = water1 + water2
+        mol.set_cell([7.0, 7.0, 7.0])
         mol.pbc = True
-        mol.calc = EMT()
+        mol.calc = LennardJones()
 
-        internals = Internals(mol)
-        internals.find_all_bonds()
-        internals.find_all_angles()
-        pes = CellInternalPES(mol, internals)
+        internals = Internals(mol, allow_fragments=True)
+        pes = CellInternalPES(mol, internals, auto_find_internals=True)
 
         _, g = pes.eval()
 
