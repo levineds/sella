@@ -1590,80 +1590,132 @@ class BaseInternals:
         start += n_other
         rot_active = active_mask[start:start+n_rot]
 
-        results = []
+        n_active = sum(active_mask)
 
-        # Translations - Hessian is zero (translation is linear: mean of positions)
-        # So HVP is always zero, just append zero rows
+        # Pre-allocate output buffer (reuse across calls via cached array)
+        if (not hasattr(self, '_hvp_buf') or self._hvp_buf is None
+                or self._hvp_buf.shape != (n_active, ndof)):
+            self._hvp_buf = np.zeros((n_active, ndof))
+        out = self._hvp_buf
+        out[:] = 0  # Clear (cheaper than allocating)
+
+        # Also pre-allocate a scratch buffer for scatter operations
+        # Shape: (max_coords_in_batch, n_atoms, 3)
+        max_batch = max(
+            self._n_bonds_actual if bonds_active.any() else 0,
+            self._n_angles_actual if angles_active.any() else 0,
+            self._n_dihedrals_actual if dihedrals_active.any() else 0,
+            1,
+        )
+        if (not hasattr(self, '_scatter_buf') or self._scatter_buf is None
+                or self._scatter_buf.shape[0] < max_batch
+                or self._scatter_buf.shape[1] != n_atoms):
+            self._scatter_buf = np.zeros((max_batch, n_atoms, 3))
+
+        row = 0  # Current write position in output
+
+        # Translations - Hessian is zero
         n_active_trans = sum(trans_active)
-        if n_active_trans > 0:
-            results.append(np.zeros((n_active_trans, ndof)))
+        # out[row:row+n_active_trans] is already zero from the clear
+        row += n_active_trans
 
-        # Bonds - use batched HVP with vectorized scatter
+        # Launch all JAX HVP computations, deferring device_get
+        # This allows JAX to pipeline the computations before we block on transfer
+
+        bond_jax_result = None
+        bond_active_idx = None
         if bonds_active.any() and self._n_bonds_actual > 0:
             if bonds_active.all():
-                # All bonds active - use padded arrays to avoid recompilation
                 bond_pos = positions[self._bond_indices_padded]
                 bond_tvecs = tvecs['bonds_padded']
                 v_sub = v_atoms[self._bond_indices_padded]
-                hvp_padded = np.asarray(device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub)))
-                hvp = hvp_padded[:self._n_bonds_actual]
-                active_idx = self._bond_indices
+                bond_jax_result = _bond_hvp_batched(bond_pos, bond_tvecs, v_sub)
+                bond_active_idx = self._bond_indices
             else:
-                active_idx = self._bond_indices[bonds_active]
-                bond_pos = positions[active_idx]
+                bond_active_idx = self._bond_indices[bonds_active]
+                bond_pos = positions[bond_active_idx]
                 bond_tvecs = tvecs['bonds'][bonds_active]
-                v_sub = v_atoms[active_idx]
-                hvp = np.asarray(device_get(_bond_hvp_batched(bond_pos, bond_tvecs, v_sub)))
-            # Vectorized scatter: replace loop with advanced indexing
-            n_coords = len(active_idx)
-            result = np.zeros((n_coords, n_atoms, 3))
-            row_idx = np.arange(n_coords)[:, None]
-            result[row_idx, active_idx] = hvp
-            results.append(result.reshape((n_coords, ndof)))
+                v_sub = v_atoms[bond_active_idx]
+                bond_jax_result = _bond_hvp_batched(bond_pos, bond_tvecs, v_sub)
 
-        # Angles - use batched HVP with vectorized scatter
+        angle_jax_result = None
+        angle_active_idx = None
         if angles_active.any() and self._n_angles_actual > 0:
             if angles_active.all():
                 angle_pos = positions[self._angle_indices_padded]
                 angle_tvecs = tvecs['angles_padded']
                 v_sub = v_atoms[self._angle_indices_padded]
-                hvp_padded = np.asarray(device_get(_angle_hvp_batched(angle_pos, angle_tvecs, v_sub)))
-                hvp = hvp_padded[:self._n_angles_actual]
-                active_idx = self._angle_indices
+                angle_jax_result = _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
+                angle_active_idx = self._angle_indices
             else:
-                active_idx = self._angle_indices[angles_active]
-                angle_pos = positions[active_idx]
+                angle_active_idx = self._angle_indices[angles_active]
+                angle_pos = positions[angle_active_idx]
                 angle_tvecs = tvecs['angles'][angles_active]
-                v_sub = v_atoms[active_idx]
-                hvp = np.asarray(device_get(_angle_hvp_batched(angle_pos, angle_tvecs, v_sub)))
-            # Vectorized scatter
-            n_coords = len(active_idx)
-            result = np.zeros((n_coords, n_atoms, 3))
-            row_idx = np.arange(n_coords)[:, None]
-            result[row_idx, active_idx] = hvp
-            results.append(result.reshape((n_coords, ndof)))
+                v_sub = v_atoms[angle_active_idx]
+                angle_jax_result = _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
 
-        # Dihedrals - use batched HVP with vectorized scatter
+        dih_jax_result = None
+        dih_active_idx = None
         if dihedrals_active.any() and self._n_dihedrals_actual > 0:
             if dihedrals_active.all():
                 dih_pos = positions[self._dihedral_indices_padded]
                 dih_tvecs = tvecs['dihedrals_padded']
                 v_sub = v_atoms[self._dihedral_indices_padded]
-                hvp_padded = np.asarray(device_get(_dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)))
-                hvp = hvp_padded[:self._n_dihedrals_actual]
-                active_idx = self._dihedral_indices
+                dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
+                dih_active_idx = self._dihedral_indices
             else:
-                active_idx = self._dihedral_indices[dihedrals_active]
-                dih_pos = positions[active_idx]
+                dih_active_idx = self._dihedral_indices[dihedrals_active]
+                dih_pos = positions[dih_active_idx]
                 dih_tvecs = tvecs['dihedrals'][dihedrals_active]
-                v_sub = v_atoms[active_idx]
-                hvp = np.asarray(device_get(_dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)))
-            # Vectorized scatter
-            n_coords = len(active_idx)
-            result = np.zeros((n_coords, n_atoms, 3))
-            row_idx = np.arange(n_coords)[:, None]
-            result[row_idx, active_idx] = hvp
-            results.append(result.reshape((n_coords, ndof)))
+                v_sub = v_atoms[dih_active_idx]
+                dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
+
+        # Launch rotation HVPs (these are small, one per rotation)
+        rot_jax_results = []
+        rot_indices = []
+        for i, coord in enumerate(self.internals['rotations']):
+            if rot_active[i]:
+                idx = np.array(coord.indices)
+                pos = positions[idx]
+                v_sub = v_atoms[idx]
+                axis = coord.kwargs['axis']
+                refpos = coord.kwargs['refpos']
+                rot_jax_results.append(
+                    (_rotation_hvp_jit(pos, axis, refpos, v_sub), idx)
+                )
+
+        # Now collect results with device_get and scatter into output buffer
+        scatter_buf = self._scatter_buf
+
+        if bond_jax_result is not None:
+            hvp = np.asarray(device_get(bond_jax_result))
+            if bonds_active.all():
+                hvp = hvp[:self._n_bonds_actual]
+            n_coords = len(bond_active_idx)
+            scatter_buf[:n_coords] = 0
+            scatter_buf[np.arange(n_coords)[:, None], bond_active_idx] = hvp
+            out[row:row+n_coords] = scatter_buf[:n_coords].reshape((n_coords, ndof))
+            row += n_coords
+
+        if angle_jax_result is not None:
+            hvp = np.asarray(device_get(angle_jax_result))
+            if angles_active.all():
+                hvp = hvp[:self._n_angles_actual]
+            n_coords = len(angle_active_idx)
+            scatter_buf[:n_coords] = 0
+            scatter_buf[np.arange(n_coords)[:, None], angle_active_idx] = hvp
+            out[row:row+n_coords] = scatter_buf[:n_coords].reshape((n_coords, ndof))
+            row += n_coords
+
+        if dih_jax_result is not None:
+            hvp = np.asarray(device_get(dih_jax_result))
+            if dihedrals_active.all():
+                hvp = hvp[:self._n_dihedrals_actual]
+            n_coords = len(dih_active_idx)
+            scatter_buf[:n_coords] = 0
+            scatter_buf[np.arange(n_coords)[:, None], dih_active_idx] = hvp
+            out[row:row+n_coords] = scatter_buf[:n_coords].reshape((n_coords, ndof))
+            row += n_coords
 
         # Other - use existing hessian computation (typically few coords, loop is fine)
         atoms = self.light_atoms
@@ -1673,26 +1725,18 @@ class BaseInternals:
                 idx = np.array(coord.indices)
                 v_sub = v_atoms[idx]
                 hvp = np.einsum('aibj,bj->ai', hess, v_sub)
-                row = np.zeros(ndof)
-                row.reshape((-1, 3))[idx] = hvp
-                results.append(row[None, :])  # Shape (1, ndof) for consistency
+                out_row = out[row].reshape((-1, 3))
+                out_row[idx] = hvp
+                row += 1
 
-        # Rotations - use O(N) HVP (typically few coords, loop is fine)
-        for i, coord in enumerate(self.internals['rotations']):
-            if rot_active[i]:
-                idx = np.array(coord.indices)
-                pos = positions[idx]
-                v_sub = v_atoms[idx]
-                axis = coord.kwargs['axis']
-                refpos = coord.kwargs['refpos']
-                hvp = np.asarray(device_get(_rotation_hvp_jit(pos, axis, refpos, v_sub)))
-                row = np.zeros(ndof)
-                row.reshape((-1, 3))[idx] = hvp
-                results.append(row[None, :])  # Shape (1, ndof) for consistency
+        # Rotations - collect deferred results
+        for jax_result, idx in rot_jax_results:
+            hvp = np.asarray(device_get(jax_result))
+            out_row = out[row].reshape((-1, 3))
+            out_row[idx] = hvp
+            row += 1
 
-        if results:
-            return np.vstack(results)
-        return np.empty((0, ndof))
+        return out[:row]
 
     def hessian_rdot_vecs(self, v: np.ndarray, *us: np.ndarray):
         """Compute (H_i @ v) · u for all active internal coordinates.
