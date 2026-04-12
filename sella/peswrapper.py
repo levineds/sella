@@ -497,6 +497,9 @@ class InternalPES(PES):
         # Cache for Jacobian pseudo-inverse
         self._pinv_cache = dict(state_hash=None, pinv=None)
 
+        # Cache for Jacobian SVD factors (shared between _get_Binv and _calc_basis)
+        self._svd_cache = dict(state_hash=None, Ui=None, Si=None, VTi=None)
+
         # Cache for constraint Hessian
         self._Hc_cache = dict(state_hash=None, result=None)
 
@@ -508,18 +511,44 @@ class InternalPES(PES):
         return h
 
     # =========================================================================
-    # Cache optimization: Store and reuse Jacobian pseudo-inverse
+    # Cache optimization: Store and reuse Jacobian SVD and pseudo-inverse
     # =========================================================================
 
+    def _get_jacobian_svd(self):
+        """Get cached economy SVD of internal Jacobian.
+
+        Returns (Ui, Si, VTi) from np.linalg.svd(B, full_matrices=False).
+        Shared between _get_Binv and _calc_basis so the same (1056, 528)
+        Jacobian is decomposed at most once per geometry.
+        """
+        state_hash = self._state_hash()
+        if self._svd_cache['state_hash'] == state_hash:
+            return self._svd_cache['Ui'], self._svd_cache['Si'], self._svd_cache['VTi']
+
+        B = self.int.jacobian()
+        Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
+        self._svd_cache.update(state_hash=state_hash, Ui=Ui, Si=Si, VTi=VTi)
+        return Ui, Si, VTi
+
     def _get_Binv(self):
-        """Get cached pseudo-inverse of internal Jacobian."""
+        """Get cached pseudo-inverse of internal Jacobian.
+
+        Computes Binv = V S^{-1} U^T from the shared SVD cache,
+        avoiding a separate np.linalg.pinv call (which internally
+        performs its own SVD).  Uses the same threshold as
+        np.linalg.pinv: max(M, N) * max(S) * machine_epsilon.
+        """
         state_hash = self._state_hash()
         if (self._pinv_cache['state_hash'] == state_hash and
                 self._pinv_cache['pinv'] is not None):
             return self._pinv_cache['pinv']
 
-        B = self.int.jacobian()
-        Binv = np.linalg.pinv(B)
+        Ui, Si, VTi = self._get_jacobian_svd()
+        # Replicate np.linalg.pinv's default rcond
+        rcond = max(Ui.shape[0], VTi.shape[0]) * np.finfo(Si.dtype).eps
+        cutoff = Si[0] * rcond
+        keep = Si > cutoff
+        Binv = (VTi[keep].T * (1 / Si[keep])) @ Ui[:, keep].T
 
         self._pinv_cache['state_hash'] = state_hash
         self._pinv_cache['pinv'] = Binv
@@ -724,12 +753,20 @@ class InternalPES(PES):
             Unred = Ui[:, :nnred]
             Vnred = VTi[:nnred].T
             Siinv = np.diag(1 / Si[:nnred])
-            drdxnred = cons.jacobian() @ Vnred @ Siinv
-            drdx = drdxnred @ Unred.T
-            Uc, Sc, VTc = np.linalg.svd(drdxnred)
-            ncons = np.sum(Sc > 1e-6)
-            Ucons = Unred @ VTc[:ncons].T
-            Ufree = Unred @ VTc[ncons:].T
+            cons_jac = cons.jacobian()
+            n_int = B.shape[0]
+            if cons_jac.shape[0] == 0:
+                # No constraints: all non-redundant DOF are free
+                drdx = np.zeros((0, n_int))
+                Ucons = np.zeros((n_int, 0))
+                Ufree = Unred
+            else:
+                drdxnred = cons_jac @ Vnred @ Siinv
+                drdx = drdxnred @ Unred.T
+                Uc, Sc, VTc = np.linalg.svd(drdxnred)
+                ncons = np.sum(Sc > 1e-6)
+                Ucons = Unred @ VTc[:ncons].T
+                Ufree = Unred @ VTc[ncons:].T
             return drdx, Ucons, Unred, Ufree
 
         # Check if cached result is valid
@@ -737,21 +774,36 @@ class InternalPES(PES):
         if self._basis_cache['state_hash'] == state_hash:
             return self._basis_cache['result']
 
-        internal = self.int
         cons = self.cons
-        B = internal.jacobian()
-        Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
+        # Use shared SVD cache to avoid redundant decomposition
+        Ui, Si, VTi = self._get_jacobian_svd()
         nnred = np.sum(Si > 1e-6)
         Unred = Ui[:, :nnred]
         Vnred = VTi[:nnred].T
         Siinv = np.diag(1 / Si[:nnred])
 
-        drdxnred = cons.jacobian() @ Vnred @ Siinv
-        drdx = drdxnred @ Unred.T
-        Uc, Sc, VTc = np.linalg.svd(drdxnred)
-        ncons = np.sum(Sc > 1e-6)
-        Ucons = Unred @ VTc[:ncons].T
-        Ufree = Unred @ VTc[ncons:].T
+        # Cross-populate Binv cache using pinv's threshold
+        rcond = max(Ui.shape[0], VTi.shape[0]) * np.finfo(Si.dtype).eps
+        cutoff = Si[0] * rcond
+        keep = Si > cutoff
+        Binv = (VTi[keep].T * (1 / Si[keep])) @ Ui[:, keep].T
+        self._pinv_cache['state_hash'] = state_hash
+        self._pinv_cache['pinv'] = Binv
+
+        n_int = Ui.shape[0]  # number of internal coordinates
+        cons_jac = cons.jacobian()
+        if cons_jac.shape[0] == 0:
+            # No constraints: all non-redundant DOF are free
+            drdx = np.zeros((0, n_int))
+            Ucons = np.zeros((n_int, 0))
+            Ufree = Unred
+        else:
+            drdxnred = cons_jac @ Vnred @ Siinv
+            drdx = drdxnred @ Unred.T
+            Uc, Sc, VTc = np.linalg.svd(drdxnred)
+            ncons = np.sum(Sc > 1e-6)
+            Ucons = Unred @ VTc[:ncons].T
+            Ufree = Unred @ VTc[ncons:].T
         result = (drdx, Ucons, Unred, Ufree)
 
         # Cache the result
