@@ -228,8 +228,25 @@ class ApproximateHessian(LinearOperator):
             self.set_B(B)
             return
 
+        # For TS-BFGS methods, try to skip the expensive eigendecomposition
+        # when B is positive-definite. When PD, |B| = B so |B|@S = B@S.
+        # Cholesky is ~3x cheaper than eigh and gives an exact PD check.
+        is_pd = False
+        if self.update_method in ('TS-BFGS', 'BFGS_auto'):
+            try:
+                np.linalg.cholesky(B)
+                is_pd = True
+            except np.linalg.LinAlgError:
+                pass
+
+        if is_pd:
+            lams, vecs = None, None
+        else:
+            lams, vecs = self.evals, self.evecs
+
         self.set_B(update_H(B, dx, dg, method=self.update_method,
-                            symm=self.symm, lams=self.evals, vecs=self.evecs))
+                            symm=self.symm, lams=lams, vecs=vecs,
+                            is_pd=is_pd))
 
     def project(self, U):
         """Project B into the subspace defined by U."""

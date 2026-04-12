@@ -35,7 +35,8 @@ def symmetrize_Y(S, Y, symm):
         raise ValueError("Unknown symmetrization method {}".format(symm))
 
 
-def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None):
+def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None,
+             is_pd=False):
     if len(S.shape) == 1:
         if np.linalg.norm(S) < 1e-8:
             return B
@@ -57,13 +58,14 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None):
         B = lam0 * np.eye(d)
 
     if lams is None or vecs is None:
-        lams, vecs = eigh(B)
+        if not is_pd:
+            lams, vecs = eigh(B)
 
     if method == 'BFGS_auto':
         # Default to TS-BFGS, and only use BFGS if B and S.T @ Y are
         # both positive definite
         method = 'TS-BFGS'
-        if np.all(lams > 0):
+        if is_pd or (lams is not None and np.all(lams > 0)):
             lams_STY, vecs_STY = eigh(S.T @ Ytilde, S.T @ S)
             if np.all(lams_STY > 0):
                 method = 'BFGS'
@@ -71,7 +73,7 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None):
     if method == 'BFGS':
         Bplus = _MS_BFGS(B, S, Ytilde)
     elif method == 'TS-BFGS':
-        Bplus = _MS_TS_BFGS(B, S, Ytilde, lams, vecs)
+        Bplus = _MS_TS_BFGS(B, S, Ytilde, lams, vecs, is_pd)
     elif method == 'PSB':
         Bplus = _MS_PSB(B, S, Ytilde)
     elif method == 'DFP':
@@ -93,10 +95,13 @@ def _MS_BFGS(B, S, Y):
     return Y @ solve(Y.T @ S, Y.T) - B @ S @ solve(S.T @ B @ S, S.T @ B)
 
 
-def _MS_TS_BFGS(B, S, Y, lams, vecs):
+def _MS_TS_BFGS(B, S, Y, lams, vecs, is_pd=False):
     J = Y - B @ S
     X1 = S.T @ Y @ Y.T
-    absBS = vecs @ (np.abs(lams[:, np.newaxis]) * (vecs.T @ S))
+    if is_pd:
+        absBS = B @ S
+    else:
+        absBS = vecs @ (np.abs(lams[:, np.newaxis]) * (vecs.T @ S))
     X2 = S.T @ absBS @ absBS.T
     U = lstsq((X1 + X2) @ S, X1 + X2)[0].T
     UJT = U @ J.T
