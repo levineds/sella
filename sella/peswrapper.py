@@ -156,8 +156,14 @@ class PES:
 
         self.hessian_function = hessian_function
 
-        # Cache for _calc_basis to avoid redundant SVD computations
-        self._basis_cache = dict(state_hash=None, result=None)
+        # 2-entry LRU cache for _calc_basis to avoid redundant SVD computations.
+        # Two entries because the step cycle alternates between two geometries:
+        # the pre-ODE (post-cell-change) and post-ODE positions.
+        self._basis_cache = [
+            dict(state_hash=None, result=None),
+            dict(state_hash=None, result=None),
+        ]
+        self._basis_cache_next = 0  # index of next entry to evict
 
     apos = property(lambda self: self.atoms.positions.copy())
     dpos = property(lambda self: None)
@@ -229,11 +235,29 @@ class PES:
     def get_drdx(self):
         return self.cons.jacobian()
 
+    def _basis_cache_get(self, state_hash):
+        """Look up state_hash in 2-entry LRU basis cache. Returns result or None."""
+        for entry in self._basis_cache:
+            if entry['state_hash'] == state_hash:
+                return entry['result']
+        return None
+
+    def _basis_cache_put(self, state_hash, result):
+        """Store result in 2-entry LRU basis cache, evicting oldest."""
+        # Don't store if already present
+        for entry in self._basis_cache:
+            if entry['state_hash'] == state_hash:
+                return
+        idx = self._basis_cache_next
+        self._basis_cache[idx] = dict(state_hash=state_hash, result=result)
+        self._basis_cache_next = 1 - idx  # alternate 0, 1
+
     def _calc_basis(self):
         # Check if cached result is valid
         state_hash = self._state_hash()
-        if self._basis_cache['state_hash'] == state_hash:
-            return self._basis_cache['result']
+        cached = self._basis_cache_get(state_hash)
+        if cached is not None:
+            return cached
 
         drdx = self.get_drdx()
         U, S, VT = np.linalg.svd(drdx)
@@ -244,8 +268,7 @@ class PES:
         result = (drdx, Ucons, Unred, Ufree)
 
         # Cache the result
-        self._basis_cache['state_hash'] = state_hash
-        self._basis_cache['result'] = result
+        self._basis_cache_put(state_hash, result)
         return result
 
     def write_traj(self):
@@ -494,11 +517,19 @@ class InternalPES(PES):
         self.bad_int = None
         self.iterative_stepper = iterative_stepper
 
-        # Cache for Jacobian pseudo-inverse
-        self._pinv_cache = dict(state_hash=None, pinv=None)
+        # 2-entry LRU caches for Jacobian pseudo-inverse and QR factors,
+        # matching the 2-entry basis cache (same two geometries per step).
+        self._pinv_cache = [
+            dict(state_hash=None, pinv=None),
+            dict(state_hash=None, pinv=None),
+        ]
+        self._pinv_cache_next = 0
 
-        # Cache for Jacobian QR factors (shared between _get_Binv and _calc_basis)
-        self._qr_cache = dict(state_hash=None, Q=None, R=None)
+        self._qr_cache = [
+            dict(state_hash=None, Q=None, R=None),
+            dict(state_hash=None, Q=None, R=None),
+        ]
+        self._qr_cache_next = 0
 
         # Cache for constraint Hessian
         self._Hc_cache = dict(state_hash=None, result=None)
@@ -526,8 +557,9 @@ class InternalPES(PES):
         Falls back to SVD if the Jacobian is rank-deficient.
         """
         state_hash = self._state_hash()
-        if self._qr_cache['state_hash'] == state_hash:
-            return self._qr_cache['Q'], self._qr_cache['R']
+        for entry in self._qr_cache:
+            if entry['state_hash'] == state_hash:
+                return entry['Q'], entry['R']
 
         B = self.int.jacobian()
         Q, R = np.linalg.qr(B, mode='reduced')
@@ -542,7 +574,9 @@ class InternalPES(PES):
             # Construct R such that B[:, :nnred] ≈ Q @ R
             R = np.diag(Si[:nnred]) @ VTi[:nnred]
 
-        self._qr_cache.update(state_hash=state_hash, Q=Q, R=R)
+        idx = self._qr_cache_next
+        self._qr_cache[idx] = dict(state_hash=state_hash, Q=Q, R=R)
+        self._qr_cache_next = 1 - idx
         return Q, R
 
     def _get_Binv(self):
@@ -552,15 +586,16 @@ class InternalPES(PES):
         using a triangular solve instead of a full SVD.
         """
         state_hash = self._state_hash()
-        if (self._pinv_cache['state_hash'] == state_hash and
-                self._pinv_cache['pinv'] is not None):
-            return self._pinv_cache['pinv']
+        for entry in self._pinv_cache:
+            if entry['state_hash'] == state_hash and entry['pinv'] is not None:
+                return entry['pinv']
 
         Q, R = self._get_jacobian_qr()
         Binv = solve_triangular(R, Q.T)
 
-        self._pinv_cache['state_hash'] = state_hash
-        self._pinv_cache['pinv'] = Binv
+        idx = self._pinv_cache_next
+        self._pinv_cache[idx] = dict(state_hash=state_hash, pinv=Binv)
+        self._pinv_cache_next = 1 - idx
         return Binv
 
     # =========================================================================
@@ -776,8 +811,9 @@ class InternalPES(PES):
 
         # Check if cached result is valid
         state_hash = self._state_hash()
-        if self._basis_cache['state_hash'] == state_hash:
-            return self._basis_cache['result']
+        cached = self._basis_cache_get(state_hash)
+        if cached is not None:
+            return cached
 
         cons = self.cons
         B = self.int.jacobian()
@@ -786,6 +822,17 @@ class InternalPES(PES):
         Unred = Ui[:, :nnred]
         Vnred = VTi[:nnred].T
         Siinv = np.diag(1 / Si[:nnred])
+
+        # Cross-populate Binv cache from SVD factors
+        Binv = Vnred @ Siinv @ Unred.T
+        # Check if already present before evicting an entry
+        already_cached = any(
+            e['state_hash'] == state_hash for e in self._pinv_cache
+        )
+        if not already_cached:
+            idx = self._pinv_cache_next
+            self._pinv_cache[idx] = dict(state_hash=state_hash, pinv=Binv)
+            self._pinv_cache_next = 1 - idx
 
         n_int = Ui.shape[0]  # number of internal coordinates
         cons_jac = cons.jacobian()
@@ -804,8 +851,7 @@ class InternalPES(PES):
         result = (drdx, Ucons, Unred, Ufree)
 
         # Cache the result
-        self._basis_cache['state_hash'] = state_hash
-        self._basis_cache['result'] = result
+        self._basis_cache_put(state_hash, result)
         return result
 
     def eval(self):
@@ -2541,8 +2587,9 @@ class CellCartesianPES(PES):
         # Compute Cartesian basis directly (not via parent, since parent uses self.dim)
         # This mirrors PES._calc_basis but uses n_cart instead of self.dim
         state_hash = self._state_hash()
-        if self._basis_cache['state_hash'] == state_hash:
-            return self._basis_cache['result']
+        cached = self._basis_cache_get(state_hash)
+        if cached is not None:
+            return cached
 
         drdx_cart = self.cons.jacobian()  # Constraint Jacobian for Cartesian coords
         U, S, VT = np.linalg.svd(drdx_cart)
@@ -2575,8 +2622,7 @@ class CellCartesianPES(PES):
         result = drdx, Ucons, Unred, Ufree
 
         # Cache the result
-        self._basis_cache['state_hash'] = state_hash
-        self._basis_cache['result'] = result
+        self._basis_cache_put(state_hash, result)
         return result
 
     def converged(self, fmax: float, smax: float = None, cmax: float = 1e-5):
