@@ -586,11 +586,7 @@ class InternalPES(PES):
         dx_initial = target - x0
 
         # Get initial gradient in Cartesian space
-        g0 = np.linalg.lstsq(
-            self.int.jacobian(),
-            self.curr.get('g', np.zeros_like(dx_initial)),
-            rcond=None,
-        )[0]
+        g0 = self._get_Binv() @ self.curr.get('g', np.zeros_like(dx_initial))
 
         rms_prev = np.inf
         initial_rms = None
@@ -1678,11 +1674,11 @@ class CellInternalPES(InternalPES):
             return dx_initial, dx_final, g_final
 
         # Get initial gradient in Cartesian for internal coord update
-        g0 = np.linalg.lstsq(
-            self.int.jacobian(),
-            self.curr.get('g', np.zeros(self.n_internal))[:self.n_internal],
-            rcond=None,
-        )[0] if 'g' in self.curr and self.curr['g'] is not None else np.zeros(3 * len(self.atoms))
+        g = self.curr.get('g')
+        if g is not None:
+            g0 = self._get_Binv() @ g[:self.n_internal]
+        else:
+            g0 = np.zeros(3 * len(self.atoms))
 
         # Now update atomic positions to match internal coordinate target
         # This is tricky: the internal coord values changed when cell changed
@@ -1721,13 +1717,10 @@ class CellInternalPES(InternalPES):
         x0 = self.int.calc()
         dx_initial = q_target - x0
 
-        g0 = np.linalg.lstsq(
-            self.int.jacobian(),
-            self.curr.get('g', np.zeros_like(dx_initial))[:self.n_internal]
-            if 'g' in self.curr and self.curr['g'] is not None
-            else np.zeros_like(dx_initial),
-            rcond=None,
-        )[0]
+        if 'g' in self.curr and self.curr['g'] is not None:
+            g0 = self._get_Binv() @ self.curr['g'][:self.n_internal]
+        else:
+            g0 = np.zeros(3 * (len(self.atoms) + len(self.dummies)))
 
         rms_prev = np.inf
         initial_rms = None
