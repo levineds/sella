@@ -1310,6 +1310,191 @@ class TestRigidFragments:
         for _ in range(3):
             opt.step()
 
+    def test_rotation_applied_on_shear(self):
+        """Test that fragment atoms rotate under shear, not just translate."""
+        atoms = self._make_two_water_crystal()
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals)
+
+        x0 = pes.get_x()
+        pos0 = atoms.get_positions().copy()
+
+        # Apply a pure shear cell displacement (off-diagonal log-deformation)
+        x_shear = x0.copy()
+        # Find an off-diagonal cell DOF (shear)
+        cell_mask = pes.cell_mask
+        offdiag_indices = []
+        for idx, (i, j) in enumerate(zip(*np.where(cell_mask))):
+            if i != j:
+                offdiag_indices.append(idx)
+        if not offdiag_indices:
+            pytest.skip("No off-diagonal cell DOF available")
+
+        shear_idx = offdiag_indices[0]
+        x_shear[pes.n_internal + shear_idx] += 0.05
+
+        pes.set_x(x_shear)
+        pos_after = atoms.get_positions().copy()
+
+        # For each fragment, check that the relative geometry changed orientation
+        # (rotation applied) but bond lengths are preserved
+        for group in pes.fragment_groups:
+            dr_before = pos0[group] - pos0[group].mean(axis=0)
+            dr_after = pos_after[group] - pos_after[group].mean(axis=0)
+
+            # Bond lengths should be nearly preserved
+            dists_before = np.linalg.norm(dr_before, axis=1)
+            dists_after = np.linalg.norm(dr_after, axis=1)
+            assert_allclose(dists_before, dists_after, atol=1e-3)
+
+            # But the orientation should have changed (dr_after != dr_before)
+            # The rotation under shear should produce a nonzero angular change
+            if len(group) > 1:
+                diff = dr_after - dr_before
+                assert np.max(np.abs(diff)) > 1e-6, (
+                    "Fragment atoms should rotate under shear deformation"
+                )
+
+    def test_gradient_numerical_large_shear(self):
+        """Test gradient correctness with a heavily sheared cell.
+
+        This stress-tests the rotation correction at large deformation
+        where the rotation component R deviates significantly from identity.
+        """
+        water1 = molecule('H2O')
+        water2 = molecule('H2O')
+        water1.positions += [1.0, 1.0, 1.0]
+        water2.positions += [4.0, 4.0, 4.0]
+        atoms = water1 + water2
+
+        # Heavily sheared triclinic cell
+        cell = np.array([
+            [7.0, 1.5, 0.8],
+            [0.0, 6.5, 1.2],
+            [0.0, 0.0, 7.5],
+        ])
+        atoms.set_cell(cell)
+        atoms.pbc = True
+        atoms.calc = LennardJones()
+
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals)
+        assert pes.rigid_fragments is True
+
+        # Get analytical gradient
+        _, g = pes.eval()
+        g_cell = g[pes.n_internal:]
+
+        # Numerical gradient via finite difference
+        delta = 1e-6
+        x0 = pes.get_x()
+        g_cell_numeric = np.zeros(pes.n_cell_dof)
+
+        for i in range(pes.n_cell_dof):
+            pes.set_x(x0)
+            x_plus = x0.copy()
+            x_plus[pes.n_internal + i] += delta
+            pes.set_x(x_plus)
+            e_plus, _ = pes.eval()
+
+            pes.set_x(x0)
+            x_minus = x0.copy()
+            x_minus[pes.n_internal + i] -= delta
+            pes.set_x(x_minus)
+            e_minus, _ = pes.eval()
+
+            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
+
+        pes.set_x(x0)
+
+        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
+
+    def test_gradient_after_cell_step(self):
+        """Test gradient correctness after the cell has already been deformed.
+
+        After a cell step, F != I and the rotation correction is nonzero.
+        Verify gradient still matches numerical FD at the deformed geometry.
+        """
+        atoms = self._make_two_water_crystal()
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals)
+
+        # First, apply a cell deformation to move away from F = I
+        x0 = pes.get_x()
+        x_deformed = x0.copy()
+        # Apply a mix of diagonal and off-diagonal strains
+        n_cell = pes.n_cell_dof
+        for i in range(n_cell):
+            x_deformed[pes.n_internal + i] += 0.02 * ((-1)**i)
+        pes.set_x(x_deformed)
+
+        # Now verify gradient at this deformed state
+        _, g = pes.eval()
+        g_cell = g[pes.n_internal:]
+
+        delta = 1e-6
+        x1 = pes.get_x()
+        g_cell_numeric = np.zeros(n_cell)
+
+        for i in range(n_cell):
+            pes.set_x(x1)
+            x_plus = x1.copy()
+            x_plus[pes.n_internal + i] += delta
+            pes.set_x(x_plus)
+            e_plus, _ = pes.eval()
+
+            pes.set_x(x1)
+            x_minus = x1.copy()
+            x_minus[pes.n_internal + i] -= delta
+            pes.set_x(x_minus)
+            e_minus, _ = pes.eval()
+
+            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
+
+        pes.set_x(x1)
+
+        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
+
+    def test_rotation_correction_nonzero_under_shear(self):
+        """Verify that the rotation correction to the gradient is nonzero
+        when the cell is sheared (so R != I in polar decomposition)."""
+        from scipy.linalg import polar
+
+        water1 = molecule('H2O')
+        water2 = molecule('H2O')
+        water1.positions += [1.0, 1.0, 1.0]
+        water2.positions += [4.0, 4.0, 4.0]
+        atoms = water1 + water2
+
+        # Start with orthogonal cell, then deform with shear
+        atoms.set_cell([7.0, 7.0, 7.0])
+        atoms.pbc = True
+        atoms.calc = LennardJones()
+
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals)
+
+        # Apply shear to move away from R = I
+        x0 = pes.get_x()
+        x_sheared = x0.copy()
+        cell_mask = pes.cell_mask
+        offdiag_indices = []
+        for idx, (i, j) in enumerate(zip(*np.where(cell_mask))):
+            if i != j:
+                offdiag_indices.append(idx)
+        if not offdiag_indices:
+            pytest.skip("No off-diagonal cell DOF")
+
+        x_sheared[pes.n_internal + offdiag_indices[0]] += 0.05
+        pes.set_x(x_sheared)
+
+        # At this point F should have a nontrivial rotation component
+        F = pes._get_deformation_gradient()
+        R, U = polar(F)
+        assert not np.allclose(R, np.eye(3), atol=1e-6), (
+            "R should differ from identity after shear"
+        )
+
 
 class TestNiggliReduction:
     """Tests for periodic Niggli reduction during cell optimization."""
