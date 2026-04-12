@@ -1252,7 +1252,14 @@ class CellInternalPES(InternalPES):
             np.save(save_hessian, H0_full)
             print(f"Initial Hessian saved to {save_hessian}")
 
-        self.set_H(H0_full, initialized=False)
+        # With FD-refined Hessian (refine_level >= 1), use initialized=False
+        # to preserve the refined cell block on the first BFGS update — the
+        # uninitialized path only updates B[:ncart, :ncart] (internal block),
+        # which is appropriate since the FD-refined cell block is better than
+        # what one BFGS update would produce.
+        # Without refinement, use initialized=True so the first BFGS update
+        # covers all DOF including cell.
+        self.set_H(H0_full, initialized=(refine_level == 0))
 
     def maybe_niggli_reduce(self, angle_threshold=30.0):
         """Apply Niggli reduction if cell angles deviate too far from 90 deg.
@@ -2263,7 +2270,7 @@ class CellCartesianPES(PES):
             np.save(save_hessian, H0_full)
             print(f"Initial Hessian saved to {save_hessian}")
 
-        self.set_H(H0_full, initialized=False)
+        self.set_H(H0_full, initialized=(refine_level == 0))
 
     def maybe_niggli_reduce(self, angle_threshold=30.0):
         """Apply Niggli reduction if cell angles deviate too far from 90 deg.
