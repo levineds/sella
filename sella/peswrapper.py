@@ -531,8 +531,12 @@ class InternalPES(PES):
         ]
         self._qr_cache_next = 0
 
-        # Cache for constraint Hessian
-        self._Hc_cache = dict(state_hash=None, result=None)
+        # 2-entry LRU cache for constraint Hessian
+        self._Hc_cache = [
+            dict(state_hash=None, result=None),
+            dict(state_hash=None, result=None),
+        ]
+        self._Hc_cache_next = 0
 
     dpos = property(lambda self: self.dummies.positions.copy())
 
@@ -762,8 +766,9 @@ class InternalPES(PES):
     # Hessian of the constraints
     def get_Hc(self):
         state_hash = self._state_hash()
-        if self._Hc_cache['state_hash'] == state_hash:
-            return self._Hc_cache['result']
+        for entry in self._Hc_cache:
+            if entry['state_hash'] == state_hash:
+                return entry['result']
 
         D_cons = self.cons.hessian().ldot(self.curr['L'])
         Binv_int = self._get_Binv()
@@ -772,8 +777,9 @@ class InternalPES(PES):
         D_int = self.int.hessian().ldot(L_int)
         Hc = Binv_int.T @ (D_cons - D_int) @ Binv_int
 
-        self._Hc_cache['state_hash'] = state_hash
-        self._Hc_cache['result'] = Hc
+        idx = self._Hc_cache_next
+        self._Hc_cache[idx] = dict(state_hash=state_hash, result=Hc)
+        self._Hc_cache_next = 1 - idx
         return Hc
 
     def get_drdx(self):
