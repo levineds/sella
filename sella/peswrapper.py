@@ -17,6 +17,33 @@ from sella.eigensolvers import rayleigh_ritz
 from sella.internal import Internals, Constraints, DuplicateInternalError
 
 
+class _LRU2:
+    """2-entry LRU cache keyed by state hash (bytes).
+
+    Two entries match the optimization step cycle, which alternates between
+    pre-ODE (post-cell-change) and post-ODE positions.
+    """
+
+    __slots__ = ('_entries', '_next')
+
+    def __init__(self):
+        self._entries = [None, None]
+        self._next = 0
+
+    def get(self, key):
+        for entry in self._entries:
+            if entry is not None and entry[0] == key:
+                return entry[1]
+        return None
+
+    def put(self, key, value):
+        for entry in self._entries:
+            if entry is not None and entry[0] == key:
+                return
+        self._entries[self._next] = (key, value)
+        self._next = 1 - self._next
+
+
 def _niggli_hessian_transform(atoms, orig_cell, exp_cell_factor, cell_mask):
     """Compute the Hessian transformation matrix for Niggli reduction.
 
@@ -156,14 +183,7 @@ class PES:
 
         self.hessian_function = hessian_function
 
-        # 2-entry LRU cache for _calc_basis to avoid redundant SVD computations.
-        # Two entries because the step cycle alternates between two geometries:
-        # the pre-ODE (post-cell-change) and post-ODE positions.
-        self._basis_cache = [
-            dict(state_hash=None, result=None),
-            dict(state_hash=None, result=None),
-        ]
-        self._basis_cache_next = 0  # index of next entry to evict
+        self._basis_cache = _LRU2()
 
     apos = property(lambda self: self.atoms.positions.copy())
     dpos = property(lambda self: None)
@@ -235,27 +255,9 @@ class PES:
     def get_drdx(self):
         return self.cons.jacobian()
 
-    def _basis_cache_get(self, state_hash):
-        """Look up state_hash in 2-entry LRU basis cache. Returns result or None."""
-        for entry in self._basis_cache:
-            if entry['state_hash'] == state_hash:
-                return entry['result']
-        return None
-
-    def _basis_cache_put(self, state_hash, result):
-        """Store result in 2-entry LRU basis cache, evicting oldest."""
-        # Don't store if already present
-        for entry in self._basis_cache:
-            if entry['state_hash'] == state_hash:
-                return
-        idx = self._basis_cache_next
-        self._basis_cache[idx] = dict(state_hash=state_hash, result=result)
-        self._basis_cache_next = 1 - idx  # alternate 0, 1
-
     def _calc_basis(self):
-        # Check if cached result is valid
         state_hash = self._state_hash()
-        cached = self._basis_cache_get(state_hash)
+        cached = self._basis_cache.get(state_hash)
         if cached is not None:
             return cached
 
@@ -267,8 +269,7 @@ class PES:
         Unred = np.eye(self.dim)
         result = (drdx, Ucons, Unred, Ufree)
 
-        # Cache the result
-        self._basis_cache_put(state_hash, result)
+        self._basis_cache.put(state_hash, result)
         return result
 
     def write_traj(self):
@@ -517,26 +518,9 @@ class InternalPES(PES):
         self.bad_int = None
         self.iterative_stepper = iterative_stepper
 
-        # 2-entry LRU caches for Jacobian pseudo-inverse and QR factors,
-        # matching the 2-entry basis cache (same two geometries per step).
-        self._pinv_cache = [
-            dict(state_hash=None, pinv=None),
-            dict(state_hash=None, pinv=None),
-        ]
-        self._pinv_cache_next = 0
-
-        self._qr_cache = [
-            dict(state_hash=None, Q=None, R=None),
-            dict(state_hash=None, Q=None, R=None),
-        ]
-        self._qr_cache_next = 0
-
-        # 2-entry LRU cache for constraint Hessian
-        self._Hc_cache = [
-            dict(state_hash=None, result=None),
-            dict(state_hash=None, result=None),
-        ]
-        self._Hc_cache_next = 0
+        self._pinv_cache = _LRU2()
+        self._qr_cache = _LRU2()
+        self._Hc_cache = _LRU2()
 
     dpos = property(lambda self: self.dummies.positions.copy())
 
@@ -561,9 +545,9 @@ class InternalPES(PES):
         Falls back to SVD if the Jacobian is rank-deficient.
         """
         state_hash = self._state_hash()
-        for entry in self._qr_cache:
-            if entry['state_hash'] == state_hash:
-                return entry['Q'], entry['R']
+        cached = self._qr_cache.get(state_hash)
+        if cached is not None:
+            return cached
 
         B = self.int.jacobian()
         Q, R = np.linalg.qr(B, mode='reduced')
@@ -575,12 +559,15 @@ class InternalPES(PES):
             Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
             nnred = np.sum(Si > 1e-6)
             Q = Ui[:, :nnred]
-            # Construct R such that B[:, :nnred] ≈ Q @ R
             R = np.diag(Si[:nnred]) @ VTi[:nnred]
 
-        idx = self._qr_cache_next
-        self._qr_cache[idx] = dict(state_hash=state_hash, Q=Q, R=R)
-        self._qr_cache_next = 1 - idx
+            # Pre-compute Binv from SVD factors and cache it, since the
+            # non-square R can't be used with solve_triangular in _get_Binv
+            Siinv = np.diag(1.0 / Si[:nnred])
+            Binv = VTi[:nnred].T @ Siinv @ Ui[:, :nnred].T
+            self._pinv_cache.put(state_hash, Binv)
+
+        self._qr_cache.put(state_hash, (Q, R))
         return Q, R
 
     def _get_Binv(self):
@@ -590,21 +577,24 @@ class InternalPES(PES):
         using a triangular solve instead of a full SVD.
         """
         state_hash = self._state_hash()
-        for entry in self._pinv_cache:
-            if entry['state_hash'] == state_hash and entry['pinv'] is not None:
-                return entry['pinv']
+        cached = self._pinv_cache.get(state_hash)
+        if cached is not None:
+            return cached
 
         Q, R = self._get_jacobian_qr()
         if R.size == 0:
-            # No internal coordinates — return empty pseudo-inverse
             ncart = 3 * len(self.atoms) + (3 * len(self.dummies) if self.dummies else 0)
             Binv = np.empty((ncart, 0))
-        else:
+        elif R.shape[0] == R.shape[1]:
             Binv = solve_triangular(R, Q.T)
+        else:
+            # Non-square R from rank-deficient SVD fallback — Binv should
+            # already have been cached by _get_jacobian_qr, but recompute
+            # as a safety net (e.g., if the 2-entry cache evicted it).
+            B = self.int.jacobian()
+            Binv = np.linalg.pinv(B)
 
-        idx = self._pinv_cache_next
-        self._pinv_cache[idx] = dict(state_hash=state_hash, pinv=Binv)
-        self._pinv_cache_next = 1 - idx
+        self._pinv_cache.put(state_hash, Binv)
         return Binv
 
     # =========================================================================
@@ -771,9 +761,9 @@ class InternalPES(PES):
     # Hessian of the constraints
     def get_Hc(self):
         state_hash = self._state_hash()
-        for entry in self._Hc_cache:
-            if entry['state_hash'] == state_hash:
-                return entry['result']
+        cached = self._Hc_cache.get(state_hash)
+        if cached is not None:
+            return cached
 
         D_cons = self.cons.hessian().ldot(self.curr['L'])
         Binv_int = self._get_Binv()
@@ -782,9 +772,7 @@ class InternalPES(PES):
         D_int = self.int.hessian().ldot(L_int)
         Hc = Binv_int.T @ (D_cons - D_int) @ Binv_int
 
-        idx = self._Hc_cache_next
-        self._Hc_cache[idx] = dict(state_hash=state_hash, result=Hc)
-        self._Hc_cache_next = 1 - idx
+        self._Hc_cache.put(state_hash, Hc)
         return Hc
 
     def get_drdx(self):
@@ -822,7 +810,7 @@ class InternalPES(PES):
 
         # Check if cached result is valid
         state_hash = self._state_hash()
-        cached = self._basis_cache_get(state_hash)
+        cached = self._basis_cache.get(state_hash)
         if cached is not None:
             return cached
 
@@ -836,14 +824,7 @@ class InternalPES(PES):
 
         # Cross-populate Binv cache from SVD factors
         Binv = Vnred @ Siinv @ Unred.T
-        # Check if already present before evicting an entry
-        already_cached = any(
-            e['state_hash'] == state_hash for e in self._pinv_cache
-        )
-        if not already_cached:
-            idx = self._pinv_cache_next
-            self._pinv_cache[idx] = dict(state_hash=state_hash, pinv=Binv)
-            self._pinv_cache_next = 1 - idx
+        self._pinv_cache.put(state_hash, Binv)
 
         n_int = Ui.shape[0]  # number of internal coordinates
         cons_jac = cons.jacobian()
@@ -862,7 +843,7 @@ class InternalPES(PES):
         result = (drdx, Ucons, Unred, Ufree)
 
         # Cache the result
-        self._basis_cache_put(state_hash, result)
+        self._basis_cache.put(state_hash, result)
         return result
 
     def eval(self):
@@ -2632,7 +2613,7 @@ class CellCartesianPES(PES):
         # Compute Cartesian basis directly (not via parent, since parent uses self.dim)
         # This mirrors PES._calc_basis but uses n_cart instead of self.dim
         state_hash = self._state_hash()
-        cached = self._basis_cache_get(state_hash)
+        cached = self._basis_cache.get(state_hash)
         if cached is not None:
             return cached
 
@@ -2667,7 +2648,7 @@ class CellCartesianPES(PES):
         result = drdx, Ucons, Unred, Ufree
 
         # Cache the result
-        self._basis_cache_put(state_hash, result)
+        self._basis_cache.put(state_hash, result)
         return result
 
     def converged(self, fmax: float, smax: float = None, cmax: float = 1e-5):

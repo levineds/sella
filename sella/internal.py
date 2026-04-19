@@ -2934,14 +2934,24 @@ class Internals(BaseInternals):
         U, S, VT = np.linalg.svd(jac)
         ndeloc = np.sum(S > 1e-8)
 
-        # If TRICs (translations/rotations) are present, they span the full
-        # 3N DOF. Otherwise, 6 DOF are removed for global translation/rotation.
         has_trics = (len(self.internals['translations']) > 0 or
                      len(self.internals['rotations']) > 0)
         if has_trics:
             ndof = 3 * (self.natoms + self.ndummies)
         else:
-            ndof = 3 * (self.natoms + self.ndummies) - 6
+            ntot = self.natoms + self.ndummies
+            has_periodic_bonds = any(
+                np.any(bond.kwargs['ncvecs'] != 0)
+                for bond in self.internals['bonds']
+            )
+            if has_periodic_bonds:
+                ndof = 3 * ntot
+            elif ntot <= 1:
+                ndof = 0
+            elif ntot == 2:
+                ndof = 1
+            else:
+                ndof = 3 * ntot - 6
 
         if ndeloc != ndof:
             warnings.warn(
