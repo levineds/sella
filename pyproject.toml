@@ -9,6 +9,20 @@ requires = [
 
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "Sella"
+version = "2.3.5"
+requires-python = ">=3.8"
+readme = "README.md"
+dependencies = [
+    "numpy>=1.14.0",
+    "scipy>=1.1.0",
+    "ase>=3.18.0",
+    "jax>=0.4.20",
+    "jaxlib>=0.4.20",
+    "numba>=0.57.0",
+]
+
 [project.optional-dependencies]
 test = [
     "pytest",
