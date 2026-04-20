@@ -4,7 +4,8 @@ from typing import List
 from itertools import product
 import numpy as np
 
-from sella.hessian_update import update_H
+from sella.hessian_update import update_H, _MS_TS_BFGS_rank2_factors
+from sella.secular import rank2_secular_update
 
 from scipy.sparse.linalg import LinearOperator
 from scipy.linalg import eigh
@@ -229,6 +230,27 @@ class ApproximateHessian(LinearOperator):
             return
 
         lams, vecs = self.evals, self.evecs
+
+        dx_arr = np.asarray(dx)
+        if (self._eigen_computed
+                and self.update_method == 'TS-BFGS'
+                and dx_arr.ndim == 1
+                and np.linalg.norm(dx_arr) >= 1e-8):
+            try:
+                W, M = _MS_TS_BFGS_rank2_factors(B, dx, dg, lams, vecs)
+                evals_new, evecs_new = rank2_secular_update(
+                    lams, vecs, W, M
+                )
+                if (np.all(np.isfinite(evals_new))
+                        and np.all(np.isfinite(evecs_new))):
+                    B_new = (evecs_new * evals_new[np.newaxis, :]) @ evecs_new.T
+                    self.B = B_new
+                    self._evals = evals_new
+                    self._evecs = evecs_new
+                    self._eigen_computed = True
+                    return
+            except Exception:
+                pass
 
         self.set_B(update_H(B, dx, dg, method=self.update_method,
                             symm=self.symm, lams=lams, vecs=vecs))

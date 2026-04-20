@@ -108,6 +108,34 @@ def _MS_TS_BFGS(B, S, Y, lams, vecs, is_pd=False):
     return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
 
 
+def _MS_TS_BFGS_rank2_factors(B, s, y, lams, vecs):
+    """Extract rank-2 factors from TS-BFGS update for a single step.
+
+    Returns (W, M) such that delta_B = W @ M @ W.T.
+    W is (n, 2), M is (2, 2) symmetric.
+    """
+    s = np.asarray(s).ravel()
+    y = np.asarray(y).ravel()
+
+    j = y - B @ s
+    absBS = vecs @ (np.abs(lams[:, np.newaxis]) * (vecs.T @ s[:, np.newaxis]))
+    absBS = absBS.ravel()
+
+    sTy = s @ y
+    sTabs = s @ absBS
+    denom_vec = sTy * y + sTabs * absBS
+    scale = denom_vec @ s
+    if abs(scale) < 1e-300:
+        raise ValueError("Degenerate TS-BFGS update: scale factor is zero")
+    u = denom_vec / scale
+
+    alpha = j @ s
+
+    W = np.column_stack([u, j])
+    M = np.array([[-alpha, 1.0], [1.0, 0.0]])
+    return W, M
+
+
 def _MS_PSB(B, S, Y):
     J = Y - B @ S
     U = solve(S.T @ S, S.T).T
