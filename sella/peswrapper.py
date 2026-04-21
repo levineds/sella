@@ -120,10 +120,8 @@ class PES:
         proj_trans: bool = None,
         proj_rot: bool = None,
         hessian_function: Callable[[Atoms], np.ndarray] = None,
-        secular: bool = False,
     ) -> None:
         self.atoms = atoms
-        self.secular = secular
         if constraints is None:
             constraints = Constraints(self.atoms)
         if proj_trans is None:
@@ -238,7 +236,6 @@ class PES:
         return self.H
 
     def set_H(self, target, *args, **kwargs):
-        kwargs.setdefault('secular', getattr(self, 'secular', False))
         self.H = ApproximateHessian(
             self.dim, self.ncart, target, *args, **kwargs
         )

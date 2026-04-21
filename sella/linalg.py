@@ -4,8 +4,7 @@ from typing import List
 from itertools import product
 import numpy as np
 
-from sella.hessian_update import update_H, _MS_TS_BFGS_rank2_factors
-from sella.secular import rank2_secular_update
+from sella.hessian_update import update_H
 
 from scipy.sparse.linalg import LinearOperator
 from scipy.linalg import eigh
@@ -149,16 +148,8 @@ class ApproximateHessian(LinearOperator):
         update_method: str = 'TS-BFGS',
         symm: int = 2,
         initialized: bool = False,
-        secular: bool = False,
     ) -> None:
-        """A wrapper object for the approximate Hessian matrix.
-
-        Parameters
-        ----------
-        secular : bool
-            Use rank-2 secular equation for eigendecomposition update
-            instead of full eigh. Default True.
-        """
+        """A wrapper object for the approximate Hessian matrix."""
         self.dim = dim
         self.ncart = ncart
         self.shape = (self.dim, self.dim)
@@ -166,7 +157,6 @@ class ApproximateHessian(LinearOperator):
         self.update_method = update_method
         self.symm = symm
         self.initialized = initialized
-        self.secular = secular
         # Lazy eigendecomposition: only compute when needed
         self._evals = None
         self._evecs = None
@@ -240,27 +230,6 @@ class ApproximateHessian(LinearOperator):
 
         lams, vecs = self.evals, self.evecs
 
-        dx_arr = np.asarray(dx)
-        if (self.secular
-                and self._eigen_computed
-                and self.update_method == 'TS-BFGS'
-                and dx_arr.ndim == 1
-                and np.linalg.norm(dx_arr) >= 1e-8):
-            try:
-                W, M = _MS_TS_BFGS_rank2_factors(B, dx, dg, lams, vecs)
-                evals_new, evecs_new = rank2_secular_update(
-                    lams, vecs, W, M
-                )
-                if (np.all(np.isfinite(evals_new))
-                        and np.all(np.isfinite(evecs_new))):
-                    self.B = B + W @ M @ W.T
-                    self._evals = evals_new
-                    self._evecs = evecs_new
-                    self._eigen_computed = True
-                    return
-            except Exception:
-                pass
-
         self.set_B(update_H(B, dx, dg, method=self.update_method,
                             symm=self.symm, lams=lams, vecs=vecs))
 
@@ -275,8 +244,7 @@ class ApproximateHessian(LinearOperator):
             Bproj = U.T @ self.B @ U
 
         return ApproximateHessian(n, 0, Bproj, self.update_method,
-                                  self.symm,
-                                  secular=self.secular)
+                                  self.symm)
 
     def asarray(self):
         if self.B is not None:
@@ -312,7 +280,6 @@ class ApproximateHessian(LinearOperator):
         return ApproximateHessian(
             self.dim, self.ncart, tot, self.update_method, self.symm,
             initialized=initialized,
-            secular=self.secular,
         )
 
 
