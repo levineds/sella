@@ -1193,7 +1193,8 @@ class CellInternalPES(InternalPES):
 
         if self.rigid_fragments:
             # Extract fragment atom groups from Translation coordinates
-            self.fragment_groups = self._extract_fragment_groups(self.int)
+            self.fragment_groups, self.fragment_dummy_groups = \
+                self._extract_fragment_groups(self.int)
 
         # Update dimension to include cell DOF
         self.dim = self.n_internal + self.n_cell_dof
@@ -1632,21 +1633,24 @@ class CellInternalPES(InternalPES):
 
         Each fragment has 3 Translation coordinates (dim=0,1,2).
         We use dim=0 to identify one Translation per fragment and
-        extract the atom indices. Dummy atoms are excluded since
-        rigid-body motion only applies to real atoms.
+        extract the atom indices.
 
         Returns
         -------
         list of ndarray
-            Each element is an array of atom indices for one fragment.
+            Each element is an array of real atom indices for one fragment.
+        list of ndarray
+            Each element is an array of dummy atom indices for the same fragment.
         """
         natoms = internals.natoms
         groups = []
+        dummy_groups = []
         for trans in internals.internals.get('translations', []):
             if trans.kwargs['dim'] == 0:  # One per fragment (x-dim)
                 indices = np.array(trans.indices)
                 groups.append(indices[indices < natoms])
-        return groups
+                dummy_groups.append(indices[indices >= natoms])
+        return groups, dummy_groups
 
     def _compute_delta_r(self):
         """Compute positions relative to fragment center of mass.
@@ -1662,8 +1666,9 @@ class CellInternalPES(InternalPES):
         positions = self.atoms.get_positions()
         delta_r = positions.copy()
         for group in self.fragment_groups:
-            com = positions[group].mean(axis=0)
-            delta_r[group] -= com
+            if len(group) > 0:
+                com = positions[group].mean(axis=0)
+                delta_r[group] -= com
         return delta_r
 
     def set_x(self, target: np.ndarray):
@@ -1716,7 +1721,8 @@ class CellInternalPES(InternalPES):
             cell_before_inv = np.linalg.inv(cell_before)
             F_inc = cell_after @ cell_before_inv
             R_inc, _ = polar(F_inc)
-            for group in self.fragment_groups:
+            for group, dgroup in zip(self.fragment_groups,
+                                     self.fragment_dummy_groups):
                 com_old = pos_before[group].mean(axis=0)
                 # Convert old CoM to fractional, then to new Cartesian
                 com_frac = com_old @ cell_before_inv
@@ -1724,6 +1730,11 @@ class CellInternalPES(InternalPES):
                 # Rotate relative positions by R (row-vector: r_new = r @ R^T)
                 delta_r = pos_before[group] - com_old
                 self.atoms.positions[group] = com_new + delta_r @ R_inc.T
+                # Move dummy atoms with the same transformation
+                if len(dgroup) > 0:
+                    didx = dgroup - self.int.natoms  # Convert to dummies index
+                    delta_d = self.dummies.positions[didx] - com_old
+                    self.dummies.positions[didx] = com_new + delta_d @ R_inc.T
 
         # Read back internal coords AFTER the cell change moved atoms.
         # The solver targets q_after_cell + dq, not the raw q_target.
