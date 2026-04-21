@@ -6,6 +6,7 @@ from scipy.integrate import LSODA
 from ase import Atoms
 from ase.build import niggli_reduce
 from ase.utils import basestring
+from ase.visualize import view
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io.trajectory import Trajectory
 
@@ -709,20 +710,6 @@ class InternalPES(PES):
         g_final = self.int.jacobian() @ g0
         return dx_initial, dx_final, g_final
 
-    def _get_regularized_Binv(self):
-        """Pseudo-inverse with capped amplification for ODE stability.
-
-        Fragment translations/rotations can have near-zero singular values in
-        the Jacobian, causing Binv to amplify those directions by thousands.
-        Floor singular values at 1% of the largest to cap amplification at ~100x.
-        """
-        B = self.int.jacobian()
-        U, S, Vt = np.linalg.svd(B, full_matrices=False)
-        nnred = np.sum(S > 1e-6)
-        S_floor = 0.01 * S[0]
-        S_reg = np.maximum(S[:nnred], S_floor)
-        return Vt[:nnred].T @ np.diag(1.0 / S_reg) @ U[:, :nnred].T
-
     def _set_x_ode(self, target):
         """ODE-based stepper for internal coordinate updates.
 
@@ -731,7 +718,7 @@ class InternalPES(PES):
         """
         dx = target - self.get_x()
         t0 = 0.
-        Binv = self._get_regularized_Binv()
+        Binv = self._get_Binv()
         self._ode_Binv = Binv
         y0 = np.hstack((self.apos.ravel(), self.dpos.ravel(),
                         Binv @ dx,
@@ -746,7 +733,9 @@ class InternalPES(PES):
             if self.bad_int is not None:
                 break
             if ode.nfev > 1000:
-                break
+                view(self.atoms + self.dummies)
+                raise RuntimeError("Geometry update ODE is taking too long "
+                                   "to converge!")
 
         if ode.status == 'failed':
             raise RuntimeError("Geometry update ODE failed to converge!")
@@ -1781,7 +1770,7 @@ class CellInternalPES(InternalPES):
         x0 = self.int.calc()
         dx = q_target - x0
         t0 = 0.
-        Binv = self._get_regularized_Binv()
+        Binv = self._get_Binv()
         self._ode_Binv = Binv
 
         y0 = np.hstack((
@@ -1802,7 +1791,7 @@ class CellInternalPES(InternalPES):
             if self.bad_int is not None:
                 break
             if ode.nfev > 1000:
-                break
+                raise RuntimeError("Geometry update ODE is taking too long!")
 
         if ode.status == 'failed':
             raise RuntimeError("Geometry update ODE failed to converge!")

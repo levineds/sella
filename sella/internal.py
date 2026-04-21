@@ -57,35 +57,14 @@ def _bond_value(pos: jnp.ndarray, tvec: jnp.ndarray) -> float:
     return jnp.linalg.norm(pos[1] - pos[0] + tvec[0])
 
 
-@custom_jvp
-def _safe_arccos(x):
-    """arccos with regularized derivatives near x=±1.
-
-    The derivative of arccos, -1/sqrt(1-x²), diverges at x=±1 (angle = 0 or π).
-    This causes ODE singularities when angles pass through near-linearity during
-    geodesic integration. Adding ε to the denominator keeps derivatives finite
-    while leaving values unchanged.
-    """
-    return jnp.arccos(jnp.clip(x, -1.0, 1.0))
-
-
-@_safe_arccos.defjvp
-def _safe_arccos_jvp(primals, tangents):
-    x, = primals
-    dx, = tangents
-    val = jnp.arccos(jnp.clip(x, -1.0, 1.0))
-    sin_sq = jnp.maximum(1.0 - x**2, 1e-4)
-    grad = -1.0 / jnp.sqrt(sin_sq)
-    return val, grad * dx
-
-
 def _angle_value(pos: jnp.ndarray, tvec: jnp.ndarray) -> float:
     """Angle value: pos shape (3, 3), tvec shape (2, 3)"""
     dx1 = -(pos[1] - pos[0] + tvec[0])
     dx2 = pos[2] - pos[1] + tvec[1]
     cos_angle = dx1 @ dx2 / (jnp.linalg.norm(dx1) * jnp.linalg.norm(dx2))
+    # Clamp to avoid NaN from arccos
     cos_angle = jnp.clip(cos_angle, -1.0, 1.0)
-    return _safe_arccos(cos_angle)
+    return jnp.arccos(cos_angle)
 
 
 def _dihedral_value(pos: jnp.ndarray, tvec: jnp.ndarray) -> float:
