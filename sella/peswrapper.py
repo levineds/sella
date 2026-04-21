@@ -242,6 +242,15 @@ class PES:
 
     # Hessian of the constraints
     def get_Hc(self):
+        if self.curr['L'] is None:
+            import traceback
+            traceback.print_stack()
+            raise RuntimeError(
+                "PES.get_Hc() called with L=None. "
+                f"curr_g_is_none={self.curr.get('g') is None}, "
+                f"curr_f_is_none={self.curr.get('f') is None}. "
+                "See stack trace above."
+            )
         return self.cons.hessian().ldot(self.curr['L'])
 
     # Hessian of the Lagrangian
@@ -341,6 +350,7 @@ class PES:
             L = None
         else:
             L = np.linalg.lstsq(drdx.T, self.curr['g'], rcond=None)[0]
+
         self.curr['L'] = L
 
     def _update_H(self, dx, dg):
@@ -352,7 +362,7 @@ class PES:
         self._update()
         return self.curr['f']
 
-    def get_g(self):
+    def get_g(self) -> np.ndarray:
         self._update()
         return self.curr['g'].copy()
 
@@ -764,6 +774,16 @@ class InternalPES(PES):
         cached = self._Hc_cache.get(state_hash)
         if cached is not None:
             return cached
+
+        if self.curr['L'] is None:
+            import traceback
+            traceback.print_stack()
+            raise RuntimeError(
+                "InternalPES.get_Hc() called with L=None. "
+                f"curr_g_is_none={self.curr.get('g') is None}, "
+                f"curr_f_is_none={self.curr.get('f') is None}. "
+                "See stack trace above."
+            )
 
         D_cons = self.cons.hessian().ldot(self.curr['L'])
         Binv_int = self._get_Binv()
@@ -1891,39 +1911,6 @@ class CellInternalPES(InternalPES):
 
         return g_cell_3x3[self.cell_mask]
 
-    def get_g(self) -> np.ndarray:
-        """Get combined gradient (internal + cell)."""
-        self._update()
-        return self.curr['g'].copy()
-
-    def _update(self, feval: bool = True):
-        """Update current state including cell gradient."""
-        x = self.get_x()
-        new_point = True
-        if self.curr['x'] is not None and np.all(x == self.curr['x']):
-            if feval and self.curr['f'] is None:
-                new_point = False
-            else:
-                return False
-
-        if feval:
-            f, g = self.eval()
-        else:
-            f = None
-            g = None
-
-        if new_point:
-            self.last = self.curr.copy()
-
-        self.curr['x'] = x
-        self.curr['f'] = f
-        self.curr['g'] = g
-
-        # Update basis for internal coordinates
-        basis = self._calc_basis()
-        self._update_basis(basis)
-        return True
-
     def _calc_basis(self, internal=None, cons=None):
         """Calculate basis including cell DOF.
 
@@ -2501,36 +2488,6 @@ class CellCartesianPES(PES):
         g_cell_3x3 = g_cell_3x3 / self.exp_cell_factor
 
         return g_cell_3x3[self.cell_mask]
-
-    def get_g(self) -> np.ndarray:
-        """Get combined gradient (Cartesian + cell)."""
-        self._update()
-        return self.curr['g'].copy()
-
-    def _update(self, feval: bool = True):
-        """Update current state including cell gradient."""
-        x = self.get_x()
-        new_point = True
-        if self.curr['x'] is not None and np.all(x == self.curr['x']):
-            if feval and self.curr['f'] is None:
-                new_point = False
-            else:
-                return False
-
-        if feval:
-            f, g = self.eval()
-        else:
-            f = None
-            g = None
-
-        if new_point:
-            self.last = self.curr.copy()
-
-        self.curr['x'] = x
-        self.curr['f'] = f
-        self.curr['g'] = g
-        self._update_basis()
-        return True
 
     def _calc_basis(self):
         """Calculate basis including cell DOF.
