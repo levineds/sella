@@ -2025,6 +2025,7 @@ class BaseInternals:
     ) -> None:
         didx = self.dinds[idx]
         assert didx >= 0
+        npos = len(self.all_positions)
         for i, trans in enumerate(self.internals['translations']):
             if idx in trans.indices:
                 new_indices = (*trans.indices[:-1], didx)
@@ -2033,12 +2034,13 @@ class BaseInternals:
 
         for i, rot in enumerate(self.internals['rotations']):
             if idx in rot.indices[:-1]:
-                new_indices = (*rot.indices[:-1], didx)
-                new_rot = Rotation(
-                    new_indices, rot.axis,
-                    self.all_positions[new_indices]
-                )
-                self.internals['rotations'][i] = new_rot
+                new_indices = np.array((*rot.indices[:-1], didx), dtype=np.int32)
+                if np.all(new_indices < npos):
+                    new_rot = Rotation(
+                        new_indices, rot.kwargs['axis'],
+                        self.all_positions[new_indices]
+                    )
+                    self.internals['rotations'][i] = new_rot
 
     def check_all_gradients(
         self, delta: float = 1e-4, atol: float = 1e-6
