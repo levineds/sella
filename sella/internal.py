@@ -798,10 +798,8 @@ class BaseInternals:
         self.dummies = dummies
         self.dinds = dinds
 
-        # Cache atom counts since they don't change during optimization
+        # Cache atom count (doesn't change during optimization)
         self._natoms = len(atoms)
-        self._ndummies = len(dummies)
-        self._ndof = 3 * (self._natoms + self._ndummies)
 
         self.internals = {key: [] for key in self._names}
         self._internals_set = {key: set() for key in self._names}
@@ -820,7 +818,11 @@ class BaseInternals:
 
     @property
     def ndummies(self) -> int:
-        return self._ndummies
+        return len(self.dummies)
+
+    @property
+    def ndof(self) -> int:
+        return 3 * (self._natoms + len(self.dummies))
 
     @property
     def ntrans(self) -> int:
@@ -860,10 +862,6 @@ class BaseInternals:
     @property
     def nint(self) -> int:
         return len(self._active_indices)
-
-    @property
-    def ndof(self) -> int:
-        return self._ndof
 
     @property
     def all_positions(self) -> np.ndarray:
@@ -2823,6 +2821,7 @@ class Internals(BaseInternals):
                         # Add the dummy atom
                         dpos += self.atoms.positions[j]
                         self.dummies += Atom('X', dpos)
+                        self._batched_arrays_valid = False
                     # Create and fix dummy bond
                     dbond = Bond((j, self.dinds[j]))
                     self.cons.fix_bond(dbond, replace_ok=False)

@@ -1632,17 +1632,20 @@ class CellInternalPES(InternalPES):
 
         Each fragment has 3 Translation coordinates (dim=0,1,2).
         We use dim=0 to identify one Translation per fragment and
-        extract the atom indices.
+        extract the atom indices. Dummy atoms are excluded since
+        rigid-body motion only applies to real atoms.
 
         Returns
         -------
         list of ndarray
             Each element is an array of atom indices for one fragment.
         """
+        natoms = internals.natoms
         groups = []
         for trans in internals.internals.get('translations', []):
             if trans.kwargs['dim'] == 0:  # One per fragment (x-dim)
-                groups.append(np.array(trans.indices))
+                indices = np.array(trans.indices)
+                groups.append(indices[indices < natoms])
         return groups
 
     def _compute_delta_r(self):
