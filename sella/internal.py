@@ -57,14 +57,35 @@ def _bond_value(pos: jnp.ndarray, tvec: jnp.ndarray) -> float:
     return jnp.linalg.norm(pos[1] - pos[0] + tvec[0])
 
 
+@custom_jvp
+def _safe_arccos(x):
+    """arccos with regularized derivatives near x=±1.
+
+    The derivative of arccos, -1/sqrt(1-x²), diverges at x=±1 (angle = 0 or π).
+    This causes ODE singularities when angles pass through near-linearity during
+    geodesic integration. Adding ε to the denominator keeps derivatives finite
+    while leaving values unchanged.
+    """
+    return jnp.arccos(jnp.clip(x, -1.0, 1.0))
+
+
+@_safe_arccos.defjvp
+def _safe_arccos_jvp(primals, tangents):
+    x, = primals
+    dx, = tangents
+    val = jnp.arccos(jnp.clip(x, -1.0, 1.0))
+    sin_sq = jnp.maximum(1.0 - x**2, 1e-4)
+    grad = -1.0 / jnp.sqrt(sin_sq)
+    return val, grad * dx
+
+
 def _angle_value(pos: jnp.ndarray, tvec: jnp.ndarray) -> float:
     """Angle value: pos shape (3, 3), tvec shape (2, 3)"""
     dx1 = -(pos[1] - pos[0] + tvec[0])
     dx2 = pos[2] - pos[1] + tvec[1]
     cos_angle = dx1 @ dx2 / (jnp.linalg.norm(dx1) * jnp.linalg.norm(dx2))
-    # Clamp to avoid NaN from arccos
     cos_angle = jnp.clip(cos_angle, -1.0, 1.0)
-    return jnp.arccos(cos_angle)
+    return _safe_arccos(cos_angle)
 
 
 def _dihedral_value(pos: jnp.ndarray, tvec: jnp.ndarray) -> float:
@@ -2642,6 +2663,38 @@ class Internals(BaseInternals):
             results.append((int(ii[p]), int(jj[p]), ts))
         return results
 
+    def _wrap_fragment_positions(self, group, cumshifts):
+        """Shift atom positions so fragment atoms are contiguous across PBC.
+
+        BFS from first atom in group, using bond ncvecs to bring each
+        bonded neighbor into the same periodic image. Accumulates shifts
+        along bond chains so molecules spanning multiple cell boundaries
+        are fully contracted. Records cumulative shifts in cumshifts dict
+        for subsequent ncvec correction.
+        """
+        group_set = set(group)
+        cell = np.asarray(self.atoms.cell)
+
+        adj = {i: [] for i in group}
+        for bond in self.internals['bonds']:
+            i, j = bond.indices
+            if i in group_set and j in group_set:
+                ncvec = bond.kwargs['ncvecs'][0]
+                adj[i].append((j, ncvec))
+                adj[j].append((i, -ncvec))
+
+        anchor = group[0]
+        cumshifts[anchor] = np.zeros(3, dtype=int)
+        queue = [anchor]
+        while queue:
+            i = queue.pop(0)
+            for j, ncvec in adj[i]:
+                if j in cumshifts:
+                    continue
+                cumshifts[j] = ncvec + cumshifts[i]
+                self.atoms.positions[j] += cumshifts[j] @ cell
+                queue.append(j)
+
     def find_all_bonds(
         self,
         nbond_cart_thr: int = 6,
@@ -2710,11 +2763,25 @@ class Internals(BaseInternals):
                     self.add_translation(i)
                 else:
                     groups[label].append(i)
+            cumshifts = {}
             for group in groups:
                 if not group:
                     continue
+                self._wrap_fragment_positions(group, cumshifts)
                 self.add_translation(group)
                 self.add_rotation(group)
+
+            # Update bond ncvecs to match the new wrapped positions.
+            # ncvec_new = ncvec_old - cumshift[j] + cumshift[i]
+            zero = np.zeros(3, dtype=int)
+            for bond in self.internals['bonds']:
+                i, j = bond.indices
+                shift_i = cumshifts.get(i, zero)
+                shift_j = cumshifts.get(j, zero)
+                if np.any(shift_i != 0) or np.any(shift_j != 0):
+                    bond.kwargs['ncvecs'] = np.array(
+                        [bond.kwargs['ncvecs'][0] - shift_j + shift_i]
+                    )
 
     def find_all_angles(
         self,
