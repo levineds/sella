@@ -2028,7 +2028,7 @@ class BaseInternals:
         for i, trans in enumerate(self.internals['translations']):
             if idx in trans.indices:
                 new_indices = (*trans.indices[:-1], didx)
-                new_trans = Translation(new_indices, trans.dim)
+                new_trans = Translation(new_indices, trans.kwargs['dim'])
                 self.internals['translations'][i] = new_trans
 
         for i, rot in enumerate(self.internals['rotations']):
