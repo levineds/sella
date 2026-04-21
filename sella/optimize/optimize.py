@@ -73,6 +73,7 @@ class Sella(Optimizer):
         niggli: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
+        secular: bool = False,
         **kwargs
     ):
         """Initialize Sella optimizer.
@@ -120,6 +121,7 @@ class Sella(Optimizer):
 
         # Validate cell optimization parameters
         self.optimize_cell = optimize_cell
+        self.allow_fragments = allow_fragments
         self.niggli = niggli
         self.smax = smax
         if optimize_cell:
@@ -161,6 +163,7 @@ class Sella(Optimizer):
             allow_fragments=allow_fragments,
             refine_initial_hessian=refine_initial_hessian,
             save_hessian=save_hessian,
+            secular=secular,
             **kwargs
         )
 
@@ -220,8 +223,11 @@ class Sella(Optimizer):
         allow_fragments: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
+        secular: bool = False,
         **kwargs
     ):
+        kwargs['secular'] = secular
+
         if internal:
             if isinstance(internal, Internals):
                 auto_find_internals = False
@@ -374,6 +380,8 @@ class Sella(Optimizer):
                 cell_mask=getattr(self.pes, 'cell_mask', None),
                 exp_cell_factor=getattr(self.pes, 'exp_cell_factor', None),
                 scalar_pressure=getattr(self.pes, 'scalar_pressure', 0.0),
+                allow_fragments=self.allow_fragments,
+                secular=getattr(self.pes, 'secular', False),
             )
             self.initialized = False
             self.rho = 1

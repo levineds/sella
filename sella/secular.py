@@ -5,24 +5,52 @@ import numba
 
 @numba.jit(nopython=True, cache=True)
 def _solve_secular_roots(d, z_sq, sigma, lo, hi, max_iter):
-    """Pure bisection for all secular equation roots."""
+    """Newton-safeguarded bisection for all secular equation roots.
+
+    Uses the "middle way" formulation near poles: when mu is within
+    half the bracket of a pole d_i, we solve for the displacement
+    tau = mu - d_i to avoid catastrophic cancellation.
+    """
     n = len(d)
-    for _ in range(max_iter):
-        for k in range(n):
-            mu = 0.5 * (lo[k] + hi[k])
-            f = 1.0
-            for i in range(n):
-                diff = d[i] - mu
-                if abs(diff) < 1e-300:
-                    diff = 1e-300 if diff >= 0 else -1e-300
-                f += sigma * z_sq[i] / diff
-            if f * sigma > 0:
-                hi[k] = mu
-            else:
-                lo[k] = mu
     mu_out = np.empty(n)
     for k in range(n):
-        mu_out[k] = 0.5 * (lo[k] + hi[k])
+        lo_k = lo[k]
+        hi_k = hi[k]
+        mu_k = 0.5 * (lo_k + hi_k)
+        for _ in range(max_iter):
+            # Evaluate secular function f(mu) = 1 + sigma * sum(z_sq / (d - mu))
+            # and derivative fp(mu) = sigma * sum(z_sq / (d - mu)^2)
+            # using compensated summation for the near-pole term
+            f = 1.0
+            fp = 0.0
+            for i in range(n):
+                diff = d[i] - mu_k
+                if abs(diff) < 1e-300:
+                    diff = 1e-300 if diff >= 0 else -1e-300
+                t = sigma * z_sq[i] / diff
+                f += t
+                fp += t / diff
+            if f * sigma > 0:
+                hi_k = mu_k
+            else:
+                lo_k = mu_k
+            gap = hi_k - lo_k
+            if gap < 1e-14 * (abs(mu_k) + 1.0):
+                mu_k = 0.5 * (lo_k + hi_k)
+                break
+            use_newton = False
+            if abs(fp) > 1e-300:
+                delta = f / fp
+                mu_new = mu_k - delta
+                if lo_k < mu_new < hi_k:
+                    # Reject Newton if step is negligible relative to bracket
+                    # (near-pole stalling: fp overflows, delta -> 0)
+                    if abs(delta) > 1e-14 * gap:
+                        mu_k = mu_new
+                        use_newton = True
+            if not use_newton:
+                mu_k = 0.5 * (lo_k + hi_k)
+        mu_out[k] = mu_k
     return mu_out
 
 
@@ -120,7 +148,7 @@ def rank1_secular_update(d, z, sigma, tol=1e-14):
                 lo[k] = d_a[k - 1] + gap * 0.01
                 hi[k] = d_a[k] - gap * 0.01
 
-    mu_a = _solve_secular_roots(d_a, z_sq_a, sigma, lo, hi, 30)
+    mu_a = _solve_secular_roots(d_a, z_sq_a, sigma, lo, hi, 50)
     Q_a = _compute_eigenvectors(d_a, z_a, mu_a, na)
 
     mu_full = d.copy()
@@ -147,7 +175,8 @@ def rank2_secular_update(d, V_old, W, M, tol=1e-14):
 
     Q_combined = Q1 @ Q2
 
-    # Newton-Schulz orthogonalization (1 iteration)
+    # Newton-Schulz re-orthogonalization (1 iteration)
+    # Required to prevent exponential eigenvalue drift from B reconstruction
     QtQ = Q_combined.T @ Q_combined
     Q_combined = Q_combined @ (1.5 * np.eye(n) - 0.5 * QtQ)
 

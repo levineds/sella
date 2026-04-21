@@ -120,8 +120,10 @@ class PES:
         proj_trans: bool = None,
         proj_rot: bool = None,
         hessian_function: Callable[[Atoms], np.ndarray] = None,
+        secular: bool = False,
     ) -> None:
         self.atoms = atoms
+        self.secular = secular
         if constraints is None:
             constraints = Constraints(self.atoms)
         if proj_trans is None:
@@ -236,6 +238,7 @@ class PES:
         return self.H
 
     def set_H(self, target, *args, **kwargs):
+        kwargs.setdefault('secular', getattr(self, 'secular', False))
         self.H = ApproximateHessian(
             self.dim, self.ncart, target, *args, **kwargs
         )
@@ -815,18 +818,10 @@ class InternalPES(PES):
             return cached
 
         cons = self.cons
-        B = self.int.jacobian()
-        Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
-        nnred = np.sum(Si > 1e-6)
-        Unred = Ui[:, :nnred]
-        Vnred = VTi[:nnred].T
-        Siinv = np.diag(1 / Si[:nnred])
+        Q, R = self._get_jacobian_qr()
+        Unred = Q
 
-        # Cross-populate Binv cache from SVD factors
-        Binv = Vnred @ Siinv @ Unred.T
-        self._pinv_cache.put(state_hash, Binv)
-
-        n_int = Ui.shape[0]  # number of internal coordinates
+        n_int = Q.shape[0]
         cons_jac = cons.jacobian()
         if cons_jac.shape[0] == 0:
             # No constraints: all non-redundant DOF are free
@@ -834,8 +829,16 @@ class InternalPES(PES):
             Ucons = np.zeros((n_int, 0))
             Ufree = Unred
         else:
-            drdxnred = cons_jac @ Vnred @ Siinv
-            drdx = drdxnred @ Unred.T
+            if R.shape[0] == R.shape[1]:
+                # Full rank: cons_jac @ R^{-1} via triangular solve
+                drdxnred = solve_triangular(
+                    R.T, cons_jac.T, lower=True
+                ).T
+            else:
+                # Rank-deficient (SVD fallback in _get_jacobian_qr)
+                Binv = self._get_Binv()
+                drdxnred = cons_jac @ (Binv @ Q)
+            drdx = drdxnred @ Q.T
             Uc, Sc, VTc = np.linalg.svd(drdxnred)
             ncons = np.sum(Sc > 1e-6)
             Ucons = Unred @ VTc[:ncons].T
@@ -1723,22 +1726,8 @@ class CellInternalPES(InternalPES):
                 g_final = np.zeros(self.n_cell_dof)
             return dx_initial, dx_final, g_final
 
-        # Get initial gradient in Cartesian for internal coord update
-        g = self.curr.get('g')
-        if g is not None:
-            g0 = self._get_Binv() @ g[:self.n_internal]
-        else:
-            g0 = np.zeros(3 * len(self.atoms))
-
         # Now update atomic positions to match internal coordinate target
-        # This is tricky: the internal coord values changed when cell changed
-        # We use the iterative stepper from parent class
-        if self.iterative_stepper:
-            res = self._set_x_iterative_internal(q_target)
-            if res is None:
-                res = self._set_x_ode_internal(q_target)
-        else:
-            res = self._set_x_ode_internal(q_target)
+        res = self._set_x_ode_internal(q_target)
 
         # Get old cell gradient for parallel transport (needed for correct
         # BFGS secant condition on the cell block of the Hessian)
@@ -1758,65 +1747,6 @@ class CellInternalPES(InternalPES):
             dx_final = np.concatenate([dx_int_final, cell_target - cell_params0])
             g_final = np.concatenate([g_int, g_old_cell])
 
-        return dx_initial, dx_final, g_final
-
-    def _set_x_iterative_internal(self, q_target: np.ndarray, max_iter: int = 20):
-        """Iterative stepper for internal coords only (cell already updated)."""
-        pos0 = self.atoms.positions.copy()
-        dpos0 = self.dummies.positions.copy()
-        x0 = self.int.calc()
-        dx_initial = q_target - x0
-
-        if 'g' in self.curr and self.curr['g'] is not None:
-            g0 = self._get_Binv() @ self.curr['g'][:self.n_internal]
-        else:
-            g0 = np.zeros(3 * (len(self.atoms) + len(self.dummies)))
-
-        rms_prev = np.inf
-        initial_rms = None
-
-        for iteration in range(max_iter):
-            residual = self.int.wrap(q_target - self.int.calc())
-            rms = np.linalg.norm(residual) / np.sqrt(len(residual))
-
-            if initial_rms is None:
-                initial_rms = rms
-
-            if rms < 1e-8:
-                break
-
-            if rms > initial_rms * 2.0:
-                self.atoms.positions = pos0
-                self.dummies.positions = dpos0
-                return None
-
-            rms_prev = rms
-
-            dx = np.linalg.lstsq(
-                self.int.jacobian(),
-                residual,
-                rcond=None,
-            )[0].reshape((-1, 3))
-
-            self.atoms.positions += dx[:len(self.atoms)]
-            self.dummies.positions += dx[len(self.atoms):]
-
-            self.bad_int = self.int.check_for_bad_internals()
-            if self.bad_int is not None:
-                self.atoms.positions = pos0
-                self.dummies.positions = dpos0
-                self.bad_int = None
-                return None
-
-        final_residual = self.int.wrap(q_target - self.int.calc())
-        final_rms = np.linalg.norm(final_residual) / np.sqrt(len(dx_initial))
-        if final_rms > 1e-6:
-            self.atoms.positions = pos0
-            self.dummies.positions = dpos0
-            return None
-
-        dx_final = self.int.calc() - x0
-        g_final = self.int.jacobian() @ g0
         return dx_initial, dx_final, g_final
 
     def _set_x_ode_internal(self, q_target: np.ndarray):

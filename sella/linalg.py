@@ -149,8 +149,16 @@ class ApproximateHessian(LinearOperator):
         update_method: str = 'TS-BFGS',
         symm: int = 2,
         initialized: bool = False,
+        secular: bool = False,
     ) -> None:
-        """A wrapper object for the approximate Hessian matrix."""
+        """A wrapper object for the approximate Hessian matrix.
+
+        Parameters
+        ----------
+        secular : bool
+            Use rank-2 secular equation for eigendecomposition update
+            instead of full eigh. Default True.
+        """
         self.dim = dim
         self.ncart = ncart
         self.shape = (self.dim, self.dim)
@@ -158,6 +166,7 @@ class ApproximateHessian(LinearOperator):
         self.update_method = update_method
         self.symm = symm
         self.initialized = initialized
+        self.secular = secular
         # Lazy eigendecomposition: only compute when needed
         self._evals = None
         self._evecs = None
@@ -232,7 +241,8 @@ class ApproximateHessian(LinearOperator):
         lams, vecs = self.evals, self.evecs
 
         dx_arr = np.asarray(dx)
-        if (self._eigen_computed
+        if (self.secular
+                and self._eigen_computed
                 and self.update_method == 'TS-BFGS'
                 and dx_arr.ndim == 1
                 and np.linalg.norm(dx_arr) >= 1e-8):
@@ -243,8 +253,7 @@ class ApproximateHessian(LinearOperator):
                 )
                 if (np.all(np.isfinite(evals_new))
                         and np.all(np.isfinite(evecs_new))):
-                    B_new = (evecs_new * evals_new[np.newaxis, :]) @ evecs_new.T
-                    self.B = B_new
+                    self.B = B + W @ M @ W.T
                     self._evals = evals_new
                     self._evecs = evecs_new
                     self._eigen_computed = True
@@ -266,7 +275,8 @@ class ApproximateHessian(LinearOperator):
             Bproj = U.T @ self.B @ U
 
         return ApproximateHessian(n, 0, Bproj, self.update_method,
-                                  self.symm)
+                                  self.symm,
+                                  secular=self.secular)
 
     def asarray(self):
         if self.B is not None:
@@ -302,6 +312,7 @@ class ApproximateHessian(LinearOperator):
         return ApproximateHessian(
             self.dim, self.ncart, tot, self.update_method, self.symm,
             initialized=initialized,
+            secular=self.secular,
         )
 
 
