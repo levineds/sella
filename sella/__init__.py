@@ -6,6 +6,7 @@ import os
 _cache_dir = os.path.expanduser("~/.cache/sella/jax_cache")
 os.makedirs(_cache_dir, exist_ok=True)
 os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", _cache_dir)
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax
 
