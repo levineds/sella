@@ -2025,14 +2025,14 @@ class BaseInternals:
         assert didx >= 0
         npos = len(self.all_positions)
         for i, trans in enumerate(self.internals['translations']):
-            if idx in trans.indices:
-                new_indices = (*trans.indices[:-1], didx)
+            if idx in trans.indices and didx not in trans.indices:
+                new_indices = (*trans.indices, didx)
                 new_trans = Translation(new_indices, trans.kwargs['dim'])
                 self.internals['translations'][i] = new_trans
 
         for i, rot in enumerate(self.internals['rotations']):
-            if idx in rot.indices[:-1]:
-                new_indices = np.array((*rot.indices[:-1], didx), dtype=np.int32)
+            if idx in rot.indices and didx not in rot.indices:
+                new_indices = np.array((*rot.indices, didx), dtype=np.int32)
                 if np.all(new_indices < npos):
                     new_rot = Rotation(
                         new_indices, rot.kwargs['axis'],
@@ -2743,10 +2743,12 @@ class Internals(BaseInternals):
                 else:
                     groups[label].append(i)
             cumshifts = {}
+            self.fragment_atom_groups = []
             for group in groups:
                 if not group:
                     continue
                 self._wrap_fragment_positions(group, cumshifts)
+                self.fragment_atom_groups.append(np.array(group, dtype=np.int32))
                 self.add_translation(group)
                 self.add_rotation(group)
 

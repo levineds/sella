@@ -1629,11 +1629,12 @@ class CellInternalPES(InternalPES):
 
     @staticmethod
     def _extract_fragment_groups(internals):
-        """Extract fragment atom groups from Translation coordinates.
+        """Extract fragment atom groups for rigid-body operations.
 
-        Each fragment has 3 Translation coordinates (dim=0,1,2).
-        We use dim=0 to identify one Translation per fragment and
-        extract the atom indices.
+        Uses the original fragment groups stored during find_all_bonds,
+        which contain all real atoms. Translation coordinates get
+        corrupted by add_dummy_to_internals (drops the last real atom),
+        so we avoid using those. Dummy indices are found via dinds.
 
         Returns
         -------
@@ -1642,14 +1643,25 @@ class CellInternalPES(InternalPES):
         list of ndarray
             Each element is an array of dummy atom indices for the same fragment.
         """
-        natoms = internals.natoms
-        groups = []
+        if hasattr(internals, 'fragment_atom_groups'):
+            groups = internals.fragment_atom_groups
+        else:
+            natoms = internals.natoms
+            groups = []
+            for trans in internals.internals.get('translations', []):
+                if trans.kwargs['dim'] == 0:
+                    indices = np.array(trans.indices)
+                    groups.append(indices[indices < natoms])
+
         dummy_groups = []
-        for trans in internals.internals.get('translations', []):
-            if trans.kwargs['dim'] == 0:  # One per fragment (x-dim)
-                indices = np.array(trans.indices)
-                groups.append(indices[indices < natoms])
-                dummy_groups.append(indices[indices >= natoms])
+        for group in groups:
+            dummies = []
+            for atom_idx in group:
+                didx = internals.dinds[atom_idx]
+                if didx >= 0:
+                    dummies.append(didx)
+            dummy_groups.append(np.array(dummies, dtype=np.int32))
+
         return groups, dummy_groups
 
     def _compute_delta_r(self):
