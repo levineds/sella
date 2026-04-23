@@ -10,7 +10,7 @@ from ase.optimize.optimize import Optimizer
 from ase.utils import basestring
 from ase.io.trajectory import Trajectory
 
-from .restricted_step import get_restricted_step
+from .restricted_step import get_restricted_step, MaxInternalStep
 from sella.peswrapper import PES, InternalPES, CellInternalPES, CellCartesianPES
 from sella.internal import Internals, Constraints
 
@@ -178,6 +178,7 @@ class Sella(Optimizer):
             self.delta = delta0
         else:
             self.delta = delta0 * self.pes.get_Ufree().shape[1]
+        self.delta_cell = delta0
 
         self.sigma_inc = sigma_inc if sigma_inc is not None else default['sigma_inc']
         self.sigma_dec = sigma_dec if sigma_dec is not None else default['sigma_dec']
@@ -236,7 +237,7 @@ class Sella(Optimizer):
             else:
                 auto_find_internals = True
                 internal = Internals(
-                    atoms, cons=constraints, allow_fragments=allow_fragments
+                    atoms, cons=constraints, allow_fragments=allow_fragments,
                 )
             self.internal = internal.copy()
             self.constraints = None
@@ -318,11 +319,18 @@ class Sella(Optimizer):
         self.pes.save()
         x0 = self.pes.get_x()
 
+        rs_kwargs = {}
+        if self.optimize_cell and isinstance(self.rs, type) and issubclass(
+            self.rs, MaxInternalStep
+        ):
+            rs_kwargs['wc'] = self.delta / self.delta_cell
+
         if self.pes.cons.has_inequalities():
             all_valid = False
             while not all_valid:
                 s, smag = self.rs(
-                    self.pes, self.ord, self.delta, method=self.method
+                    self.pes, self.ord, self.delta, method=self.method,
+                    **rs_kwargs
                 ).get_s()
                 self.pes.set_x(x0 + s)
                 all_valid = self.pes.cons.validate_inequalities()
@@ -331,7 +339,8 @@ class Sella(Optimizer):
             self.pes._update_basis()
         else:
             s, smag = self.rs(
-                self.pes, self.ord, self.delta, method=self.method
+                self.pes, self.ord, self.delta, method=self.method,
+                **rs_kwargs
             ).get_s()
 
         return s, smag
@@ -383,10 +392,24 @@ class Sella(Optimizer):
 
         # Update trust radius
         if rho is not None:
+            if self.optimize_cell and hasattr(self.pes, 'n_internal'):
+                n_int = self.pes.n_internal
+                smag_int = np.max(np.abs(s[:n_int])) if n_int > 0 else 0
+                smag_cell = np.max(np.abs(s[n_int:])) if len(s) > n_int else 0
+            else:
+                smag_int = smag
+                smag_cell = 0
+
             if rho < 1./self.rho_dec or rho > self.rho_dec:
-                self.delta = max(smag * self.sigma_dec, self.delta_min)
+                self.delta = max(smag_int * self.sigma_dec, self.delta_min)
+                if smag_cell > 0:
+                    self.delta_cell = max(self.delta_cell * self.sigma_dec,
+                                          self.delta_min)
             elif 1./self.rho_inc < rho < self.rho_inc:
-                self.delta = max(self.sigma_inc * smag, self.delta)
+                self.delta = max(self.sigma_inc * smag_int, self.delta)
+                if smag_cell > 0:
+                    self.delta_cell = max(self.sigma_inc * smag_cell,
+                                          self.delta_cell)
             self.rho = rho
         else:
             self.rho = 1.
@@ -417,13 +440,15 @@ class Sella(Optimizer):
             buf = " " * len(name)
             if self.nsteps == 0:
                 self.logfile.write(buf + "{:>4s} {:>8s} {:>15s} {:>12s} {:>12s} "
-                                   "{:>12s} {:>12s} {:>12s}\n"
+                                   "{:>12s} {:>12s} {:>12s} {:>12s}\n"
                                    .format("Step", "Time", "Energy", "fmax",
-                                           "smax", "cmax", "rtrust", "rho"))
+                                           "smax", "cmax", "rtrust",
+                                           "strust", "rho"))
             self.logfile.write("{} {:>3d} {:>8s} {:>15.6f} {:>12.4f} {:>12.4f} "
-                               "{:>12.4f} {:>12.4f} {:>12.4f}\n"
+                               "{:>12.4f} {:>12.4f} {:>12.4f} {:>12.4f}\n"
                                .format(name, self.nsteps, T, e, fmax, smax_actual,
-                                       cmax, self.delta, self.rho))
+                                       cmax, self.delta, self.delta_cell,
+                                       self.rho))
         else:
             _, fmax, cmax = self.pes.converged(self.fmax)
             e = self.pes.get_f()

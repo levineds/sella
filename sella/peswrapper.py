@@ -765,7 +765,18 @@ class InternalPES(PES):
         return self._set_x_ode(target)
 
     def get_x(self):
-        return self.int.calc()
+        x = self.int.calc()
+        if self.curr['x'] is not None:
+            dih_start = (self.int.ntrans + self.int.nbonds
+                         + self.int.nangles)
+            dih_end = dih_start + self.int.ndihedrals
+            if dih_end > dih_start:
+                dx = x[dih_start:dih_end] - self.curr['x'][dih_start:dih_end]
+                x[dih_start:dih_end] = (
+                    self.curr['x'][dih_start:dih_end]
+                    + (dx + np.pi) % (2 * np.pi) - np.pi
+                )
+        return x
 
     # Hessian of the constraints
     def get_Hc(self):
@@ -1589,7 +1600,20 @@ class CellInternalPES(InternalPES):
             return q
 
         cell_params = self._masked_cell_params()  # Cell DOF
-        return np.concatenate([q, cell_params])
+        x = np.concatenate([q, cell_params])
+
+        # Unwrap dihedrals to prevent ±π branch cut jumps
+        if self.curr['x'] is not None:
+            dih_start = (self.int.ntrans + self.int.nbonds
+                         + self.int.nangles)
+            dih_end = dih_start + self.int.ndihedrals
+            if dih_end > dih_start:
+                dx = x[dih_start:dih_end] - self.curr['x'][dih_start:dih_end]
+                x[dih_start:dih_end] = (
+                    self.curr['x'][dih_start:dih_end]
+                    + (dx + np.pi) % (2 * np.pi) - np.pi
+                )
+        return x
 
     def _get_deformation_gradient(self) -> np.ndarray:
         """Get current deformation gradient F = cell @ inv(orig_cell)."""
@@ -1791,7 +1815,7 @@ class CellInternalPES(InternalPES):
 
         return dx_initial, dx_final, g_final
 
-    def _set_x_ode_internal(self, q_target: np.ndarray):
+    def _set_x_ode_internal(self, q_target: np.ndarray, old_g_cart=None):
         """ODE-based stepper for internal coords only (cell already updated)."""
         x0 = self.int.calc()
         dx = q_target - x0
@@ -1799,13 +1823,16 @@ class CellInternalPES(InternalPES):
         Binv = self._get_Binv()
         self._ode_Binv = Binv
 
+        if 'g' in self.curr and self.curr['g'] is not None:
+            g_cart_for_ode = Binv @ self.curr['g'][:self.n_internal]
+        else:
+            g_cart_for_ode = np.zeros(3 * (len(self.atoms) + len(self.dummies)))
+
         y0 = np.hstack((
             self.apos.ravel(),
             self.dpos.ravel(),
             Binv @ dx,
-            Binv @ self.curr.get('g', np.zeros_like(dx))[:self.n_internal]
-            if 'g' in self.curr and self.curr['g'] is not None
-            else np.zeros(3 * (len(self.atoms) + len(self.dummies)))
+            g_cart_for_ode,
         ))
         ode = LSODA(self._q_ode, t0, y0, t_bound=1., atol=1e-6)
 

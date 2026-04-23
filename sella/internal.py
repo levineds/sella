@@ -3112,8 +3112,12 @@ class Internals(BaseInternals):
         for angle in self.internals['angles']:
             h0[idx] = self._h0_angle(angle)
             idx += 1
+        dummy_set = set(range(self.natoms, self.natoms + self.ndummies))
         for dihedral in self.internals['dihedrals']:
-            h0[idx] = self._h0_dihedral(dihedral, nbonds)
+            if any(j in dummy_set for j in dihedral.indices):
+                h0[idx] = 0.5 * units.Hartree
+            else:
+                h0[idx] = self._h0_dihedral(dihedral, nbonds)
             idx += 1
         # remaining degrees of freedom are rotations.
         # No idea what a good curvature is for these
