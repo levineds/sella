@@ -988,10 +988,10 @@ class InternalPES(PES):
         self.dummies.positions = x[nxa:].reshape((-1, 3)).copy()
 
         # Use direct HVP computation instead of forming full Hessians
-        Dv, Dg = self.int.hessian_rdot_vecs(dxdt, dxdt, g)
+        D_rdot = self.int.hessian_rdot(dxdt)
         Binv = self._ode_Binv
-        dydt[1] = -Binv @ Dv
-        dydt[2] = -Binv @ Dg
+        dydt[1] = -Binv @ (D_rdot @ dxdt)
+        dydt[2] = -Binv @ (D_rdot @ g)
 
         return dydt.ravel()
 
