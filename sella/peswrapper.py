@@ -354,6 +354,10 @@ class PES:
 
     def _update_basis(self, basis=None):
         if basis is None:
+            x = self.get_x()
+            if (self.curr['x'] is not None and np.all(x == self.curr['x'])
+                    and self.curr.get('Ufree') is not None):
+                return
             basis = self._calc_basis()
         drdx, Ucons, Unred, Ufree = basis
         self.curr['drdx'] = drdx
