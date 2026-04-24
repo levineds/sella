@@ -16,6 +16,21 @@ from sella.linalg import NumericalHessian, ApproximateHessian
 from sella.eigensolvers import rayleigh_ritz
 from sella.internal import Internals, Constraints, DuplicateInternalError
 
+try:
+    import torch
+    _has_torch = torch.cuda.is_available()
+except ImportError:
+    _has_torch = False
+
+
+def _gpu_qr(A):
+    """Economy QR on GPU if available, else CPU."""
+    if _has_torch and A.shape[0] >= 200:
+        At = torch.from_numpy(np.ascontiguousarray(A)).cuda()
+        Q_t, R_t = torch.linalg.qr(At, mode='reduced')
+        return Q_t.cpu().numpy(), R_t.cpu().numpy()
+    return np.linalg.qr(A, mode='reduced')
+
 
 class _LRU2:
     """2-entry LRU cache keyed by state hash (bytes).
@@ -560,7 +575,7 @@ class InternalPES(PES):
             return cached
 
         B = self.int.jacobian()
-        Q, R = np.linalg.qr(B, mode='reduced')
+        Q, R = _gpu_qr(B)
 
         # Check for rank deficiency via R diagonal
         rdiag = np.abs(np.diag(R))

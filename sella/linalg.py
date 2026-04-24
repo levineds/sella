@@ -9,6 +9,21 @@ from sella.hessian_update import update_H
 from scipy.sparse.linalg import LinearOperator
 from scipy.linalg import eigh
 
+try:
+    import torch
+    _has_torch = torch.cuda.is_available()
+except ImportError:
+    _has_torch = False
+
+
+def _gpu_eigh(A):
+    """Eigendecomposition on GPU if available, else CPU."""
+    if _has_torch and A.shape[0] >= 200:
+        At = torch.from_numpy(A).cuda()
+        evals_t, evecs_t = torch.linalg.eigh(At)
+        return evals_t.cpu().numpy(), evecs_t.cpu().numpy()
+    return eigh(A)
+
 
 class NumericalHessian(LinearOperator):
     dtype = np.dtype('float64')
@@ -167,7 +182,7 @@ class ApproximateHessian(LinearOperator):
     def _ensure_eigen_computed(self):
         """Compute eigendecomposition if not already done."""
         if not self._eigen_computed and self.B is not None:
-            self._evals, self._evecs = eigh(self.B)
+            self._evals, self._evecs = _gpu_eigh(self.B)
             self._eigen_computed = True
 
     @property
