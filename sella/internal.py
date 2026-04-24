@@ -983,6 +983,36 @@ class BaseInternals:
             self._dihedral_mask = np.empty(0, dtype=np.float64)
             self._n_dihedrals_actual = 0
 
+        # Precompute flat column indices for direct scatter in hessian_rdot.
+        # For bond (a,b), the non-zero columns in the (ndof,) output are
+        # [3a, 3a+1, 3a+2, 3b, 3b+1, 3b+2].  Analogous for angles (9 cols)
+        # and dihedrals (12 cols).  These are topology-dependent and
+        # invalidated together with the rest of the batched arrays.
+        offsets = np.arange(3)
+        if self._n_bonds_actual > 0:
+            bi = self._bond_indices  # (n_bonds, 2)
+            self._bond_flat_cols = np.concatenate([
+                bi[:, k:k+1] * 3 + offsets for k in range(2)
+            ], axis=1)  # (n_bonds, 6)
+        else:
+            self._bond_flat_cols = np.empty((0, 6), dtype=np.intp)
+
+        if self._n_angles_actual > 0:
+            ai = self._angle_indices  # (n_angles, 3)
+            self._angle_flat_cols = np.concatenate([
+                ai[:, k:k+1] * 3 + offsets for k in range(3)
+            ], axis=1)  # (n_angles, 9)
+        else:
+            self._angle_flat_cols = np.empty((0, 9), dtype=np.intp)
+
+        if self._n_dihedrals_actual > 0:
+            di = self._dihedral_indices  # (n_dihedrals, 4)
+            self._dihedral_flat_cols = np.concatenate([
+                di[:, k:k+1] * 3 + offsets for k in range(4)
+            ], axis=1)  # (n_dihedrals, 12)
+        else:
+            self._dihedral_flat_cols = np.empty((0, 12), dtype=np.intp)
+
         self._batched_arrays_valid = True
 
     def _get_cached_tvecs(self, cell: np.ndarray) -> Dict[str, np.ndarray]:
@@ -1597,19 +1627,6 @@ class BaseInternals:
         out = self._hvp_buf
         out[:] = 0  # Clear (cheaper than allocating)
 
-        # Also pre-allocate a scratch buffer for scatter operations
-        # Shape: (max_coords_in_batch, n_atoms, 3)
-        max_batch = max(
-            self._n_bonds_actual if bonds_active.any() else 0,
-            self._n_angles_actual if angles_active.any() else 0,
-            self._n_dihedrals_actual if dihedrals_active.any() else 0,
-            1,
-        )
-        if (not hasattr(self, '_scatter_buf') or self._scatter_buf is None
-                or self._scatter_buf.shape[0] < max_batch
-                or self._scatter_buf.shape[1] != n_atoms):
-            self._scatter_buf = np.zeros((max_batch, n_atoms, 3))
-
         row = 0  # Current write position in output
 
         # Translations - Hessian is zero
@@ -1683,36 +1700,41 @@ class BaseInternals:
                 )
 
         # Now collect results with device_get and scatter into output buffer
-        scatter_buf = self._scatter_buf
 
         if bond_jax_result is not None:
             hvp = np.asarray(device_get(bond_jax_result))
             if bonds_active.all():
                 hvp = hvp[:self._n_bonds_actual]
-            n_coords = len(bond_active_idx)
-            scatter_buf[:n_coords] = 0
-            scatter_buf[np.arange(n_coords)[:, None], bond_active_idx] = hvp
-            out[row:row+n_coords] = scatter_buf[:n_coords].reshape((n_coords, ndof))
+                flat_cols = self._bond_flat_cols
+            else:
+                flat_cols = self._bond_flat_cols[bonds_active]
+            n_coords = len(flat_cols)
+            out[row:row+n_coords, :] = 0
+            out[np.arange(row, row+n_coords)[:, None], flat_cols] = hvp.reshape(n_coords, -1)
             row += n_coords
 
         if angle_jax_result is not None:
             hvp = np.asarray(device_get(angle_jax_result))
             if angles_active.all():
                 hvp = hvp[:self._n_angles_actual]
-            n_coords = len(angle_active_idx)
-            scatter_buf[:n_coords] = 0
-            scatter_buf[np.arange(n_coords)[:, None], angle_active_idx] = hvp
-            out[row:row+n_coords] = scatter_buf[:n_coords].reshape((n_coords, ndof))
+                flat_cols = self._angle_flat_cols
+            else:
+                flat_cols = self._angle_flat_cols[angles_active]
+            n_coords = len(flat_cols)
+            out[row:row+n_coords, :] = 0
+            out[np.arange(row, row+n_coords)[:, None], flat_cols] = hvp.reshape(n_coords, -1)
             row += n_coords
 
         if dih_jax_result is not None:
             hvp = np.asarray(device_get(dih_jax_result))
             if dihedrals_active.all():
                 hvp = hvp[:self._n_dihedrals_actual]
-            n_coords = len(dih_active_idx)
-            scatter_buf[:n_coords] = 0
-            scatter_buf[np.arange(n_coords)[:, None], dih_active_idx] = hvp
-            out[row:row+n_coords] = scatter_buf[:n_coords].reshape((n_coords, ndof))
+                flat_cols = self._dihedral_flat_cols
+            else:
+                flat_cols = self._dihedral_flat_cols[dihedrals_active]
+            n_coords = len(flat_cols)
+            out[row:row+n_coords, :] = 0
+            out[np.arange(row, row+n_coords)[:, None], flat_cols] = hvp.reshape(n_coords, -1)
             row += n_coords
 
         # Other - use existing hessian computation (typically few coords, loop is fine)
