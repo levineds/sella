@@ -425,15 +425,22 @@ class Sella(Optimizer):
         fmax = getattr(self, 'fmax', None) or 0.05  # Default threshold
         if self.optimize_cell:
             smax = self.smax if self.smax is not None else fmax
-            return self.pes.converged(fmax, smax=smax)[0]
-        return self.pes.converged(fmax)[0]
+            result = self.pes.converged(fmax, smax=smax)
+            self._last_converged = result
+            return result[0]
+        result = self.pes.converged(fmax)
+        self._last_converged = result
+        return result[0]
 
     def log(self, forces=None):
         if self.logfile is None:
             return
         if self.optimize_cell:
             smax = self.smax if self.smax is not None else self.fmax
-            _, fmax, cmax, smax_actual = self.pes.converged(self.fmax, smax=smax)
+            result = getattr(self, '_last_converged', None)
+            if result is None or len(result) != 4:
+                result = self.pes.converged(self.fmax, smax=smax)
+            _, fmax, cmax, smax_actual = result
             e = self.pes.get_f()
             T = strftime("%H:%M:%S", localtime())
             name = self.__class__.__name__
@@ -450,7 +457,10 @@ class Sella(Optimizer):
                                        cmax, self.delta, self.delta_cell,
                                        self.rho))
         else:
-            _, fmax, cmax = self.pes.converged(self.fmax)
+            result = getattr(self, '_last_converged', None)
+            if result is None or len(result) != 3:
+                result = self.pes.converged(self.fmax)
+            _, fmax, cmax = result
             e = self.pes.get_f()
             T = strftime("%H:%M:%S", localtime())
             name = self.__class__.__name__
