@@ -17,7 +17,7 @@ class BaseRestrictedStep:
         order: int,
         delta: float,
         method: str = 'qn',
-        tol: float = 1e-15,
+        tol: float = None,
         maxiter: int = 1000,
         d1: Optional[np.ndarray] = None,
         W: Optional[np.ndarray] = None,
@@ -56,6 +56,8 @@ class BaseRestrictedStep:
                 d1=d1,
             )
 
+        if tol is None:
+            tol = 1e-10 if self.stepper.newton_safe else 1e-15
         self.tol = tol
         self.maxiter = maxiter
 
@@ -93,7 +95,9 @@ class BaseRestrictedStep:
                 lower = alpha
 
             a1 = alpha - err / dval
-            if np.isnan(a1) or a1 <= lower or a1 >= upper or niter > 4:
+            if np.isnan(a1) or a1 <= lower or a1 >= upper or (
+                niter > 4 and not self.stepper.newton_safe
+            ):
                 a2 = (lower + upper) / 2.
                 if np.isinf(a2):
                     alpha = alpha + max(1, 0.5 * alpha) * np.sign(a2)

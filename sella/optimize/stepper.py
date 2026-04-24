@@ -13,6 +13,8 @@ class BaseStepper:
     alphamax: Optional[float] = None
     # Whether the step size increases or decreases with increasing alpha
     slope: Optional[float] = None
+    # Whether get_s is smooth enough for Newton to converge reliably
+    newton_safe: bool = True
     synonyms: List[str] = []
 
     def __init__(
@@ -114,6 +116,7 @@ class RationalFunctionOptimization(BaseStepper):
     alphamin = 0.
     alphamax = 1.
     slope = 1.
+    newton_safe = False
     synonyms = ['rfo', 'rational function optimization']
 
     def _stepper_init(self) -> None:
