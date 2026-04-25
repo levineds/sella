@@ -51,7 +51,7 @@ class BaseRestrictedStep:
                 d1 = np.linalg.lstsq(self.P.T, d1, rcond=None)[0]
             self.stepper = stepper(
                 self.P @ g,
-                self.pes.get_HL().project(self.P.T),
+                self.pes.get_HL_projected(self.P.T),
                 order,
                 d1=d1,
             )

@@ -272,6 +272,22 @@ class PES:
     def get_HL(self):
         return self.get_H() - self.get_Hc()
 
+    def get_HL_projected(self, U):
+        """Projected Hessian of the Lagrangian: ApproximateHessian(U.T @ HL @ U).
+
+        Equivalent to ``self.get_HL().project(U)`` but skips constructing the
+        full (dim, dim) HL matrix and the intermediate ApproximateHessian.
+        """
+        H_B = self.get_H().B
+        if H_B is None:
+            Bproj = None
+        else:
+            Hc = self.get_Hc()
+            UtH = U.T @ H_B
+            Bproj = UtH @ U - (U.T @ Hc) @ U
+        n = U.shape[1]
+        return ApproximateHessian(n, 0, Bproj, self.H.update_method, self.H.symm)
+
     # Getters for constraints and their derivatives
     def get_res(self):
         return self.cons.residual()
@@ -406,7 +422,7 @@ class PES:
         if nfree == 0:
             return
 
-        P = self.get_HL().project(Ufree)
+        P = self.get_HL_projected(Ufree)
         P_is_none = P.B is None
 
         # Determine initial guess vector
