@@ -93,7 +93,7 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
 
         t = expand(V, Ytilde, P, B, lams, vecs, thetai, method, seeking)
         t /= np.linalg.norm(t)
-        if np.linalg.norm(t - V @ V.T @ t) < 1e-2:  # pragma: no cover
+        if np.linalg.norm(t - V @ (V.T @ t)) < 1e-2:  # pragma: no cover
             # Do Lanczos instead
             t = ri / np.linalg.norm(ri)
 

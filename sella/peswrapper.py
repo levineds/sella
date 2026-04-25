@@ -2699,7 +2699,7 @@ class CellCartesianPES(PES):
         g_cart = g[:self.n_cart]
         Ufree = self.get_Ufree()
         Ufree_cart = Ufree[:self.n_cart, :Ufree.shape[1] - self.n_cell_dof]
-        g_proj = (Ufree_cart @ Ufree_cart.T @ g_cart).reshape((-1, 3))
+        g_proj = (Ufree_cart @ (Ufree_cart.T @ g_cart)).reshape((-1, 3))
 
         fmax_actual = np.linalg.norm(g_proj, axis=1).max()
 

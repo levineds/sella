@@ -147,7 +147,9 @@ class RationalFunctionOptimization(BaseStepper):
         L_diff = np.where(L_diff >= 0,
                          np.maximum(L_diff, 1e-12),
                          np.minimum(L_diff, -1e-12))
-        dVda = V1 @ ((V1.T @ dAda @ V[:, self.order]) / L_diff)
+        # Reassociate to do two matvecs (V1.T @ dAda is otherwise a (k-1, k)
+        # matmul that costs ~25× more for the same final vector result).
+        dVda = V1 @ ((V1.T @ (dAda @ V[:, self.order])) / L_diff)
 
         dsda = (V[:-1, self.order] / denom
                 + (alpha / denom) * dVda[:-1]
