@@ -1005,11 +1005,15 @@ class InternalPES(PES):
         self.atoms.positions = x[:nxa].reshape((-1, 3)).copy()
         self.dummies.positions = x[nxa:].reshape((-1, 3)).copy()
 
-        # Use direct HVP computation instead of forming full Hessians
+        # Use direct HVP computation instead of forming full Hessians.
+        # Batch the two D_rdot @ vector products into one (D_rdot @ matrix)
+        # matmul, then one Binv @ matrix matmul, halving the matmul count.
         D_rdot = self.int.hessian_rdot(dxdt)
         Binv = self._ode_Binv
-        dydt[1] = -Binv @ (D_rdot @ dxdt)
-        dydt[2] = -Binv @ (D_rdot @ g)
+        rhs = np.column_stack((dxdt, g))     # (ndof, 2)
+        out = -Binv @ (D_rdot @ rhs)          # (ndof, 2)
+        dydt[1] = out[:, 0]
+        dydt[2] = out[:, 1]
 
         return dydt.ravel()
 
