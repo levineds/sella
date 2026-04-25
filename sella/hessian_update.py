@@ -86,7 +86,11 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None,
         raise ValueError('Unknown update method {}'.format(method))
 
     Bplus += B
-    Bplus -= np.tril(Bplus.T - Bplus, -1).T
+    # Symmetrize to clean up floating-point roundoff. The MS_* updates above
+    # are mathematically symmetric, so any asymmetry is at machine precision;
+    # (B + B.T) / 2 is faster than the tril-based approach and gives the same
+    # result up to ~1e-16.
+    Bplus = (Bplus + Bplus.T) * 0.5
 
     return Bplus
 
