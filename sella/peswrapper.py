@@ -1247,6 +1247,11 @@ class CellInternalPES(InternalPES):
         # parent's internal-only _Hc_cache).
         self._Hc_cell_cache = _LRU2()
 
+        # Cache for the cell-extended basis (parent's _basis_cache only covers
+        # the internal-coords-only basis; CellInternalPES._calc_basis adds the
+        # cell-DOF zero-padding which we cache here).
+        self._cell_basis_cache = _LRU2()
+
         # Done initializing - now get_x returns full vector
         self._initializing = False
 
@@ -2005,6 +2010,13 @@ class CellInternalPES(InternalPES):
 
         The cell DOF are treated as unconstrained additional coordinates.
         """
+        # When called with custom internal/cons (refine paths), bypass cache.
+        if internal is None and cons is None:
+            state_hash = self._state_hash()
+            cached = self._cell_basis_cache.get(state_hash)
+            if cached is not None:
+                return cached
+
         # Get internal coordinate basis from parent
         result = InternalPES._calc_basis(self, internal=internal, cons=cons)
         drdx_int, Ucons_int, Unred_int, Ufree_int = result
@@ -2032,7 +2044,10 @@ class CellInternalPES(InternalPES):
         Ufree[:n_int, :Ufree_int.shape[1]] = Ufree_int
         Ufree[n_int:, Ufree_int.shape[1]:] = np.eye(self.n_cell_dof)
 
-        return drdx, Ucons, Unred, Ufree
+        out = (drdx, Ucons, Unred, Ufree)
+        if internal is None and cons is None:
+            self._cell_basis_cache.put(state_hash, out)
+        return out
 
     def converged(self, fmax: float, smax: float = None, cmax: float = 1e-5):
         """Check convergence of forces and stress.
