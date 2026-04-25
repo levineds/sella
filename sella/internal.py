@@ -1312,6 +1312,14 @@ class BaseInternals:
     def jacobian(self) -> np.ndarray:
         """Calculates the internal coordinate Jacobian matrix using vectorized operations."""
         self._cache_check()
+
+        # If a fully-built B was cached, return it directly. The cache is
+        # invalidated by _cache_check whenever positions change, and the active
+        # mask is stable within a single position evaluation.
+        cached_B = self._cache.get('jacobian_B')
+        if cached_B is not None:
+            return cached_B
+
         if 'jacobian' not in self._cache:
             positions = self.all_positions
             cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
@@ -1419,7 +1427,9 @@ class BaseInternals:
                 np.add.at(B, (row, idx), jac)
                 row += 1
 
-        return B.reshape((n_active, 3 * n_atoms))
+        result = B.reshape((n_active, 3 * n_atoms))
+        self._cache['jacobian_B'] = result
+        return result
 
     def cell_jacobian(self) -> np.ndarray:
         """Compute Jacobian of internal coordinates with respect to cell matrix.
