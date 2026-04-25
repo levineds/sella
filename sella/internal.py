@@ -1531,10 +1531,20 @@ class BaseInternals:
             # Use vectorized computation for bonds, angles, dihedrals
             batched_hess = self._compute_batched_hessians(positions, cell)
 
-            # Non-batched coords use lightweight atoms
+            # Non-batched coords use lightweight atoms. Translation hessians are
+            # identically zero (translations are linear in positions), so cache
+            # one zero array per (n,) and reuse — avoids 24+ JAX calls per
+            # hessian rebuild on systems with TRICs.
             atoms = self.light_atoms
-            trans_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
-                          for coord in self.internals['translations']]
+            trans_data = []
+            zero_cache = {}
+            for coord in self.internals['translations']:
+                n = len(coord.indices)
+                z = zero_cache.get(n)
+                if z is None:
+                    z = np.zeros((n, 3, n, 3))
+                    zero_cache[n] = z
+                trans_data.append((coord.indices, z))
             other_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
                           for coord in self.internals['other']]
             rot_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
