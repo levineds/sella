@@ -328,13 +328,14 @@ class PES:
         return scons
 
     def _update(self, feval=True):
-        x = self.get_x()
+        state = self._state_hash()
         new_point = True
-        if self.curr['x'] is not None and np.all(x == self.curr['x']):
+        if self.curr['x'] is not None and state == self.curr.get('state_hash'):
             if feval and self.curr['f'] is None:
                 new_point = False
             else:
                 return False
+        x = self.get_x()
         basis = self._calc_basis()
 
         if feval:
@@ -347,6 +348,7 @@ class PES:
             self.last = self.curr.copy()
 
         self.curr['x'] = x
+        self.curr['state_hash'] = state
         self.curr['f'] = f
         self.curr['g'] = g
         self._update_basis(basis)
@@ -354,10 +356,6 @@ class PES:
 
     def _update_basis(self, basis=None):
         if basis is None:
-            x = self.get_x()
-            if (self.curr['x'] is not None and np.all(x == self.curr['x'])
-                    and self.curr.get('Ufree') is not None):
-                return
             basis = self._calc_basis()
         drdx, Ucons, Unred, Ufree = basis
         self.curr['drdx'] = drdx
