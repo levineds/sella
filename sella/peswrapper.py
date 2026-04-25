@@ -824,8 +824,14 @@ class InternalPES(PES):
                 "See stack trace above."
             )
 
-        D_cons = self.cons.hessian().ldot(self.curr['L'])
+        # No constraints → L is empty → Hc is identically zero. Skip the
+        # expensive ldot/matmul chain (~95ms at 400 atoms).
         Binv_int = self._get_Binv()
+        n_dof = Binv_int.shape[1]
+        if self.curr['L'].size == 0:
+            return np.zeros((n_dof, n_dof))
+
+        D_cons = self.cons.hessian().ldot(self.curr['L'])
         B_cons = self.cons.jacobian()
         L_int = self.curr['L'] @ B_cons @ Binv_int
         D_int = self.int.hessian().ldot(L_int)
