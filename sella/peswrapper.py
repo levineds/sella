@@ -466,7 +466,7 @@ class PES:
         """Returns Nx3 array of atomic forces orthogonal to constraints."""
         g = self.get_g()
         Ufree = self.get_Ufree()
-        return -((Ufree @ Ufree.T) @ g).reshape((-1, 3))
+        return -(Ufree @ (Ufree.T @ g)).reshape((-1, 3))
 
     def converged(self, fmax, cmax=1e-5):
         fmax1 = np.linalg.norm(self.get_projected_forces(), axis=1).max()
@@ -988,7 +988,7 @@ class InternalPES(PES):
             B = self.curr['B']
         else:
             B = self.int.jacobian()
-        return -((Ufree @ Ufree.T) @ g @ B).reshape((-1, 3))
+        return -(Ufree @ (Ufree.T @ g) @ B).reshape((-1, 3))
 
     def wrap_dx(self, dx):
         return self.int.wrap(dx)
@@ -2060,11 +2060,13 @@ class CellInternalPES(InternalPES):
         if smax is None:
             smax = fmax
 
-        # Force convergence (project out constraints)
+        # Force convergence (project out constraints).
+        # Associate as U @ (U.T @ g) — two cheap matvecs — instead of
+        # (U @ U.T) @ g which materializes a (n_int, n_int) intermediate.
         g = self.get_g()
         g_internal = g[:self.n_internal]
         Ufree_int = self.curr['Ufree'][:self.n_internal, :self.curr['Ufree'].shape[1] - self.n_cell_dof]
-        g_proj = Ufree_int @ Ufree_int.T @ g_internal
+        g_proj = Ufree_int @ (Ufree_int.T @ g_internal)
 
         # Convert to Cartesian for force norm
         B = self.int.jacobian()
