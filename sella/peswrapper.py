@@ -1239,6 +1239,10 @@ class CellInternalPES(InternalPES):
         # Update dimension to include cell DOF
         self.dim = self.n_internal + self.n_cell_dof
 
+        # Cache for the cell-extended constraint Hessian (separate from the
+        # parent's internal-only _Hc_cache).
+        self._Hc_cell_cache = _LRU2()
+
         # Done initializing - now get_x returns full vector
         self._initializing = False
 
@@ -2106,6 +2110,11 @@ class CellInternalPES(InternalPES):
         We extend it with zeros to (dim, dim) since there are no constraints
         on cell DOF.
         """
+        state_hash = self._state_hash()
+        cached = self._Hc_cell_cache.get(state_hash)
+        if cached is not None:
+            return cached
+
         # Get internal constraint Hessian from parent
         Hc_int = InternalPES.get_Hc(self)
 
@@ -2115,6 +2124,7 @@ class CellInternalPES(InternalPES):
         if Hc_int.size > 0:
             Hc[:n_int, :n_int] = Hc_int
 
+        self._Hc_cell_cache.put(state_hash, Hc)
         return Hc
 
 
