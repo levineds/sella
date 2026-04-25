@@ -812,12 +812,8 @@ class InternalPES(PES):
         return x
 
     # Hessian of the constraints
-    def get_Hc(self):
-        state_hash = self._state_hash()
-        cached = self._Hc_cache.get(state_hash)
-        if cached is not None:
-            return cached
-
+    def _compute_Hc_int(self):
+        """Compute the internal-coords-only constraint Hessian (uncached)."""
         if self.curr['L'] is None:
             import traceback
             traceback.print_stack()
@@ -833,8 +829,18 @@ class InternalPES(PES):
         B_cons = self.cons.jacobian()
         L_int = self.curr['L'] @ B_cons @ Binv_int
         D_int = self.int.hessian().ldot(L_int)
-        Hc = Binv_int.T @ (D_cons - D_int) @ Binv_int
+        return Binv_int.T @ (D_cons - D_int) @ Binv_int
 
+    def get_Hc(self):
+        # Subclasses (CellInternalPES) cache the cell-extended form themselves
+        # and call _compute_Hc_int directly, so we only cache here when this
+        # *is* the runtime class.
+        state_hash = self._state_hash()
+        cached = self._Hc_cache.get(state_hash)
+        if cached is not None:
+            return cached
+
+        Hc = self._compute_Hc_int()
         self._Hc_cache.put(state_hash, Hc)
         return Hc
 
@@ -842,8 +848,43 @@ class InternalPES(PES):
         # dr/dq = dr/dx dx/dq
         return PES.get_drdx(self) @ self._get_Binv()
 
+    def _compute_basis_int(self):
+        """Compute the internal-coords-only basis (uncached, fast path).
+
+        Uses the cached jacobian QR factors. Subclasses (CellInternalPES) call
+        this to obtain the internal block, then add their own cell extension
+        and cache the combined result themselves.
+        """
+        cons = self.cons
+        Q, R = self._get_jacobian_qr()
+        Unred = Q
+
+        n_int = Q.shape[0]
+        cons_jac = cons.jacobian()
+        if cons_jac.shape[0] == 0:
+            # No constraints: all non-redundant DOF are free
+            drdx = np.zeros((0, n_int))
+            Ucons = np.zeros((n_int, 0))
+            Ufree = Unred
+        else:
+            if R.shape[0] == R.shape[1]:
+                # Full rank: cons_jac @ R^{-1} via triangular solve
+                drdxnred = solve_triangular(
+                    R.T, cons_jac.T, lower=True
+                ).T
+            else:
+                # Rank-deficient (SVD fallback in _get_jacobian_qr)
+                Binv = self._get_Binv()
+                drdxnred = cons_jac @ (Binv @ Q)
+            drdx = drdxnred @ Q.T
+            Uc, Sc, VTc = np.linalg.svd(drdxnred)
+            ncons = np.sum(Sc > 1e-6)
+            Ucons = Unred @ VTc[:ncons].T
+            Ufree = Unred @ VTc[ncons:].T
+        return drdx, Ucons, Unred, Ufree
+
     def _calc_basis(self, internal=None, cons=None):
-        # If custom internal/cons provided, bypass cache
+        # If custom internal/cons provided, bypass cache (used by refine paths)
         if internal is not None or cons is not None:
             if internal is None:
                 internal = self.int
@@ -871,41 +912,15 @@ class InternalPES(PES):
                 Ufree = Unred @ VTc[ncons:].T
             return drdx, Ucons, Unred, Ufree
 
-        # Check if cached result is valid
+        # Subclasses (CellInternalPES) cache the cell-extended form themselves
+        # and call _compute_basis_int directly, so we only cache here when
+        # this *is* the runtime class.
         state_hash = self._state_hash()
         cached = self._basis_cache.get(state_hash)
         if cached is not None:
             return cached
 
-        cons = self.cons
-        Q, R = self._get_jacobian_qr()
-        Unred = Q
-
-        n_int = Q.shape[0]
-        cons_jac = cons.jacobian()
-        if cons_jac.shape[0] == 0:
-            # No constraints: all non-redundant DOF are free
-            drdx = np.zeros((0, n_int))
-            Ucons = np.zeros((n_int, 0))
-            Ufree = Unred
-        else:
-            if R.shape[0] == R.shape[1]:
-                # Full rank: cons_jac @ R^{-1} via triangular solve
-                drdxnred = solve_triangular(
-                    R.T, cons_jac.T, lower=True
-                ).T
-            else:
-                # Rank-deficient (SVD fallback in _get_jacobian_qr)
-                Binv = self._get_Binv()
-                drdxnred = cons_jac @ (Binv @ Q)
-            drdx = drdxnred @ Q.T
-            Uc, Sc, VTc = np.linalg.svd(drdxnred)
-            ncons = np.sum(Sc > 1e-6)
-            Ucons = Unred @ VTc[:ncons].T
-            Ufree = Unred @ VTc[ncons:].T
-        result = (drdx, Ucons, Unred, Ufree)
-
-        # Cache the result
+        result = self._compute_basis_int()
         self._basis_cache.put(state_hash, result)
         return result
 
@@ -2010,44 +2025,48 @@ class CellInternalPES(InternalPES):
 
         The cell DOF are treated as unconstrained additional coordinates.
         """
-        # When called with custom internal/cons (refine paths), bypass cache.
-        if internal is None and cons is None:
-            state_hash = self._state_hash()
-            cached = self._cell_basis_cache.get(state_hash)
-            if cached is not None:
-                return cached
+        # Refine paths pass custom internal/cons; fall back to the parent's
+        # full path (bypasses parent's cache too) and return without caching
+        # on this side.
+        if internal is not None or cons is not None:
+            result = InternalPES._calc_basis(self, internal=internal, cons=cons)
+            return self._extend_basis_with_cell(result)
 
-        # Get internal coordinate basis from parent
-        result = InternalPES._calc_basis(self, internal=internal, cons=cons)
-        drdx_int, Ucons_int, Unred_int, Ufree_int = result
+        state_hash = self._state_hash()
+        cached = self._cell_basis_cache.get(state_hash)
+        if cached is not None:
+            return cached
 
-        # Extend to include cell DOF
+        # Compute the internal-only basis directly (bypass parent's cache —
+        # we cache the cell-extended form here instead, so the parent cache
+        # would just hold a redundant unpadded copy).
+        result = self._compute_basis_int()
+        out = self._extend_basis_with_cell(result)
+        self._cell_basis_cache.put(state_hash, out)
+        return out
+
+    def _extend_basis_with_cell(self, basis_int):
+        """Pad an internal-only basis with cell DOF (identity in Unred/Ufree)."""
+        drdx_int, Ucons_int, Unred_int, Ufree_int = basis_int
         n_int = drdx_int.shape[1]
         n_total = n_int + self.n_cell_dof
 
         # Cell DOF are not constrained, so they're all in Ufree
-        # drdx extended with zeros for cell columns
         drdx = np.zeros((drdx_int.shape[0], n_total))
         drdx[:, :n_int] = drdx_int
 
-        # Ucons stays the same (no cell constraints)
         Ucons = np.zeros((n_total, Ucons_int.shape[1]))
         Ucons[:n_int, :] = Ucons_int
 
-        # Unred extended with identity for cell DOF
         Unred = np.zeros((n_total, Unred_int.shape[1] + self.n_cell_dof))
         Unred[:n_int, :Unred_int.shape[1]] = Unred_int
         Unred[n_int:, Unred_int.shape[1]:] = np.eye(self.n_cell_dof)
 
-        # Ufree extended with identity for cell DOF
         Ufree = np.zeros((n_total, Ufree_int.shape[1] + self.n_cell_dof))
         Ufree[:n_int, :Ufree_int.shape[1]] = Ufree_int
         Ufree[n_int:, Ufree_int.shape[1]:] = np.eye(self.n_cell_dof)
 
-        out = (drdx, Ucons, Unred, Ufree)
-        if internal is None and cons is None:
-            self._cell_basis_cache.put(state_hash, out)
-        return out
+        return drdx, Ucons, Unred, Ufree
 
     def converged(self, fmax: float, smax: float = None, cmax: float = 1e-5):
         """Check convergence of forces and stress.
@@ -2105,7 +2124,7 @@ class CellInternalPES(InternalPES):
         Ufree = self.get_Ufree()
         Ufree_int = Ufree[:self.n_internal, :]
         B = self.int.jacobian()
-        return -((Ufree_int @ Ufree_int.T) @ g_internal @ B).reshape((-1, 3))
+        return -(Ufree_int @ (Ufree_int.T @ g_internal) @ B).reshape((-1, 3))
 
     def get_drdx(self):
         """Get constraint Jacobian extended for cell DOF.
@@ -2136,8 +2155,10 @@ class CellInternalPES(InternalPES):
         if cached is not None:
             return cached
 
-        # Get internal constraint Hessian from parent
-        Hc_int = InternalPES.get_Hc(self)
+        # Compute the internal-only Hc directly (bypass parent's _Hc_cache —
+        # we cache the cell-extended form here instead, so the parent cache
+        # would just hold a redundant unpadded copy).
+        Hc_int = self._compute_Hc_int()
 
         # Extend to full dimension
         Hc = np.zeros((self.dim, self.dim))
