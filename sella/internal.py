@@ -1575,47 +1575,50 @@ class BaseInternals:
         n_atoms = self.natoms + self.ndummies
         hessians = []
 
-        # Translations (not batched)
+        # Translations (not batched). Hessian rows are stored in cached
+        # nonbatched data; SparseInternalHessian only reads .vals so views are
+        # safe.
         for i, (idx, hess) in enumerate(trans_data):
             if trans_active[i]:
-                hessians.append(SparseInternalHessian(n_atoms, np.array(idx), hess.copy()))
+                hessians.append(SparseInternalHessian(n_atoms, idx, hess))
 
-        # Bonds (batched)
+        # Bonds (batched). Fancy indexing already returns a fresh array; per-row
+        # views into it are read-only consumers, so no per-coord copy is needed.
         bond_indices, bond_hess = batched['bonds']
-        bonds_active_arr = np.array(bonds_active, dtype=bool)
+        bonds_active_arr = np.asarray(bonds_active, dtype=bool)
         if bonds_active_arr.any():
             active_bond_idx = bond_indices[bonds_active_arr]
             active_bond_hess = bond_hess[bonds_active_arr]
             for i in range(len(active_bond_idx)):
-                hessians.append(SparseInternalHessian(n_atoms, active_bond_idx[i], active_bond_hess[i].copy()))
+                hessians.append(SparseInternalHessian(n_atoms, active_bond_idx[i], active_bond_hess[i]))
 
         # Angles (batched)
         angle_indices, angle_hess = batched['angles']
-        angles_active_arr = np.array(angles_active, dtype=bool)
+        angles_active_arr = np.asarray(angles_active, dtype=bool)
         if angles_active_arr.any():
             active_angle_idx = angle_indices[angles_active_arr]
             active_angle_hess = angle_hess[angles_active_arr]
             for i in range(len(active_angle_idx)):
-                hessians.append(SparseInternalHessian(n_atoms, active_angle_idx[i], active_angle_hess[i].copy()))
+                hessians.append(SparseInternalHessian(n_atoms, active_angle_idx[i], active_angle_hess[i]))
 
         # Dihedrals (batched)
         dihedral_indices, dihedral_hess = batched['dihedrals']
-        dihedrals_active_arr = np.array(dihedrals_active, dtype=bool)
+        dihedrals_active_arr = np.asarray(dihedrals_active, dtype=bool)
         if dihedrals_active_arr.any():
             active_dih_idx = dihedral_indices[dihedrals_active_arr]
             active_dih_hess = dihedral_hess[dihedrals_active_arr]
             for i in range(len(active_dih_idx)):
-                hessians.append(SparseInternalHessian(n_atoms, active_dih_idx[i], active_dih_hess[i].copy()))
+                hessians.append(SparseInternalHessian(n_atoms, active_dih_idx[i], active_dih_hess[i]))
 
         # Other (not batched)
         for i, (idx, hess) in enumerate(other_data):
             if other_active[i]:
-                hessians.append(SparseInternalHessian(n_atoms, np.array(idx), hess.copy()))
+                hessians.append(SparseInternalHessian(n_atoms, idx, hess))
 
         # Rotations (not batched)
         for i, (idx, hess) in enumerate(rot_data):
             if rot_active[i]:
-                hessians.append(SparseInternalHessian(n_atoms, np.array(idx), hess.copy()))
+                hessians.append(SparseInternalHessian(n_atoms, idx, hess))
 
         result = SparseInternalHessians(hessians, self.ndof)
         self._cache['hessian_result'] = result
