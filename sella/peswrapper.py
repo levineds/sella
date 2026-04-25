@@ -2064,15 +2064,31 @@ class CellInternalPES(InternalPES):
         Ucons = np.zeros((n_total, Ucons_int.shape[1]))
         Ucons[:n_int, :] = Ucons_int
 
-        Unred = np.zeros((n_total, Unred_int.shape[1] + self.n_cell_dof))
-        Unred[:n_int, :Unred_int.shape[1]] = Unred_int
-        Unred[n_int:, Unred_int.shape[1]:] = np.eye(self.n_cell_dof)
+        Unred = self._pad_with_cell_identity(Unred_int)
 
-        Ufree = np.zeros((n_total, Ufree_int.shape[1] + self.n_cell_dof))
-        Ufree[:n_int, :Ufree_int.shape[1]] = Ufree_int
-        Ufree[n_int:, Ufree_int.shape[1]:] = np.eye(self.n_cell_dof)
+        # When there are no constraints, _compute_basis_int returns
+        # ``Ufree is Unred`` (same object). Share the extended array too —
+        # avoids a second ~3 MB slice copy on every call.
+        if Ufree_int is Unred_int:
+            Ufree = Unred
+        else:
+            Ufree = self._pad_with_cell_identity(Ufree_int)
 
         return drdx, Ucons, Unred, Ufree
+
+    def _pad_with_cell_identity(self, M_int):
+        """Build (n_int + n_cell, M_int.shape[1] + n_cell) with M_int and an
+        identity block in the cell-DOF corner. Uses np.empty and explicit
+        zero strips to skip the bulk np.zeros memset for the n_int block
+        that's about to be overwritten anyway."""
+        n_int, n_cols = M_int.shape
+        n_cell = self.n_cell_dof
+        out = np.empty((n_int + n_cell, n_cols + n_cell))
+        out[:n_int, :n_cols] = M_int
+        out[:n_int, n_cols:] = 0
+        out[n_int:, :n_cols] = 0
+        out[n_int:, n_cols:] = np.eye(n_cell)
+        return out
 
     def converged(self, fmax: float, smax: float = None, cmax: float = 1e-5):
         """Check convergence of forces and stress.
