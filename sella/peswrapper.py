@@ -785,12 +785,86 @@ class InternalPES(PES):
 
         Uses fast iterative stepper by default, with ODE fallback for robustness.
         """
+        x0 = self.get_x()
         if self.iterative_stepper:
             res = self._set_x_iterative(target)
             if res is not None:
-                return res
+                self._project_to_constraints()
+                # Recompute realized dx_final to reflect any projection.
+                dx_initial, _, g_final = res
+                dx_final = self.get_x() - x0
+                return dx_initial, dx_final, g_final
         # Fall back to ODE solver
-        return self._set_x_ode(target)
+        res = self._set_x_ode(target)
+        self._project_to_constraints()
+        dx_initial, _, g_final = res
+        dx_final = self.get_x() - x0
+        return dx_initial, dx_final, g_final
+
+    def _project_to_constraints(self, target_tol=1e-7, max_iter=8,
+                                safety_limit=0.05):
+        """Newton projection onto the constraint manifold (IC null-space).
+
+        Drives ``cons.residual()`` to zero with corrections that, to
+        first order, do not change any *free* internal coordinate.
+        This avoids the failure mode of a Cartesian min-norm projection,
+        which would tilt the dummy atom in directions that couple back
+        into the free improper-dihedral bending coordinate.
+
+        Algorithm (one Newton iteration, repeated):
+
+            r       = cons.residual()                          # (ncons,)
+            drdx    = d(cons) / d(int_coords)                   # (ncons, n_int)
+            Ucons   = IC-space basis spanned by constraints     # (n_int, ncons')
+            s       = lstsq(drdx @ Ucons, -r)                   # min-norm in Ucons
+            dq_int  = Ucons @ s                                 # IC-space step
+            dx_cart = Binv @ dq_int                             # back to Cartesian
+
+        Because ``dq_int`` lives entirely in ``Ucons`` (orthogonal to
+        ``Ufree`` in the IC inner product), every free internal — including
+        the improper dihedral that parametrizes a linear-bend — is
+        unchanged to first order. The Cartesian step is the
+        minimum-norm representative of that IC-space step (``Binv`` is
+        the pseudoinverse), so real atoms only move when the
+        constraint *requires* it (e.g. ``FixBondLengths``).
+
+        ``safety_limit`` caps ``|dx_cart|_inf`` per iteration. If the
+        first Newton step would exceed it, we damp by
+        ``safety_limit / |dx|_inf`` and re-iterate. This converges hard
+        cases where the constraint and optimizer are fighting (real
+        atoms must move) without overshooting on a single step.
+        """
+        if not hasattr(self.cons, 'residual'):
+            return
+        if len(self.cons.residual()) == 0:
+            return
+
+        n_real = 3 * len(self.atoms)
+        n_dummy = 3 * len(self.dummies)
+
+        for _ in range(max_iter):
+            r = self.cons.residual()
+            if np.linalg.norm(r, ord=np.inf) < target_tol:
+                return
+
+            # _compute_basis_int returns (drdx, Ucons, Unred, Ufree) for the
+            # internal-only block (no cell DOF). drdx is ncons × n_int in
+            # IC space; Ucons is n_int × ncons'.
+            drdx, Ucons, _, _ = self._compute_basis_int()
+            if Ucons.shape[1] == 0:
+                return  # no constraint subspace — nothing to project
+
+            s, *_ = np.linalg.lstsq(drdx @ Ucons, -r, rcond=None)
+            dq_int = Ucons @ s                       # IC-space step (n_int,)
+            dx = self._get_Binv() @ dq_int            # Cartesian (n_cart,)
+
+            max_step = np.linalg.norm(dx, ord=np.inf)
+            if max_step > safety_limit:
+                dx = dx * (safety_limit / max_step)
+
+            self.atoms.positions += dx[:n_real].reshape(-1, 3)
+            if n_dummy > 0:
+                self.dummies.positions += dx[n_real:n_real + n_dummy].reshape(-1, 3)
 
     def get_x(self):
         x = self.int.calc()
@@ -1853,6 +1927,12 @@ class CellInternalPES(InternalPES):
         # Now update atomic positions to match internal coordinate target
         res = self._set_x_ode_internal(q_target)
 
+        # Project onto constraint manifold (decoupled from trust radius).
+        # Only when ODE succeeded — the InternalPES.set_x fallback below
+        # runs its own projection internally.
+        if res is not None:
+            self._project_to_constraints()
+
         # Get old cell gradient for parallel transport (needed for correct
         # BFGS secant condition on the cell block of the Hessian)
         g_old = self.curr.get('g', None)
@@ -1868,7 +1948,21 @@ class CellInternalPES(InternalPES):
             g_final = np.concatenate([g_int, g_old_cell])
         else:
             dx_int_initial, dx_int_final, g_int = res
-            dx_final = np.concatenate([dx_int_final, cell_target - cell_params0])
+            # Recompute the realized internal-coord displacement to
+            # account for the projection that happened after _set_x_ode_internal.
+            # Unwrap dihedrals against q0 so a 2π branch-cut jump in the
+            # improper dihedral (possible when projection nudges across
+            # ±π) doesn't poison the BFGS secant condition.
+            dx_int_realized = self.int.calc() - q0
+            dih_start = (self.int.ntrans + self.int.nbonds
+                         + self.int.nangles)
+            dih_end = dih_start + self.int.ndihedrals
+            if dih_end > dih_start:
+                dx_int_realized[dih_start:dih_end] = (
+                    (dx_int_realized[dih_start:dih_end] + np.pi)
+                    % (2 * np.pi) - np.pi
+                )
+            dx_final = np.concatenate([dx_int_realized, cell_target - cell_params0])
             g_final = np.concatenate([g_int, g_old_cell])
 
         return dx_initial, dx_final, g_final
