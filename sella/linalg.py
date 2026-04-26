@@ -5,24 +5,10 @@ from itertools import product
 import numpy as np
 
 from sella.hessian_update import update_H
+from sella import _gpu as _gpu_mod
+from sella._gpu import gpu_eigh, gpu_eigh_t, to_gpu
 
 from scipy.sparse.linalg import LinearOperator
-from scipy.linalg import eigh
-
-try:
-    import torch
-    _has_torch = torch.cuda.is_available()
-except ImportError:
-    _has_torch = False
-
-
-def _gpu_eigh(A):
-    """Eigendecomposition on GPU if available, else CPU."""
-    if _has_torch and A.shape[0] >= 200:
-        At = torch.from_numpy(A).cuda()
-        evals_t, evecs_t = torch.linalg.eigh(At)
-        return evals_t.cpu().numpy(), evecs_t.cpu().numpy()
-    return eigh(A)
 
 
 class NumericalHessian(LinearOperator):
@@ -176,14 +162,50 @@ class ApproximateHessian(LinearOperator):
         self._evals = None
         self._evecs = None
         self._eigen_computed = False
+        # Lazy GPU upload of B, shared with downstream consumers
+        # (projection, etc.) so a single (N,N) transfer covers the step.
+        self._B_gpu = None
+        # Cached torch eigvals/eigvecs alongside the numpy versions, so the
+        # GPU-resident TS-BFGS update can read them without re-uploading.
+        self._evals_gpu = None
+        self._evecs_gpu = None
 
         self.set_B(B0)
 
     def _ensure_eigen_computed(self):
-        """Compute eigendecomposition if not already done."""
-        if not self._eigen_computed and self.B is not None:
-            self._evals, self._evecs = _gpu_eigh(self.B)
-            self._eigen_computed = True
+        """Compute eigendecomposition if not already done.
+
+        Prefers the GPU-tensor path when B_gpu is cached so the eigvecs stay
+        on device for downstream consumers (e.g. _MS_TS_BFGS), while still
+        producing the numpy copies the rest of Sella expects.
+        """
+        if self._eigen_computed or self.B is None:
+            return
+        B_gpu = self._get_B_gpu()
+        if B_gpu is not None:
+            evals_t, evecs_t = gpu_eigh_t(B_gpu)
+            if evals_t is not None:
+                self._evals_gpu = evals_t
+                self._evecs_gpu = evecs_t
+                self._evals = evals_t.cpu().numpy()
+                self._evecs = evecs_t.cpu().numpy()
+                self._eigen_computed = True
+                return
+        # CPU fallback (no GPU or OOM)
+        self._evals, self._evecs = gpu_eigh(self.B, A_gpu=None)
+        self._eigen_computed = True
+
+    def _get_B_gpu(self):
+        """Return cached torch tensor of B on GPU, uploading lazily.
+
+        Returns None when no GPU is available, when B is below the size
+        threshold, or when an upload attempt has previously OOM'd.
+        """
+        if self.B is None:
+            return None
+        if self._B_gpu is None and _gpu_mod._gpu_ok(self.B.shape[0]):
+            self._B_gpu = to_gpu(self.B)
+        return self._B_gpu
 
     @property
     def evals(self):
@@ -215,6 +237,9 @@ class ApproximateHessian(LinearOperator):
             self._evals = None
             self._evecs = None
             self._eigen_computed = False
+            self._B_gpu = None
+            self._evals_gpu = None
+            self._evecs_gpu = None
             self.initialized = False
             return
         elif np.isscalar(target):
@@ -225,6 +250,27 @@ class ApproximateHessian(LinearOperator):
         self.B = target
         # Mark eigendecomposition as stale - will recompute on next access
         self._eigen_computed = False
+        # B has changed, so the GPU copies are stale. Don't re-upload eagerly:
+        # _get_B_gpu does it lazily on next read.
+        self._B_gpu = None
+        self._evals_gpu = None
+        self._evecs_gpu = None
+
+    def _set_from_gpu(self, B_numpy, B_gpu):
+        """Install (numpy, torch) copies of B that are already in sync.
+
+        Used by `update()` to avoid the round-trip when the GPU TS-BFGS path
+        produced both a numpy result and the same tensor on device.
+        """
+        assert B_numpy.shape == self.shape
+        self.B = B_numpy
+        self.initialized = True
+        self._B_gpu = B_gpu
+        self._eigen_computed = False
+        self._evals = None
+        self._evecs = None
+        self._evals_gpu = None
+        self._evecs_gpu = None
 
     def update(self, dx, dg):
         """Perform a quasi-Newton update on B"""
@@ -243,10 +289,20 @@ class ApproximateHessian(LinearOperator):
             self.set_B(B)
             return
 
+        # Force GPU eig cache to populate alongside numpy lams/vecs (if a
+        # GPU is available); keeps update_H's GPU path eligible.
         lams, vecs = self.evals, self.evecs
 
-        self.set_B(update_H(B, dx, dg, method=self.update_method,
-                            symm=self.symm, lams=lams, vecs=vecs))
+        result = update_H(B, dx, dg, method=self.update_method,
+                          symm=self.symm, lams=lams, vecs=vecs,
+                          B_gpu=self._B_gpu,
+                          evals_gpu=self._evals_gpu,
+                          evecs_gpu=self._evecs_gpu)
+        if isinstance(result, tuple):
+            Bplus_numpy, Bplus_gpu = result
+            self._set_from_gpu(Bplus_numpy, Bplus_gpu)
+        else:
+            self.set_B(result)
 
     def project(self, U):
         """Project B into the subspace defined by U."""

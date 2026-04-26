@@ -15,21 +15,7 @@ from sella.hessian_update import symmetrize_Y
 from sella.linalg import NumericalHessian, ApproximateHessian
 from sella.eigensolvers import rayleigh_ritz
 from sella.internal import Internals, Constraints, DuplicateInternalError
-
-try:
-    import torch
-    _has_torch = torch.cuda.is_available()
-except ImportError:
-    _has_torch = False
-
-
-def _gpu_qr(A):
-    """Economy QR on GPU if available, else CPU."""
-    if _has_torch and A.shape[0] >= 200:
-        At = torch.from_numpy(np.ascontiguousarray(A)).cuda()
-        Q_t, R_t = torch.linalg.qr(At, mode='reduced')
-        return Q_t.cpu().numpy(), R_t.cpu().numpy()
-    return np.linalg.qr(A, mode='reduced')
+from sella._gpu import gpu_qr as _gpu_qr, gpu_project
 
 
 class _LRU2:
@@ -278,13 +264,22 @@ class PES:
         Equivalent to ``self.get_HL().project(U)`` but skips constructing the
         full (dim, dim) HL matrix and the intermediate ApproximateHessian.
         """
-        H_B = self.get_H().B
+        H = self.get_H()
+        H_B = H.B
         if H_B is None:
             Bproj = None
         else:
-            Hc = self.get_Hc()
-            UtH = U.T @ H_B
-            Bproj = UtH @ U - (U.T @ Hc) @ U
+            UtHU = gpu_project(H_B, U, H_gpu=H._get_B_gpu())
+            # Skip the constraint projection entirely when there are no
+            # constraints — Hc is allocated as a (dim, dim) zero block in
+            # CellInternalPES, so the matmul would just churn through ~N^3
+            # zeros (and force a 44 MB GPU upload at 400 atoms).
+            L = self.curr.get('L')
+            if L is not None and L.size > 0:
+                Hc = self.get_Hc()
+                Bproj = UtHU - gpu_project(Hc, U)
+            else:
+                Bproj = UtHU
         n = U.shape[1]
         return ApproximateHessian(n, 0, Bproj, self.H.update_method, self.H.symm)
 
