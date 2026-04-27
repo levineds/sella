@@ -1,7 +1,7 @@
 from typing import Union, Callable
 
 import numpy as np
-from scipy.linalg import eigh, expm, expm_frechet, logm, polar, solve_triangular
+from scipy.linalg import eigh, expm, expm_frechet, logm, polar, qr, solve_triangular
 from scipy.integrate import LSODA
 from ase import Atoms
 from ase.build import niggli_reduce
@@ -43,6 +43,27 @@ class _LRU2:
                 return
         self._entries[self._next] = (key, value)
         self._next = 1 - self._next
+
+
+def _split_cons_subspace(drdxnred, tol_factor=1e-6):
+    """Split (n_int) into Ucons (rowspace of drdxnred) and Ufree (its complement).
+
+    Replaces ``np.linalg.svd(drdxnred)`` (which materializes a full
+    n_int×n_int V matrix) with rank-revealing QR on ``drdxnred.T``.
+    For an (m, n) drdxnred with m << n, this is roughly half the cost of
+    the SVD path and returns the same orthonormal subspaces (column order
+    differs but the spans match — every downstream consumer is column-
+    permutation-invariant).
+
+    Returns ``(Ucons, Ufree)`` of shapes (n, ncons) and (n, n - ncons).
+    """
+    Q, R, _ = qr(drdxnred.T, mode='full', pivoting=True, check_finite=False)
+    diag = np.abs(np.diag(R))
+    if diag.size and diag[0] > 0:
+        ncons = int(np.sum(diag > tol_factor * diag[0]))
+    else:
+        ncons = 0
+    return Q[:, :ncons], Q[:, ncons:]
 
 
 def _niggli_hessian_transform(atoms, orig_cell, exp_cell_factor, cell_mask):
@@ -297,10 +318,7 @@ class PES:
             return cached
 
         drdx = self.get_drdx()
-        U, S, VT = np.linalg.svd(drdx)
-        ncons = np.sum(S > 1e-6)
-        Ucons = VT[:ncons].T
-        Ufree = VT[ncons:].T
+        Ucons, Ufree = _split_cons_subspace(drdx)
         Unred = np.eye(self.dim)
         result = (drdx, Ucons, Unred, Ufree)
 
@@ -624,7 +642,7 @@ class InternalPES(PES):
             ncart = 3 * len(self.atoms) + (3 * len(self.dummies) if self.dummies else 0)
             Binv = np.empty((ncart, 0))
         elif R.shape[0] == R.shape[1]:
-            Binv = solve_triangular(R, Q.T)
+            Binv = solve_triangular(R, Q.T, check_finite=False)
         else:
             # Non-square R from rank-deficient SVD fallback — Binv should
             # already have been cached by _get_jacobian_qr, but recompute
@@ -974,17 +992,16 @@ class InternalPES(PES):
             if R.shape[0] == R.shape[1]:
                 # Full rank: cons_jac @ R^{-1} via triangular solve
                 drdxnred = solve_triangular(
-                    R.T, cons_jac.T, lower=True
+                    R.T, cons_jac.T, lower=True, check_finite=False
                 ).T
             else:
                 # Rank-deficient (SVD fallback in _get_jacobian_qr)
                 Binv = self._get_Binv()
                 drdxnred = cons_jac @ (Binv @ Q)
             drdx = drdxnred @ Q.T
-            Uc, Sc, VTc = np.linalg.svd(drdxnred)
-            ncons = np.sum(Sc > 1e-6)
-            Ucons = Unred @ VTc[:ncons].T
-            Ufree = Unred @ VTc[ncons:].T
+            Vcons, Vfree = _split_cons_subspace(drdxnred)
+            Ucons = Unred @ Vcons
+            Ufree = Unred @ Vfree
         return drdx, Ucons, Unred, Ufree
 
     def _calc_basis(self, internal=None, cons=None):
@@ -1010,10 +1027,9 @@ class InternalPES(PES):
             else:
                 drdxnred = cons_jac @ Vnred @ Siinv
                 drdx = drdxnred @ Unred.T
-                Uc, Sc, VTc = np.linalg.svd(drdxnred)
-                ncons = np.sum(Sc > 1e-6)
-                Ucons = Unred @ VTc[:ncons].T
-                Ufree = Unred @ VTc[ncons:].T
+                Vcons, Vfree = _split_cons_subspace(drdxnred)
+                Ucons = Unred @ Vcons
+                Ufree = Unred @ Vfree
             return drdx, Ucons, Unred, Ufree
 
         # Subclasses (CellInternalPES) cache the cell-extended form themselves
