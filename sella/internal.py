@@ -454,7 +454,7 @@ class Internal(Coordinate):
         """
         ncvecs = jnp.asarray(self.kwargs['ncvecs'], dtype=np.float64)
         cell = jnp.asarray(
-            atoms.cell.array if hasattr(atoms.cell, 'array') else np.asarray(atoms.cell),
+            atoms.cell.array,
             dtype=np.float64
         )
         pos = jnp.asarray(atoms.positions[self.indices], dtype=np.float64)
@@ -627,7 +627,7 @@ class Rotation(Coordinate):
             return False
         if set(self.indices) != set(other.indices):
             return False
-        if np.any(self.kwargs['refpos'] != other.kwargs['refpos']):
+        if not np.allclose(self.kwargs['refpos'], other.kwargs['refpos']):
             return False
         return True
 
@@ -659,7 +659,7 @@ class Displacement(Coordinate):
     def __eq__(self, other: Coordinate) -> bool:
         if not Coordinate.__eq__(self, other):
             return False
-        return np.all(self.kwargs['refpos'] == other.kwargs['refpos'])
+        return np.allclose(self.kwargs['refpos'], other.kwargs['refpos'])
 
     _eval0 = staticmethod(jit(_displacement))
     _eval1 = staticmethod(jit(_gradient(_displacement)))
@@ -813,6 +813,10 @@ class BaseInternals:
         # Batched arrays for vectorized computation (built lazily)
         self._batched_arrays_valid = False
 
+        # Lazy caches.
+        self._tvecs_cache = None  # set to {'cell_hash': ..., 'tvecs': ...} on first build
+        self._hvp_buf = None  # reusable buffer for hessian_rdot output
+
     @property
     def natoms(self) -> int:
         return self._natoms
@@ -878,7 +882,7 @@ class BaseInternals:
     @property
     def light_atoms(self) -> LightAtoms:
         """Get lightweight atoms-like object for coordinate calculations."""
-        cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+        cell = self.atoms.cell.array
         return LightAtoms(self.all_positions, cell)
 
     def _cache_check(self) -> None:
@@ -1073,7 +1077,7 @@ class BaseInternals:
         Returns both unpadded tvecs (for indexing) and padded tvecs (for batch ops).
         """
         cell_hash = cell.tobytes()
-        if hasattr(self, '_tvecs_cache') and self._tvecs_cache.get('cell_hash') == cell_hash:
+        if self._tvecs_cache is not None and self._tvecs_cache['cell_hash'] == cell_hash:
             return self._tvecs_cache['tvecs']
 
         self._build_batched_arrays()
@@ -1273,7 +1277,7 @@ class BaseInternals:
         self._cache_check()
         if 'coords' not in self._cache:
             positions = self.all_positions
-            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+            cell = self.atoms.cell.array
 
             # Use vectorized computation for bonds, angles, dihedrals
             batched_vals = self._compute_batched_values(positions, cell)
@@ -1322,7 +1326,7 @@ class BaseInternals:
 
         if 'jacobian' not in self._cache:
             positions = self.all_positions
-            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+            cell = self.atoms.cell.array
 
             # Use vectorized computation for bonds, angles, dihedrals
             batched_grads = self._compute_batched_gradients(positions, cell)
@@ -1457,7 +1461,7 @@ class BaseInternals:
 
         if 'cell_jacobian' not in self._cache:
             positions = self.all_positions
-            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+            cell = self.atoms.cell.array
 
             # Compute batched cell gradients for bonds, angles, dihedrals
             cell_grads = self._compute_batched_cell_gradients(positions, cell)
@@ -1536,7 +1540,7 @@ class BaseInternals:
 
         if 'hessian' not in self._cache:
             positions = self.all_positions
-            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+            cell = self.atoms.cell.array
 
             # Use vectorized computation for bonds, angles, dihedrals
             batched_hess = self._compute_batched_hessians(positions, cell)
@@ -1661,7 +1665,7 @@ class BaseInternals:
         """
         self._cache_check()
         positions = self.all_positions
-        cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+        cell = self.atoms.cell.array
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
 
@@ -1701,7 +1705,7 @@ class BaseInternals:
             data = self._csr_data
             data[:] = 0
         else:
-            if (not hasattr(self, '_hvp_buf') or self._hvp_buf is None
+            if (self._hvp_buf is None
                     or self._hvp_buf.shape != (n_active, ndof)):
                 self._hvp_buf = np.zeros((n_active, ndof))
             out = self._hvp_buf
@@ -1879,8 +1883,7 @@ class BaseInternals:
         """
         self._cache_check()
         positions = self.all_positions
-        cell = (self.atoms.cell.array if hasattr(self.atoms.cell, 'array')
-                else np.asarray(self.atoms.cell))
+        cell = self.atoms.cell.array
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
 
@@ -2071,7 +2074,7 @@ class BaseInternals:
 
     def _get_neighbors(self, dx: np.ndarray) -> Iterator[np.ndarray]:
         pbc = self.atoms.pbc
-        if self.cell is None or not np.all(self.cell == self.atoms.cell):
+        if self.cell is None or not np.allclose(self.cell, self.atoms.cell):
             self.cell = self.atoms.cell.array.copy()
             rcell, self.op = minkowski_reduce(
                 complete_cell(self.cell), pbc=pbc
@@ -2706,7 +2709,7 @@ class Internals(BaseInternals):
         pbc = self.atoms.pbc
 
         # Ensure cell/rcell/op are cached
-        if self.cell is None or not np.all(self.cell == self.atoms.cell):
+        if self.cell is None or not np.allclose(self.cell, self.atoms.cell):
             self.cell = self.atoms.cell.array.copy()
             rcell, self.op = minkowski_reduce(
                 complete_cell(self.cell), pbc=pbc
@@ -3149,7 +3152,7 @@ class Internals(BaseInternals):
         self._build_batched_arrays()
         if self._n_angles_actual > 0:
             positions = self.all_positions
-            cell = self.atoms.cell.array if hasattr(self.atoms.cell, 'array') else np.asarray(self.atoms.cell)
+            cell = self.atoms.cell.array
             tvecs = self._get_cached_tvecs(cell)
             angle_pos = positions[self._angle_indices_padded]
             angle_vals_padded = np.asarray(_angle_value_batched(angle_pos, tvecs['angles_padded']))

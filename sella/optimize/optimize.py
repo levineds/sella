@@ -202,6 +202,10 @@ class Sella(Optimizer):
         self.initialized = False
         self.xi = 1.
         self.nsteps_per_diag = nsteps_per_diag
+
+        # Set by run() / first converged() call.
+        self.fmax = None
+        self._last_converged = None
         self.nsteps_since_diag = 0
         self.diag_every_n = np.inf if diag_every_n is None else diag_every_n
 
@@ -392,7 +396,7 @@ class Sella(Optimizer):
 
         # Update trust radius
         if rho is not None:
-            if self.optimize_cell and hasattr(self.pes, 'n_internal'):
+            if self.optimize_cell and isinstance(self.pes, CellInternalPES):
                 n_int = self.pes.n_internal
                 smag_int = np.max(np.abs(s[:n_int])) if n_int > 0 else 0
                 smag_cell = np.max(np.abs(s[n_int:])) if len(s) > n_int else 0
@@ -421,8 +425,8 @@ class Sella(Optimizer):
             self.rho = 1.
 
     def converged(self, forces=None):
-        # fmax might be None if converged() is called before run()
-        fmax = getattr(self, 'fmax', None) or 0.05  # Default threshold
+        # fmax may still be None if converged() is called before run()
+        fmax = self.fmax if self.fmax is not None else 0.05  # Default threshold
         if self.optimize_cell:
             smax = self.smax if self.smax is not None else fmax
             result = self.pes.converged(fmax, smax=smax)
@@ -437,7 +441,7 @@ class Sella(Optimizer):
             return
         if self.optimize_cell:
             smax = self.smax if self.smax is not None else self.fmax
-            result = getattr(self, '_last_converged', None)
+            result = self._last_converged
             if result is None or len(result) != 4:
                 result = self.pes.converged(self.fmax, smax=smax)
             _, fmax, cmax, smax_actual = result
@@ -457,7 +461,7 @@ class Sella(Optimizer):
                                        cmax, self.delta, self.delta_cell,
                                        self.rho))
         else:
-            result = getattr(self, '_last_converged', None)
+            result = self._last_converged
             if result is None or len(result) != 3:
                 result = self.pes.converged(self.fmax)
             _, fmax, cmax = result

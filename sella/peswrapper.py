@@ -1757,7 +1757,7 @@ class CellInternalPES(InternalPES):
         q = self.int.calc()  # Internal coordinates
 
         # During parent initialization, return only internal coords
-        if getattr(self, '_initializing', True):
+        if self._initializing:
             return q
 
         cell_params = self._masked_cell_params()  # Cell DOF
@@ -2602,7 +2602,7 @@ class CellCartesianPES(PES):
         x_cart = self.apos.ravel().copy()
 
         # During parent initialization, return only Cartesian coords
-        if getattr(self, '_initializing', True):
+        if self._initializing:
             return x_cart
 
         cell_params = self._masked_cell_params()
