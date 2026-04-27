@@ -23,7 +23,8 @@ import jax.numpy as jnp
 from jax import jit, grad, jacfwd, jacrev, custom_jvp, vmap, jvp, device_get
 
 from sella.linalg import (
-    SparseInternalJacobian, SparseInternalHessian, SparseInternalHessians
+    SparseInternalJacobian, SparseInternalHessian, SparseInternalHessians,
+    SparseInternalHessiansSkeleton
 )
 
 
@@ -870,10 +871,20 @@ class BaseInternals:
 
     @property
     def all_positions(self) -> np.ndarray:
-        """Get combined positions without creating an Atoms object."""
-        if self.ndummies > 0:
-            return np.vstack([self.atoms.positions, self.dummies.positions])
-        return self.atoms.positions
+        """Get combined positions without creating an Atoms object.
+
+        Cached on ``self._cache['all_positions']`` so repeated reads
+        within a single position evaluation reuse the same vstack.
+        ``_cache_check`` clears the cache whenever positions change.
+        """
+        if self.ndummies == 0:
+            return self.atoms.positions
+        cached = self._cache.get('all_positions')
+        if cached is not None:
+            return cached
+        merged = np.vstack([self.atoms.positions, self.dummies.positions])
+        self._cache['all_positions'] = merged
+        return merged
 
     @property
     def all_atoms(self) -> Atoms:
@@ -890,7 +901,10 @@ class BaseInternals:
         # the last time a property was calculated. These positions are floats,
         # but we use a strict equality check to compare to avoid subtle bugs
         # that might occur during fine-resolution geodesic steps.
-        current_pos = self.all_positions
+        if self.ndummies == 0:
+            current_pos = self.atoms.positions
+        else:
+            current_pos = np.vstack([self.atoms.positions, self.dummies.positions])
         if (
             self._lastpos is None
             or np.any(current_pos != self._lastpos)
@@ -898,6 +912,10 @@ class BaseInternals:
             self._cache = dict()
             self._lastpos = current_pos.copy()
             self._cache_version += 1
+        # Park the freshly-merged positions in the cache so the next
+        # all_positions access doesn't redo the vstack.
+        if self.ndummies > 0:
+            self._cache.setdefault('all_positions', self._lastpos)
 
     def _build_batched_arrays(self) -> None:
         """Build batched index arrays for vectorized computation.
@@ -1530,6 +1548,28 @@ class BaseInternals:
         # Flatten cell matrix to 9-element vector (row-major order)
         return B_cell.reshape((n_active, 9))
 
+    def _get_hessian_skeleton(self, hessians):
+        """Return a cached SparseInternalHessiansSkeleton for ``hessians``.
+
+        The skeleton holds index-derived data (per-size groupings, scatter
+        indices) that depend only on which coordinates exist and which
+        atom indices they touch — not on positions or Hessian values. We
+        invalidate by total coord count + active mask, which jointly
+        cover the mutation paths: ``add_dummy_to_internals`` /
+        ``find_all_*`` / ``check_for_bad_internals`` regenerations grow
+        ``self.internals``, while ``apply_inequalities`` /
+        ``validate_inequalities`` flip ``self._active``.
+        """
+        key = (len(hessians), self.natoms + self.ndummies,
+               tuple(self._active_mask))
+        cached = getattr(self, '_hessian_skeleton', None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        skeleton = SparseInternalHessiansSkeleton(hessians,
+                                                  self.natoms + self.ndummies)
+        self._hessian_skeleton = (key, skeleton)
+        return skeleton
+
     def hessian(self) -> np.ndarray:
         """Calculates the Hessian matrix for each internal coordinate using vectorized operations."""
         self._cache_check()
@@ -1644,7 +1684,8 @@ class BaseInternals:
             if rot_active[i]:
                 hessians.append(SparseInternalHessian(n_atoms, idx, hess))
 
-        result = SparseInternalHessians(hessians, self.ndof)
+        result = SparseInternalHessians(hessians, self.ndof,
+                                        skeleton=self._get_hessian_skeleton(hessians))
         self._cache['hessian_result'] = result
         return result
 

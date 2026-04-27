@@ -468,86 +468,125 @@ class SparseInternalHessian(LinearOperator):
 # Uses np.einsum for batched matrix-vector products and np.add.at for scatter.
 # =============================================================================
 
-class SparseInternalHessians:
-    def __init__(
-        self,
-        hessians: List[SparseInternalHessian],
-        ndof: int
-    ):
-        self.hessians = hessians
-        self.natoms = ndof // 3
-        self.shape = (len(self.hessians), ndof, ndof)
-        # Pre-compute batched data structures for vectorized operations
-        self._prepare_batched_data()
+class SparseInternalHessiansSkeleton:
+    """Index-only data for SparseInternalHessians.
 
-    def _prepare_batched_data(self):
-        """Pre-compute index arrays for vectorized ldot and rdot operations."""
-        # Group hessians by size (number of atoms involved)
+    Holds the per-size groupings, atom-index arrays, and pre-computed flat
+    indices used by ldot/rdot. These derive only from the per-coord
+    ``indices`` and the global ``natoms`` — neither depends on the
+    coordinate Hessian *values* or atomic positions, so the skeleton can
+    be cached across optimizer steps and reused as long as the active
+    set of internal coordinates is unchanged.
+    """
+
+    def __init__(self, hessians: List[SparseInternalHessian], natoms: int):
+        self.natoms = natoms
+        self.n_hess = len(hessians)
+
+        # Group hessians by size (number of atoms involved).
         by_size = {}
-        for i, h in enumerate(self.hessians):
+        for i, h in enumerate(hessians):
             n = len(h.indices)
             if n not in by_size:
-                by_size[n] = {'orig_idx': [], 'indices': [], 'vals': []}
+                by_size[n] = {'orig_idx': [], 'indices': []}
             by_size[n]['orig_idx'].append(i)
             by_size[n]['indices'].append(h.indices)
-            by_size[n]['vals'].append(h.vals)
 
-        # Pre-compute the 3x3 index mesh for ldot
         i_idx, j_idx = np.meshgrid(np.arange(3), np.arange(3), indexing='ij')
         i_flat = i_idx.ravel()
         j_flat = j_idx.ravel()
 
-        self._batched_rdot = {}
-        self._batched_ldot = {}
+        # rdot only needs orig_idx + per-coord atom indices; vals are
+        # filled in per call by SparseInternalHessians.
+        self.rdot_meta = {}
+        # ldot also needs the precomputed flat 1D scatter index.
+        self.ldot_meta = {}
 
         for size, data in by_size.items():
             orig_idx = np.array(data['orig_idx'])
             indices = np.array(data['indices'])  # (batch, size)
-            vals = np.array(data['vals'])  # (batch, size, 3, size, 3)
             batch = len(orig_idx)
 
-            # For rdot: prepare gather/scatter indices
-            self._batched_rdot[size] = {
+            self.rdot_meta[size] = {
                 'orig_idx': orig_idx,
                 'indices': indices,
-                'vals': vals,
             }
 
-            # For ldot: prepare fully expanded index arrays
             n_pairs = size * size
-
-            # Create atom pair indices
             a_local, b_local = np.meshgrid(np.arange(size), np.arange(size), indexing='ij')
             a_local = a_local.ravel()
             b_local = b_local.ravel()
 
-            # Map to actual atom indices for each batch
             row_atoms = indices[:, a_local]  # (batch, size*size)
             col_atoms = indices[:, b_local]
-
-            # Expand for 3x3 blocks
             row_atoms = np.repeat(row_atoms, 9, axis=1)  # (batch, size*size*9)
             col_atoms = np.repeat(col_atoms, 9, axis=1)
             i_full = np.tile(i_flat, (batch, n_pairs))
             j_full = np.tile(j_flat, (batch, n_pairs))
 
-            # Reorder vals: (batch, size, 3, size, 3) -> (batch, size*size*9)
-            vals_reordered = vals.transpose(0, 1, 3, 2, 4)  # (batch, size, size, 3, 3)
-            vals_flat = vals_reordered.reshape(batch, -1)
-
             # Pre-compute the flat 1D index used by the bincount-based ldot.
-            # M is (natoms, 3, natoms, 3); flat index = ((row*3 + i)*natoms + col)*3 + j.
+            # M is (natoms, 3, natoms, 3); flat index =
+            # ((row*3 + i)*natoms + col)*3 + j.
             linear_idx = ((row_atoms.ravel() * 3 + i_full.ravel())
-                          * self.natoms + col_atoms.ravel()) * 3 + j_full.ravel()
+                          * natoms + col_atoms.ravel()) * 3 + j_full.ravel()
 
+            self.ldot_meta[size] = {
+                'orig_idx': orig_idx,
+                'linear_idx': linear_idx,
+                'batch': batch,
+                'n_pairs': n_pairs,
+            }
+
+
+class SparseInternalHessians:
+    def __init__(
+        self,
+        hessians: List[SparseInternalHessian],
+        ndof: int,
+        skeleton: 'SparseInternalHessiansSkeleton' = None,
+    ):
+        self.hessians = hessians
+        self.natoms = ndof // 3
+        self.shape = (len(self.hessians), ndof, ndof)
+
+        if skeleton is None:
+            skeleton = SparseInternalHessiansSkeleton(hessians, self.natoms)
+        elif skeleton.n_hess != len(hessians) or skeleton.natoms != self.natoms:
+            raise ValueError(
+                "skeleton was built for a different (n_hess, natoms); "
+                f"got skeleton ({skeleton.n_hess}, {skeleton.natoms}) vs "
+                f"this ({len(hessians)}, {self.natoms})"
+            )
+        self._skeleton = skeleton
+        self._build_value_views()
+
+    def _build_value_views(self):
+        """Stitch fresh per-coord vals onto the cached skeleton.
+
+        ``vals_flat`` is rebuilt on every call (it tracks atomic positions
+        via the per-coord Hessian values), but the index arrays are reused
+        from the skeleton.
+        """
+        hessians = self.hessians
+        self._batched_rdot = {}
+        self._batched_ldot = {}
+        for size, meta in self._skeleton.rdot_meta.items():
+            orig_idx = meta['orig_idx']
+            # Stack the current Hessian values for this size group.
+            vals = np.array([hessians[i].vals for i in orig_idx])
+            self._batched_rdot[size] = {
+                'orig_idx': orig_idx,
+                'indices': meta['indices'],
+                'vals': vals,
+            }
+            ldot_meta = self._skeleton.ldot_meta[size]
+            # Reorder vals: (batch, size, 3, size, 3) -> (batch, size*size*9)
+            vals_reordered = vals.transpose(0, 1, 3, 2, 4)
+            vals_flat = vals_reordered.reshape(ldot_meta['batch'], -1)
             self._batched_ldot[size] = {
                 'orig_idx': orig_idx,
                 'vals_flat': vals_flat,
-                'row_atoms': row_atoms,
-                'col_atoms': col_atoms,
-                'i_full': i_full,
-                'j_full': j_full,
-                'linear_idx': linear_idx,
+                'linear_idx': ldot_meta['linear_idx'],
             }
 
     def asarray(self) -> np.ndarray:
