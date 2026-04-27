@@ -27,8 +27,10 @@ class BaseRestrictedStep:
         self.d1 = d1
         g0 = self.pes.get_g()
 
-        if W is None:
-            W = np.eye(len(g0))
+        # W defaults to the identity, in which case Ufree.T @ W == Ufree.T.
+        # Skip allocating an n_dof x n_dof eye for the (very common)
+        # default case to avoid quadratic zero-fill on large systems.
+        self._W_is_identity = (W is None)
 
         self.scons = self.pes.get_scons()
         # TODO: Should this be HL instead of H?
@@ -45,7 +47,10 @@ class BaseRestrictedStep:
             self.stepper = NaiveStepper(dx)
             self.scons[:] *= 0
         else:
-            self.P = self.pes.get_Ufree().T @ W
+            if self._W_is_identity:
+                self.P = self.pes.get_Ufree().T
+            else:
+                self.P = self.pes.get_Ufree().T @ W
             d1 = self.d1
             if d1 is not None:
                 d1 = np.linalg.lstsq(self.P.T, d1, rcond=None)[0]
@@ -198,18 +203,7 @@ class MaxInternalStep(BaseRestrictedStep):
         BaseRestrictedStep.__init__(self, pes, *args, **kwargs)
 
     def cons(self, s, dsda=None):
-        w = np.array(
-            [self.wx] * self.pes.int.ntrans
-            + [self.wb] * self.pes.int.nbonds
-            + [self.wa] * self.pes.int.nangles
-            + [self.wd] * self.pes.int.ndihedrals
-            + [self.wo] * self.pes.int.nother
-            + [self.wx] * self.pes.int.nrotations
-        )
-        # Add cell DOF weights if present
-        n_cell_dof = getattr(self.pes, 'n_cell_dof', 0)
-        if n_cell_dof > 0:
-            w = np.concatenate([w, [self.wc] * n_cell_dof])
+        w = self._get_weights()
         assert len(w) == len(s)
 
         sw = np.abs(s * w)
@@ -219,6 +213,33 @@ class MaxInternalStep(BaseRestrictedStep):
         if dsda is None:
             return val
         return val, np.sign(s[idx]) * dsda[idx] * w[idx]
+
+    def _get_weights(self):
+        """Build the per-DOF weight vector. Cached against
+        (counts, weights, n_cell_dof) so the np.array construction
+        only runs once per restricted-step instance."""
+        cached = getattr(self, '_weights_cache', None)
+        n_cell_dof = getattr(self.pes, 'n_cell_dof', 0)
+        key = (
+            self.pes.int.ntrans, self.pes.int.nbonds,
+            self.pes.int.nangles, self.pes.int.ndihedrals,
+            self.pes.int.nother, self.pes.int.nrotations,
+            n_cell_dof,
+        )
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        w = np.array(
+            [self.wx] * self.pes.int.ntrans
+            + [self.wb] * self.pes.int.nbonds
+            + [self.wa] * self.pes.int.nangles
+            + [self.wd] * self.pes.int.ndihedrals
+            + [self.wo] * self.pes.int.nother
+            + [self.wx] * self.pes.int.nrotations
+        )
+        if n_cell_dof > 0:
+            w = np.concatenate([w, [self.wc] * n_cell_dof])
+        self._weights_cache = (key, w)
+        return w
 
 
 _all_restricted_step = [TrustRegion, RestrictedAtomicStep, MaxInternalStep]
