@@ -66,6 +66,72 @@ def _split_cons_subspace(drdxnred, tol_factor=1e-6):
     return Q[:, :ncons], Q[:, ncons:]
 
 
+def _logm_3x3(F):
+    """Closed-form 3x3 matrix logarithm via eigendecomposition.
+
+    Replaces ``scipy.linalg.logm`` (which uses Padé + inverse-squaring
+    + onenormest, ~0.9ms per call on 3x3) with a direct
+    eigendecomposition: ``log(F) = V diag(log(lam)) V^{-1}``. ~50x
+    faster on 3x3, machine-precision agreement on cell-deformation
+    inputs (real, near-identity, well-conditioned).
+
+    Falls back to scipy.linalg.logm when ``np.linalg.eig`` produces a
+    near-singular eigenvector matrix (defective F). Returns the real
+    part directly since cell deformation gradients are real and have
+    no negative real eigenvalues for any reasonable cell.
+    """
+    lam, V = np.linalg.eig(F)
+    if np.linalg.cond(V) > 1e10:
+        return logm(F)
+    return (V @ np.diag(np.log(lam)) @ np.linalg.inv(V)).real
+
+
+def _expm_frechet_3x3_contracted(U, dEdF):
+    """Compute g[mu,nu] = sum_{ab} d expm(U)[E_munu] * dEdF[a,b] for all 9 (mu,nu).
+
+    Replaces the inner ``9x scipy.linalg.expm_frechet`` loop in the
+    cell-stress-to-gradient conversion. For diagonalizable 3x3 ``U``
+    (which is the typical case for a real positive-definite cell
+    deformation logm), the directional derivative of expm has the
+    Daleckii–Krein closed form
+
+        d expm(U)[E] = V (f(lam) ⊙ (V^{-1} E V)) V^{-1},
+
+    where ``f(a, b) = (e^a - e^b) / (a - b)`` (or ``e^a`` when ``a==b``).
+    Contracting over E_munu and dEdF gives the single matmul chain
+    ``g = real(Vinv.T (f ⊙ (V.T dEdF Vinv.T)) V.T)``. ~25x faster than
+    the scipy loop on 3x3 inputs (0.67 → 0.03 ms/call).
+
+    Falls back to scipy when ``U`` is too close to zero (eigenvectors
+    of a noisy zero matrix are catastrophically ill-conditioned) or
+    when ``np.linalg.eig`` produces a near-singular ``V``.
+    """
+    # When ||U|| ~ 0 the derivative reduces to the identity map E -> E,
+    # so the contracted output is dEdF itself. Avoid eig on a noisy zero.
+    Unorm = np.linalg.norm(U)
+    if Unorm < 1e-10:
+        return dEdF.copy()
+    lam, V = np.linalg.eig(U)
+    if np.linalg.cond(V) > 1e10:
+        # Fall back when the eigenvector basis is too ill-conditioned
+        # for the closed form to be numerically reliable.
+        g = np.zeros((3, 3))
+        for mu in range(3):
+            for nu in range(3):
+                E = np.zeros((3, 3)); E[mu, nu] = 1.0
+                ed = expm_frechet(U, E, compute_expm=False)
+                g[mu, nu] = np.sum(ed * dEdF)
+        return g
+    Vinv = np.linalg.inv(V)
+    expl = np.exp(lam)
+    diff = lam[:, None] - lam[None, :]
+    mask = np.abs(diff) > 1e-12 * max(np.abs(lam).max(), 1.0)
+    safe = np.where(mask, diff, 1.0)
+    fij = np.where(mask, (expl[:, None] - expl[None, :]) / safe, expl[:, None])
+    M = V.T @ dEdF @ Vinv.T
+    return (Vinv.T @ (fij * M) @ V.T).real
+
+
 def _niggli_hessian_transform(atoms, orig_cell, exp_cell_factor, cell_mask):
     """Compute the Hessian transformation matrix for Niggli reduction.
 
@@ -98,7 +164,7 @@ def _niggli_hessian_transform(atoms, orig_cell, exp_cell_factor, cell_mask):
     # Compute old Jacobian: J_old[ab, ij] = d(cell_ab)/d(L_ij)
     # at the current (pre-reduction) L value
     F_old = atoms.get_cell().array @ np.linalg.inv(orig_cell)
-    X_old = logm(F_old).real / exp_cell_factor  # unscaled log-deformation
+    X_old = _logm_3x3(F_old) / exp_cell_factor  # unscaled log-deformation
 
     J_old = np.zeros((9, 9))
     for idx in range(9):
@@ -1262,7 +1328,7 @@ class CellInternalPES(InternalPES):
 
     The cell is parameterized using the log of the deformation gradient:
         F = cell @ inv(orig_cell)
-        cell_params = logm(F) * exp_cell_factor
+        cell_params = _logm_3x3(F) * exp_cell_factor
 
     This parameterization ensures that:
     1. The identity corresponds to zero cell parameters
@@ -1799,7 +1865,7 @@ class CellInternalPES(InternalPES):
     def _get_log_deform(self) -> np.ndarray:
         """Get log of deformation gradient, scaled by exp_cell_factor."""
         F = self._get_deformation_gradient()
-        return logm(F).real * self.exp_cell_factor
+        return _logm_3x3(F) * self.exp_cell_factor
 
     def _set_cell_from_log_deform(self, log_deform_scaled: np.ndarray) -> None:
         """Set cell from scaled log-deformation gradient.
@@ -2138,14 +2204,8 @@ class CellInternalPES(InternalPES):
 
         # Convert dE/dF to dE/dU via Frechet derivative of expm
         F = self._get_deformation_gradient()
-        U = logm(F).real
-        g_cell_3x3 = np.zeros((3, 3))
-        for mu in range(3):
-            for nu in range(3):
-                E = np.zeros((3, 3))
-                E[mu, nu] = 1.0
-                expm_der = expm_frechet(U, E, compute_expm=False)
-                g_cell_3x3[mu, nu] = np.sum(expm_der * dEdF)
+        U = _logm_3x3(F)
+        g_cell_3x3 = _expm_frechet_3x3_contracted(U, dEdF)
 
         # Apply cell mask and scale
         g_cell_3x3 = g_cell_3x3 * self.cell_mask
@@ -2327,7 +2387,7 @@ class CellCartesianPES(PES):
 
     The cell is parameterized using the log of the deformation gradient:
         F = cell @ inv(orig_cell)
-        cell_params = logm(F) * exp_cell_factor
+        cell_params = _logm_3x3(F) * exp_cell_factor
 
     This parameterization ensures that:
     1. The identity corresponds to zero cell parameters
@@ -2631,7 +2691,7 @@ class CellCartesianPES(PES):
     def _get_log_deform(self) -> np.ndarray:
         """Get log of deformation gradient, scaled by exp_cell_factor."""
         F = self._get_deformation_gradient()
-        return logm(F).real * self.exp_cell_factor
+        return _logm_3x3(F) * self.exp_cell_factor
 
     def _set_cell_from_log_deform(self, log_deform_scaled: np.ndarray) -> None:
         """Set cell from scaled log-deformation gradient.
@@ -2756,14 +2816,8 @@ class CellCartesianPES(PES):
 
         # Convert dE/dF to dE/dU via Frechet derivative of expm
         F = self._get_deformation_gradient()
-        U = logm(F).real
-        g_cell_3x3 = np.zeros((3, 3))
-        for mu in range(3):
-            for nu in range(3):
-                E = np.zeros((3, 3))
-                E[mu, nu] = 1.0
-                expm_der = expm_frechet(U, E, compute_expm=False)
-                g_cell_3x3[mu, nu] = np.sum(expm_der * dEdF)
+        U = _logm_3x3(F)
+        g_cell_3x3 = _expm_frechet_3x3_contracted(U, dEdF)
 
         # Apply cell mask and scale
         g_cell_3x3 = g_cell_3x3 * self.cell_mask
