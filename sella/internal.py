@@ -582,6 +582,85 @@ def _rotation(
     return 2 * q[axis + 1] * asinc(q[0])
 
 
+def _rotation_3axis_masked(
+    pos: jnp.ndarray, refpos: jnp.ndarray, mask: jnp.ndarray
+) -> jnp.ndarray:
+    """All 3 rotation values for one fragment, padded + masked.
+
+    Returns an array of length 3 (one value per rotation axis). The
+    fragment is assumed centered: ``refpos`` is already the centered
+    reference, padded rows are zero. ``mask`` is 1 on real atoms and 0
+    on padding so the centroid divides by the actual atom count.
+    """
+    pos_eff = pos * mask[:, None]
+    natoms = jnp.sum(mask)
+    centroid = jnp.sum(pos_eff, axis=0) / natoms
+    dx = (pos - centroid) * mask[:, None]
+    refpos_centered = refpos * mask[:, None]
+    R = dx.T @ refpos_centered
+    Rtr = jnp.trace(R)
+    Ftop = jnp.array([R[1, 2] - R[2, 1], R[2, 0] - R[0, 2], R[0, 1] - R[1, 0]])
+    F = jnp.block([
+        [Rtr, Ftop[None, :]],
+        [Ftop[:, None], -Rtr * jnp.eye(3) + R + R.T],
+    ])
+    q = eigh_rightmost(F)
+    q = q * jnp.sign(q[0])
+    a = asinc(q[0])
+    return jnp.stack([2 * q[1] * a, 2 * q[2] * a, 2 * q[3] * a])
+
+
+_rotation_3axis_hess_batched = jit(vmap(
+    jacfwd(jacfwd(_rotation_3axis_masked, argnums=0), argnums=0),
+    in_axes=(0, 0, 0)
+))
+
+
+_rotation_3axis_value_batched = jit(vmap(
+    _rotation_3axis_masked,
+    in_axes=(0, 0, 0)
+))
+
+
+_rotation_3axis_grad_batched = jit(vmap(
+    jacfwd(_rotation_3axis_masked, argnums=0),
+    in_axes=(0, 0, 0)
+))
+
+
+def _rotation_3axis_hvp(pos, refpos, mask, v):
+    """HVP for one fragment, all 3 axes at once.
+
+    Returns shape (3, N, 3) — the directional derivative of the
+    Jacobian (3, N, 3) along v (N, 3).
+    """
+    primals = (pos,)
+    tangents = (v,)
+    _, hvp = jvp(
+        lambda p: jacfwd(_rotation_3axis_masked, argnums=0)(p, refpos, mask),
+        primals, tangents
+    )
+    return hvp
+
+
+_rotation_3axis_hvp_batched_jit = jit(
+    vmap(_rotation_3axis_hvp, in_axes=(0, 0, 0, 0))
+)
+
+
+def _rotation_hess_padded_vmap(positions, refpos_padded, mask):
+    """JIT+vmap'd Hessian for all rotations of one fragment, batched.
+
+    positions: (B, N_max, 3) — fragment positions, padded
+    refpos_padded: (B, N_max, 3) — fragment refpos, centered+padded
+    mask: (B, N_max) — 1 on real atoms, 0 on padding
+
+    Returns: (B, 3, N_max, 3, N_max, 3) — per-fragment, per-axis, full
+    NxN Hessian with padded rows/cols zeroed out.
+    """
+    return _rotation_3axis_hess_batched(positions, refpos_padded, mask)
+
+
 def _rotation_hvp(
     pos: jnp.ndarray,
     axis: int,
@@ -1321,9 +1400,13 @@ class BaseInternals:
             for coord in self.internals['other']:
                 all_coords.append(coord.calc(atoms))
 
-            # Rotations (not batched - usually few)
-            for coord in self.internals['rotations']:
-                all_coords.append(coord.calc(atoms))
+            # Rotations (batched if all 3 axes present per fragment)
+            rot_vals = self._batched_rotation_values(positions)
+            if rot_vals is None:
+                for coord in self.internals['rotations']:
+                    all_coords.append(coord.calc(atoms))
+            else:
+                all_coords.extend(rot_vals)
 
             self._cache['coords'] = np.array(all_coords)
 
@@ -1355,8 +1438,10 @@ class BaseInternals:
                           for coord in self.internals['translations']]
             other_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
                           for coord in self.internals['other']]
-            rot_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
-                        for coord in self.internals['rotations']]
+            rot_data = self._batched_rotation_gradients(positions)
+            if rot_data is None:
+                rot_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
+                            for coord in self.internals['rotations']]
 
             self._cache['jacobian_batched'] = batched_grads
             self._cache['jacobian_nonbatched'] = (trans_data, other_data, rot_data)
@@ -1548,6 +1633,139 @@ class BaseInternals:
         # Flatten cell matrix to 9-element vector (row-major order)
         return B_cell.reshape((n_active, 9))
 
+    def _rotation_padded_inputs(self, positions: np.ndarray):
+        """Build padded (pos, refpos, mask) batches grouped by fragment.
+
+        Returns ``(pos_pad, ref_pad, mask, frag_indices, frag_axis_slots,
+        valid)`` where:
+          pos_pad/ref_pad shape (n_frags, N_max, 3),
+          mask shape (n_frags, N_max),
+          frag_indices: list of np.array per fragment,
+          frag_axis_slots: list of [axis0_idx, axis1_idx, axis2_idx]
+            per fragment (each entry is the original Rotation index),
+          valid: True if all fragments have all 3 axes.
+        Cached per geometry on ``self._cache``.
+        """
+        cached = self._cache.get('rotation_pad')
+        if cached is not None:
+            return cached
+        rotations = self.internals['rotations']
+        if not rotations:
+            out = (None, None, None, [], [], True)
+            self._cache['rotation_pad'] = out
+            return out
+        groups = {}
+        for i, r in enumerate(rotations):
+            key = (tuple(r.indices), r.kwargs['refpos'].tobytes())
+            slot = groups.setdefault(key, [None, None, None])
+            slot[r.kwargs['axis']] = i
+        if any(None in slot for slot in groups.values()):
+            out = (None, None, None, [], [], False)
+            self._cache['rotation_pad'] = out
+            return out
+        n_frags = len(groups)
+        n_max = max(len(r.indices) for r in rotations)
+        pos_pad = np.zeros((n_frags, n_max, 3), dtype=np.float64)
+        ref_pad = np.zeros((n_frags, n_max, 3), dtype=np.float64)
+        mask = np.zeros((n_frags, n_max), dtype=np.float64)
+        frag_indices = []
+        frag_axis_slots = []
+        for fi, slot in enumerate(groups.values()):
+            r0 = rotations[slot[0]]
+            n = len(r0.indices)
+            pos_pad[fi, :n] = positions[r0.indices]
+            ref_pad[fi, :n] = r0.kwargs['refpos']
+            mask[fi, :n] = 1.0
+            frag_indices.append(np.asarray(r0.indices))
+            frag_axis_slots.append(slot)
+        out = (pos_pad, ref_pad, mask, frag_indices, frag_axis_slots, True)
+        self._cache['rotation_pad'] = out
+        return out
+
+    def _batched_rotation_values(self, positions: np.ndarray):
+        """Per-Rotation values via one padded+vmapped JAX dispatch.
+
+        Returns a length-N_rotations list of floats in original order,
+        or None when the heterogeneous fall-back is required.
+        """
+        rotations = self.internals['rotations']
+        if not rotations:
+            return []
+        pos_pad, ref_pad, mask, _, slots, valid = self._rotation_padded_inputs(positions)
+        if not valid:
+            return None
+        vals_padded = np.asarray(device_get(_rotation_3axis_value_batched(
+            jnp.asarray(pos_pad), jnp.asarray(ref_pad), jnp.asarray(mask)
+        )))
+        # vals_padded.shape == (n_frags, 3)
+        out = [None] * len(rotations)
+        for fi, slot in enumerate(slots):
+            for axis, rot_idx in enumerate(slot):
+                out[rot_idx] = float(vals_padded[fi, axis])
+        return out
+
+    def _batched_rotation_gradients(self, positions: np.ndarray):
+        """Per-Rotation gradients via one padded+vmapped JAX dispatch.
+
+        Returns a list of ``(indices, grad)`` tuples in original order,
+        or None when the heterogeneous fall-back is required.
+        """
+        rotations = self.internals['rotations']
+        if not rotations:
+            return []
+        pos_pad, ref_pad, mask, frag_indices, slots, valid = (
+            self._rotation_padded_inputs(positions)
+        )
+        if not valid:
+            return None
+        grads_padded = np.asarray(device_get(_rotation_3axis_grad_batched(
+            jnp.asarray(pos_pad), jnp.asarray(ref_pad), jnp.asarray(mask)
+        )))
+        # grads_padded.shape == (n_frags, 3, N_max, 3)
+        out = [None] * len(rotations)
+        for fi, slot in enumerate(slots):
+            n = len(frag_indices[fi])
+            for axis, rot_idx in enumerate(slot):
+                out[rot_idx] = (frag_indices[fi], grads_padded[fi, axis, :n, :])
+        return out
+
+    def _batched_rotation_hessians(self, positions: np.ndarray):
+        """Compute per-Rotation Hessians via one padded+vmapped JAX dispatch.
+
+        Each fragment owns 3 Rotation objects (axes 0,1,2) that share
+        the same atom indices and refpos. We group them by fragment,
+        pad to the max-fragment-size across the system, run one
+        vmapped call to ``_rotation_hess_padded_vmap``, and slice the
+        result back into per-Rotation arrays.
+
+        On AJEYAQ (4 fragments x 3 axes = 12 Rotations) this drops the
+        rotation portion of int.hessian build from ~14ms to ~1ms.
+        Returns a list of ``(indices, hess)`` tuples in the original
+        per-Rotation order, matching the shape Internals.hessian
+        expects.
+        """
+        rotations = self.internals['rotations']
+        if not rotations:
+            return []
+        pos_pad, ref_pad, mask, frag_indices, slots, valid = (
+            self._rotation_padded_inputs(positions)
+        )
+        if not valid:
+            atoms = self.light_atoms
+            return [(r.indices, np.array(r.calc_hessian(atoms)))
+                    for r in rotations]
+        hess_padded = np.asarray(device_get(_rotation_hess_padded_vmap(
+            jnp.asarray(pos_pad), jnp.asarray(ref_pad), jnp.asarray(mask)
+        )))
+        # hess_padded.shape == (n_frags, 3, N_max, 3, N_max, 3)
+        out = [None] * len(rotations)
+        for fi, slot in enumerate(slots):
+            n = len(frag_indices[fi])
+            for axis, rot_idx in enumerate(slot):
+                h = hess_padded[fi, axis, :n, :, :n, :]
+                out[rot_idx] = (frag_indices[fi], h)
+        return out
+
     def _get_hessian_skeleton(self, hessians):
         """Return a cached SparseInternalHessiansSkeleton for ``hessians``.
 
@@ -1601,8 +1819,7 @@ class BaseInternals:
                 trans_data.append((coord.indices, z))
             other_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
                           for coord in self.internals['other']]
-            rot_data = [(coord.indices, np.array(coord.calc_hessian(atoms)))
-                        for coord in self.internals['rotations']]
+            rot_data = self._batched_rotation_hessians(positions)
 
             self._cache['hessian_batched'] = batched_hess
             self._cache['hessian_nonbatched'] = (trans_data, other_data, rot_data)
@@ -1810,19 +2027,43 @@ class BaseInternals:
                 v_sub = v_atoms[dih_active_idx]
                 dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
 
-        # Launch rotation HVPs (these are small, one per rotation)
+        # Launch rotation HVPs: one vmapped dispatch per fragment x 3 axes
+        # when all rotations are active and all fragments have all 3 axes.
+        # Otherwise fall back to per-rotation calls.
         rot_jax_results = []
         rot_indices = []
-        for i, coord in enumerate(self.internals['rotations']):
-            if rot_active[i]:
-                idx = np.array(coord.indices)
-                pos = positions[idx]
-                v_sub = v_atoms[idx]
-                axis = coord.kwargs['axis']
-                refpos = coord.kwargs['refpos']
-                rot_jax_results.append(
-                    (_rotation_hvp_jit(pos, axis, refpos, v_sub), idx)
-                )
+        rot_batched_result = None
+        rot_batched_slots = None
+        rot_batched_frag_indices = None
+        all_rot_active = bool(np.asarray(rot_active, dtype=bool).all())
+        if all_rot_active and self.internals['rotations']:
+            pos_pad, ref_pad, mask, frag_indices, slots, valid = (
+                self._rotation_padded_inputs(positions)
+            )
+        else:
+            valid = False
+        if valid:
+            n_max = mask.shape[1]
+            v_pad = np.zeros((len(frag_indices), n_max, 3), dtype=np.float64)
+            for fi, fi_idx in enumerate(frag_indices):
+                v_pad[fi, :len(fi_idx)] = v_atoms[fi_idx]
+            rot_batched_result = _rotation_3axis_hvp_batched_jit(
+                jnp.asarray(pos_pad), jnp.asarray(ref_pad),
+                jnp.asarray(mask), jnp.asarray(v_pad),
+            )
+            rot_batched_slots = slots
+            rot_batched_frag_indices = frag_indices
+        else:
+            for i, coord in enumerate(self.internals['rotations']):
+                if rot_active[i]:
+                    idx = np.array(coord.indices)
+                    pos = positions[idx]
+                    v_sub = v_atoms[idx]
+                    axis = coord.kwargs['axis']
+                    refpos = coord.kwargs['refpos']
+                    rot_jax_results.append(
+                        (_rotation_hvp_jit(pos, axis, refpos, v_sub), idx)
+                    )
 
         # Now collect results with device_get and scatter into output
 
@@ -1887,18 +2128,44 @@ class BaseInternals:
                     out_row[idx] = hvp
                 row += 1
 
-        # Rotations - collect deferred results
-        for jax_result, idx in rot_jax_results:
-            hvp = np.asarray(device_get(jax_result))
-            if use_sparse:
-                dense_row = np.zeros(ndof)
-                dense_row.reshape((-1, 3))[idx] = hvp
-                data[off:off + ndof] = dense_row
-                off += ndof
-            else:
-                out_row = out[row].reshape((-1, 3))
-                out_row[idx] = hvp
-            row += 1
+        # Rotations - collect results (batched or per-rotation)
+        if rot_batched_result is not None:
+            hvp_padded = np.asarray(device_get(rot_batched_result))
+            # hvp_padded.shape == (n_frags, 3, N_max, 3)
+            # Reassemble in original Rotation order
+            ordered = [None] * len(self.internals['rotations'])
+            for fi, slot in enumerate(rot_batched_slots):
+                n = len(rot_batched_frag_indices[fi])
+                for axis, rot_idx in enumerate(slot):
+                    ordered[rot_idx] = (
+                        hvp_padded[fi, axis, :n, :],
+                        rot_batched_frag_indices[fi],
+                    )
+            for i, coord in enumerate(self.internals['rotations']):
+                if not rot_active[i]:
+                    continue
+                hvp, idx = ordered[i]
+                if use_sparse:
+                    dense_row = np.zeros(ndof)
+                    dense_row.reshape((-1, 3))[idx] = hvp
+                    data[off:off + ndof] = dense_row
+                    off += ndof
+                else:
+                    out_row = out[row].reshape((-1, 3))
+                    out_row[idx] = hvp
+                row += 1
+        else:
+            for jax_result, idx in rot_jax_results:
+                hvp = np.asarray(device_get(jax_result))
+                if use_sparse:
+                    dense_row = np.zeros(ndof)
+                    dense_row.reshape((-1, 3))[idx] = hvp
+                    data[off:off + ndof] = dense_row
+                    off += ndof
+                else:
+                    out_row = out[row].reshape((-1, 3))
+                    out_row[idx] = hvp
+                row += 1
 
         if use_sparse:
             return sparse.csr_matrix(
