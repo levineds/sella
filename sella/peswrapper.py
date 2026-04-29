@@ -1,4 +1,5 @@
 from typing import Union, Callable
+import traceback
 
 import numpy as np
 from scipy.linalg import eigh, expm, expm_frechet, logm, polar, qr, solve_triangular
@@ -331,7 +332,6 @@ class PES:
     # Hessian of the constraints
     def get_Hc(self):
         if self.curr['L'] is None:
-            import traceback
             traceback.print_stack()
             raise RuntimeError(
                 "PES.get_Hc() called with L=None. "
@@ -630,7 +630,8 @@ class InternalPES(PES):
             # Construct guess hessian and zero out components in
             # infeasible subspace
             B = self.int.jacobian()
-            P = B @ np.linalg.pinv(B)
+            Q, _ = qr(B, mode='economic')
+            P = Q @ Q.T
             H0 = P @ self.int.guess_hessian() @ P
             self.set_H(H0, initialized=False)
         else:
@@ -997,7 +998,6 @@ class InternalPES(PES):
     def _compute_Hc_int(self):
         """Compute the internal-coords-only constraint Hessian (uncached)."""
         if self.curr['L'] is None:
-            import traceback
             traceback.print_stack()
             raise RuntimeError(
                 "InternalPES.get_Hc() called with L=None. "
@@ -1466,7 +1466,8 @@ class CellInternalPES(InternalPES):
             H0_full[:self.n_internal, :self.n_internal] = H_old
         else:
             B = self.int.jacobian()
-            P = B @ np.linalg.pinv(B)
+            Q, _ = qr(B, mode='economic')
+            P = Q @ Q.T
             H_internal = P @ self.int.guess_hessian() @ P
             H0_full[:self.n_internal, :self.n_internal] = H_internal
 

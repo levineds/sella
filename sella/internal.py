@@ -10,6 +10,7 @@ from functools import partialmethod
 import warnings
 
 from scipy import sparse
+from scipy.linalg import svdvals
 import numpy as np
 from ase import Atom, Atoms, units
 from ase.cell import Cell
@@ -3417,7 +3418,7 @@ class Internals(BaseInternals):
 
     def validate_basis(self) -> None:
         jac = self.jacobian()
-        U, S, VT = np.linalg.svd(jac)
+        S = svdvals(jac)
         ndeloc = np.sum(S > 1e-8)
 
         has_trics = (len(self.internals['translations']) > 0 or
