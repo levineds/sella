@@ -567,6 +567,39 @@ class TestSellaWithCellOptimization:
             assert 2.4 < a < 2.7
 
 
+    def test_gradient_converged_delegates_to_converged(self):
+        """Test that gradient_converged routes through converged().
+
+        ASE 3.28 changed irun() to call gradient_converged() instead of
+        converged(), bypassing Sella's stress check. This test verifies
+        that Sella's gradient_converged override delegates to converged(),
+        so the stress convergence check is always reached.
+        """
+        atoms = bulk('Cu', 'fcc', a=3.8)  # Strained → nonzero stress
+        atoms.calc = EMT()
+
+        opt = Sella(atoms, internal=True, order=0, optimize_cell=True,
+                    logfile=None)
+
+        # Force evaluation so pes has cached gradient
+        opt.pes.eval()
+
+        # converged() should check stress; with a strained cell and tight
+        # tolerance, it should report not converged
+        opt.fmax = 1e-10
+        opt.smax = 1e-10
+        assert not opt.converged()
+
+        # gradient_converged must agree (it delegates to converged)
+        assert not opt.gradient_converged()
+
+        # Now with loose tolerances, both should agree on convergence
+        opt.fmax = 100.0
+        opt.smax = 100.0
+        assert opt.converged()
+        assert opt.gradient_converged()
+
+
 class TestVoigtConversion:
     """Test Voigt stress conversion functions."""
 
