@@ -435,6 +435,9 @@ class Sella(Optimizer):
             self.initialized = False
             self.rho = 1.
 
+    def gradient_converged(self, gradient=None):
+        return self.converged()
+
     def converged(self, forces=None):
         # fmax may still be None if converged() is called before run()
         fmax = self.fmax if self.fmax is not None else 0.05  # Default threshold
