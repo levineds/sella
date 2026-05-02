@@ -1,5 +1,5 @@
+import logging
 from typing import Union, Callable
-import traceback
 
 import numpy as np
 from scipy.linalg import eigh, expm, expm_frechet, logm, polar, qr, solve_triangular
@@ -17,6 +17,8 @@ from sella.linalg import NumericalHessian, ApproximateHessian
 from sella.eigensolvers import rayleigh_ritz
 from sella.internal import Internals, Constraints, DuplicateInternalError
 from sella._gpu import gpu_qr as _gpu_qr, gpu_project
+
+logger = logging.getLogger(__name__)
 
 
 class _LRU2:
@@ -197,6 +199,8 @@ def _niggli_hessian_transform(atoms, orig_cell, exp_cell_factor, cell_mask):
 
 
 class PES:
+    n_cell_dof = 0
+
     def __init__(
         self,
         atoms: Atoms,
@@ -332,12 +336,10 @@ class PES:
     # Hessian of the constraints
     def get_Hc(self):
         if self.curr['L'] is None:
-            traceback.print_stack()
             raise RuntimeError(
                 "PES.get_Hc() called with L=None. "
                 f"curr_g_is_none={self.curr.get('g') is None}, "
-                f"curr_f_is_none={self.curr.get('f') is None}. "
-                "See stack trace above."
+                f"curr_f_is_none={self.curr.get('f') is None}."
             )
         return self.cons.hessian().ldot(self.curr['L'])
 
@@ -540,7 +542,6 @@ class PES:
 
         self.first_diag = False
 
-    # FIXME: temporary functions for backwards compatibility
     def get_projected_forces(self):
         """Returns Nx3 array of atomic forces orthogonal to constraints."""
         g = self.get_g()
@@ -945,9 +946,7 @@ class InternalPES(PES):
         Hessian noise. Bailing leaves the projection as a strict
         improvement: it can only help, never hurt.
         """
-        if not hasattr(self.cons, 'residual'):
-            return False
-        if len(self.cons.residual()) == 0:
+        if self.cons.residual().size == 0:
             return False
 
         n_real = 3 * len(self.atoms)
@@ -998,12 +997,10 @@ class InternalPES(PES):
     def _compute_Hc_int(self):
         """Compute the internal-coords-only constraint Hessian (uncached)."""
         if self.curr['L'] is None:
-            traceback.print_stack()
             raise RuntimeError(
                 "InternalPES.get_Hc() called with L=None. "
                 f"curr_g_is_none={self.curr.get('g') is None}, "
-                f"curr_f_is_none={self.curr.get('f') is None}. "
-                "See stack trace above."
+                f"curr_f_is_none={self.curr.get('f') is None}."
             )
 
         # No constraints → L is empty → Hc is identically zero. Skip the
@@ -1120,13 +1117,6 @@ class InternalPES(PES):
 
         nold = 3 * (len(self.atoms) + len(self.dummies))
 
-        # FIXME: Testing to see if disabling this works
-        #if self.bad_int is not None:
-        #    for bond in self.bad_int['bonds']:
-        #        self.int_orig.forbid_bond(bond)
-        #    for angle in self.bad_int['angles']:
-        #        self.int_orig.forbid_angle(angle)
-
         # Find new internals, constraints, and dummies
         new_int = self.int_orig.copy()
         new_int.find_all_bonds()
@@ -1174,12 +1164,10 @@ class InternalPES(PES):
             return None
         Unred = self.get_Unred()
         dx_r = dx @ Unred
-        # dx_r = self.wrap_dx(dx) @ Unred
         g_r = g @ Unred
         H_r = Unred.T @ H @ Unred
         return g_r.T @ dx_r + (dx_r.T @ H_r @ dx_r) / 2.
 
-    # FIXME: temporary functions for backwards compatibility
     def get_projected_forces(self):
         """Returns Nx3 array of atomic forces orthogonal to constraints."""
         g = self.get_g()
@@ -1220,11 +1208,6 @@ class InternalPES(PES):
 
     def kick(self, dx, diag=False, **diag_kwargs):
         ratio = PES.kick(self, dx, diag=diag, **diag_kwargs)
-
-        # FIXME: Testing to see if this works
-        #if self.bad_int is not None:
-        #    self.update_internals(dx)
-        #    self.bad_int = None
 
         return ratio
 
@@ -1511,7 +1494,7 @@ class CellInternalPES(InternalPES):
         # Save Hessian if requested
         if save_hessian is not None:
             np.save(save_hessian, H0_full)
-            print(f"Initial Hessian saved to {save_hessian}")
+            logger.info("Initial Hessian saved to %s", save_hessian)
 
         # With FD-refined Hessian (refine_level >= 1), use initialized=False
         # to preserve the refined cell block on the first BFGS update — the
@@ -1626,7 +1609,7 @@ class CellInternalPES(InternalPES):
 
         # Update the Hessian (preserves eigenvalue tracking, etc.)
         self.set_H(H, initialized=True)
-        print(f" [Hessian re-refined at level {refine_level}]")
+        logger.info("Hessian re-refined at level %d", refine_level)
 
     def _compute_cell_hessian_columns(self, delta: float) -> np.ndarray:
         """Compute Hessian columns for cell DOF via finite differences.
@@ -1652,7 +1635,7 @@ class CellInternalPES(InternalPES):
         pos0 = self.atoms.positions.copy()
 
         n_evals = 2 * self.n_cell_dof
-        print(f"Refining initial Hessian: 0/{n_evals} force calls", end="", flush=True)
+        logger.info("Refining initial Hessian: 0/%d force calls", n_evals)
 
         for i in range(self.n_cell_dof):
             # Restore state before each FD probe to ensure path-independence
@@ -1664,7 +1647,7 @@ class CellInternalPES(InternalPES):
             x_plus[self.n_internal + i] += delta
             self.set_x(x_plus)
             _, g_plus = self.eval()
-            print(f"\rRefining initial Hessian: {2*i + 1}/{n_evals} force calls", end="", flush=True)
+            logger.info("Refining initial Hessian: %d/%d force calls", 2*i + 1, n_evals)
 
             # Restore before -delta
             self.atoms.positions = pos0.copy()
@@ -1675,12 +1658,11 @@ class CellInternalPES(InternalPES):
             x_minus[self.n_internal + i] -= delta
             self.set_x(x_minus)
             _, g_minus = self.eval()
-            print(f"\rRefining initial Hessian: {2*i + 2}/{n_evals} force calls", end="", flush=True)
+            logger.info("Refining initial Hessian: %d/%d force calls", 2*i + 2, n_evals)
 
             # Central difference
             H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
 
-        print()  # Newline after progress
 
         # Restore original state
         self.atoms.positions = pos0
@@ -1733,7 +1715,7 @@ class CellInternalPES(InternalPES):
         pos0 = self.atoms.positions.copy()
 
         n_evals = 2 * n_tric
-        print(f"Refining TRIC Hessian: 0/{n_evals} force calls", end="", flush=True)
+        logger.info("Refining TRIC Hessian: 0/%d force calls", n_evals)
 
         for i, idx in enumerate(tric_indices):
             # Displace TRIC parameter +delta
@@ -1743,7 +1725,7 @@ class CellInternalPES(InternalPES):
             x_plus[idx] += delta
             self.set_x(x_plus)
             _, g_plus = self.eval()
-            print(f"\rRefining TRIC Hessian: {2*i + 1}/{n_evals} force calls", end="", flush=True)
+            logger.info("Refining TRIC Hessian: %d/%d force calls", 2*i + 1, n_evals)
 
             # Displace TRIC parameter -delta
             self.atoms.positions = pos0.copy()
@@ -1752,12 +1734,11 @@ class CellInternalPES(InternalPES):
             x_minus[idx] -= delta
             self.set_x(x_minus)
             _, g_minus = self.eval()
-            print(f"\rRefining TRIC Hessian: {2*i + 2}/{n_evals} force calls", end="", flush=True)
+            logger.info("Refining TRIC Hessian: %d/%d force calls", 2*i + 2, n_evals)
 
             # Central difference
             H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
 
-        print()  # Newline after progress
 
         # Restore original state
         self.atoms.positions = pos0
@@ -1793,7 +1774,7 @@ class CellInternalPES(InternalPES):
         pos0 = self.atoms.positions.copy()
 
         n_evals = 2 * self.n_internal
-        print(f"Refining internal Hessian: 0/{n_evals} force calls", end="", flush=True)
+        logger.info("Refining internal Hessian: 0/%d force calls", n_evals)
 
         for i in range(self.n_internal):
             # Displace internal coordinate +delta
@@ -1817,9 +1798,8 @@ class CellInternalPES(InternalPES):
 
             # Progress update every 10 columns or at the end
             if (i + 1) % 10 == 0 or i == self.n_internal - 1:
-                print(f"\rRefining internal Hessian: {2*(i+1)}/{n_evals} force calls", end="", flush=True)
+                logger.info("Refining internal Hessian: %d/%d force calls", 2*(i+1), n_evals)
 
-        print()  # Newline after progress
 
         # Restore original state
         self.atoms.positions = pos0
@@ -1911,7 +1891,7 @@ class CellInternalPES(InternalPES):
         list of ndarray
             Each element is an array of dummy atom indices for the same fragment.
         """
-        if hasattr(internals, 'fragment_atom_groups'):
+        if internals.fragment_atom_groups is not None:
             groups = internals.fragment_atom_groups
         else:
             natoms = internals.natoms
@@ -2511,7 +2491,7 @@ class CellCartesianPES(PES):
         # Save Hessian if requested
         if save_hessian is not None:
             np.save(save_hessian, H0_full)
-            print(f"Initial Hessian saved to {save_hessian}")
+            logger.info("Initial Hessian saved to %s", save_hessian)
 
         self.set_H(H0_full, initialized=(refine_level == 0))
 
@@ -2604,7 +2584,7 @@ class CellCartesianPES(PES):
 
         # Update the Hessian (preserves eigenvalue tracking, etc.)
         self.set_H(H, initialized=True)
-        print(f" [Hessian re-refined at level {refine_level}]")
+        logger.info("Hessian re-refined at level %d", refine_level)
 
     def _compute_cell_hessian_columns(self, delta: float) -> np.ndarray:
         """Compute Hessian columns for cell DOF via finite differences.
@@ -2630,7 +2610,7 @@ class CellCartesianPES(PES):
         pos0 = self.atoms.positions.copy()
 
         n_evals = 2 * self.n_cell_dof
-        print(f"Refining initial Hessian: 0/{n_evals} force calls", end="", flush=True)
+        logger.info("Refining initial Hessian: 0/%d force calls", n_evals)
 
         for i in range(self.n_cell_dof):
             # Restore state before each FD probe
@@ -2642,7 +2622,7 @@ class CellCartesianPES(PES):
             x_plus[self.n_cart + i] += delta
             self.set_x(x_plus)
             _, g_plus = self.eval()
-            print(f"\rRefining initial Hessian: {2*i + 1}/{n_evals} force calls", end="", flush=True)
+            logger.info("Refining initial Hessian: %d/%d force calls", 2*i + 1, n_evals)
 
             # Restore before -delta
             self.atoms.positions = pos0.copy()
@@ -2653,12 +2633,11 @@ class CellCartesianPES(PES):
             x_minus[self.n_cart + i] -= delta
             self.set_x(x_minus)
             _, g_minus = self.eval()
-            print(f"\rRefining initial Hessian: {2*i + 2}/{n_evals} force calls", end="", flush=True)
+            logger.info("Refining initial Hessian: %d/%d force calls", 2*i + 2, n_evals)
 
             # Central difference
             H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
 
-        print()  # Newline after progress
 
         # Restore original state
         self.atoms.positions = pos0
@@ -2923,7 +2902,7 @@ class CellCartesianPES(PES):
         g_cart = g[:self.n_cart]
         Ufree = self.get_Ufree()
         Ufree_cart = Ufree[:self.n_cart, :]
-        return -((Ufree_cart @ Ufree_cart.T) @ g_cart).reshape((-1, 3))
+        return -(Ufree_cart @ (Ufree_cart.T @ g_cart)).reshape((-1, 3))
 
     def get_drdx(self):
         """Get constraint Jacobian extended for cell DOF."""

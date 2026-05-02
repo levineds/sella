@@ -200,6 +200,7 @@ class MaxInternalStep(BaseRestrictedStep):
         self.wd = wd
         self.wo = wo
         self.wc = wc  # Weight for cell DOF
+        self._weights_cache = None
         BaseRestrictedStep.__init__(self, pes, *args, **kwargs)
 
     def cons(self, s, dsda=None):
@@ -218,8 +219,8 @@ class MaxInternalStep(BaseRestrictedStep):
         """Build the per-DOF weight vector. Cached against
         (counts, weights, n_cell_dof) so the np.array construction
         only runs once per restricted-step instance."""
-        cached = getattr(self, '_weights_cache', None)
-        n_cell_dof = getattr(self.pes, 'n_cell_dof', 0)
+        cached = self._weights_cache
+        n_cell_dof = self.pes.n_cell_dof
         key = (
             self.pes.int.ntrans, self.pes.int.nbonds,
             self.pes.int.nangles, self.pes.int.ndihedrals,

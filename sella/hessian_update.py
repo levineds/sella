@@ -70,7 +70,7 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None,
     # (evals_gpu, evecs_gpu).
     if (method == 'TS-BFGS' and B_gpu is not None
             and (is_pd or (evals_gpu is not None and evecs_gpu is not None))):
-        result = _gpu_update_TS_BFGS(B, B_gpu, S, Ytilde, evals_gpu,
+        result = _gpu_update_TS_BFGS(B_gpu, S, Ytilde, evals_gpu,
                                      evecs_gpu, is_pd)
         if result is not None:
             return result  # (Bplus_numpy, Bplus_gpu)
@@ -162,7 +162,7 @@ def _MS_Powell(B, S, Y):  # pragma: no cover
     return (Y - B @ S) @ S.T
 
 
-def _gpu_update_TS_BFGS(B, B_gpu, S, Y, evals_gpu, evecs_gpu, is_pd):
+def _gpu_update_TS_BFGS(B_gpu, S, Y, evals_gpu, evecs_gpu, is_pd):
     """GPU-resident TS-BFGS update + symmetrize, returning numpy + torch.
 
     Mirrors `_MS_TS_BFGS` but does the heavy matmuls and lstsq on device,

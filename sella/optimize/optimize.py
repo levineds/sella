@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import logging
 import warnings
 from time import localtime, strftime
 from typing import Union, Callable, Optional
@@ -13,6 +14,8 @@ from ase.io.trajectory import Trajectory
 from .restricted_step import get_restricted_step, MaxInternalStep
 from sella.peswrapper import PES, InternalPES, CellInternalPES, CellCartesianPES
 from sella.internal import Internals, Constraints
+
+logger = logging.getLogger(__name__)
 
 _default_kwargs = dict(
     minimum=dict(
@@ -375,6 +378,14 @@ class Sella(Optimizer):
         # Check for bad internals, and if found, reset PES object.
         # This skips the trust radius update.
         if self.internal and self.pes.int.check_for_bad_internals():
+            if isinstance(self.pes, CellInternalPES):
+                cell_mask = self.pes.cell_mask
+                exp_cell_factor = self.pes.exp_cell_factor
+                scalar_pressure = self.pes.scalar_pressure
+            else:
+                cell_mask = None
+                exp_cell_factor = None
+                scalar_pressure = 0.0
             self.initialize_pes(
                 atoms=self.pes.atoms,
                 trajectory=self.pes.traj,
@@ -385,9 +396,9 @@ class Sella(Optimizer):
                 internal=self.user_internal,
                 hessian_function=self.pes.hessian_function,
                 optimize_cell=self.optimize_cell,
-                cell_mask=getattr(self.pes, 'cell_mask', None),
-                exp_cell_factor=getattr(self.pes, 'exp_cell_factor', None),
-                scalar_pressure=getattr(self.pes, 'scalar_pressure', 0.0),
+                cell_mask=cell_mask,
+                exp_cell_factor=exp_cell_factor,
+                scalar_pressure=scalar_pressure,
                 allow_fragments=self.allow_fragments,
             )
             self.initialized = False
@@ -420,7 +431,7 @@ class Sella(Optimizer):
 
         # Apply Niggli reduction if cell becomes too skewed
         if self.optimize_cell and self.niggli and self.pes.maybe_niggli_reduce():
-            print("Sella: Applied Niggli reduction to reduce cell skewness")
+            logger.info("Applied Niggli reduction to reduce cell skewness")
             self.initialized = False
             self.rho = 1.
 
@@ -478,8 +489,7 @@ class Sella(Optimizer):
                                "{:>12.4f} {:>12.4f}\n"
                                .format(name, self.nsteps, T, e, fmax, cmax,
                                        self.delta, self.rho))
-        # Flush for immediate output visibility, but skip for ASE's Log class
-        # which auto-flushes and emits FutureWarning if flush() is called
-        if (hasattr(self.logfile, 'flush') and
-                type(self.logfile).__name__ != 'Log'):
+        try:
             self.logfile.flush()
+        except (AttributeError, TypeError):
+            pass

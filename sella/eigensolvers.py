@@ -73,10 +73,7 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
         # a hack for the optbench.org eigensolver convergence test
         if vref is not None:
             x0 = V @ vecs[:, 0]
-            print(np.abs(x0 @ vref))
             if np.abs(x0 @ vref) > vreftol:
-                print("Dot product between your v0 and the final answer:",
-                      np.abs(v0 @ x0) / np.linalg.norm(v0))
                 return lams, V, AV
 
         # Loop over all Ritz values of interest

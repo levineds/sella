@@ -890,6 +890,7 @@ class BaseInternals:
         self.rcell = None
         self._rcell_reciprocal_T = None
         self.op = None
+        self._hessian_skeleton = None
 
         # Batched arrays for vectorized computation (built lazily)
         self._batched_arrays_valid = False
@@ -1781,7 +1782,7 @@ class BaseInternals:
         """
         key = (len(hessians), self.natoms + self.ndummies,
                tuple(self._active_mask))
-        cached = getattr(self, '_hessian_skeleton', None)
+        cached = self._hessian_skeleton
         if cached is not None and cached[0] == key:
             return cached[1]
         skeleton = SparseInternalHessiansSkeleton(hessians,
@@ -2814,6 +2815,7 @@ class Internals(BaseInternals):
             for coord in self.cons.internals[kind]:
                 adder(coord)
         self.allow_fragments = allow_fragments
+        self.fragment_atom_groups = None
 
     def copy(self) -> 'Internals':
         new = self.__class__(
