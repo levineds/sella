@@ -1380,34 +1380,52 @@ class _CellPESMixin:
 
         Returns array of shape (dim, n_cell_dof).
         """
-        H_cols = np.zeros((self.dim, self.n_cell_dof))
+        n = self.n_coords
+        indices = list(range(n, n + self.n_cell_dof))
+        return self._fd_hessian_columns(delta, indices, self.dim, "cell")
+
+    def _fd_hessian_columns(self, delta, indices, n_rows, label=""):
+        """Central-difference Hessian columns for arbitrary coordinate indices.
+
+        Parameters
+        ----------
+        delta : float
+            Finite difference step size.
+        indices : list of int
+            Which DOF indices in get_x() to perturb.
+        n_rows : int
+            Number of gradient components to store per column.
+        label : str
+            Label for log messages.
+        """
+        n_cols = len(indices)
+        H_cols = np.zeros((n_rows, n_cols))
         x0 = self.get_x()
         cell0 = self.atoms.get_cell().array.copy()
         pos0 = self.atoms.positions.copy()
-        n = self.n_coords
-        n_evals = 2 * self.n_cell_dof
-        logger.info("Refining initial Hessian: 0/%d force calls", n_evals)
+        n_evals = 2 * n_cols
+        logger.info("Refining %s Hessian: 0/%d force calls", label, n_evals)
 
-        for i in range(self.n_cell_dof):
+        for col, idx in enumerate(indices):
             self.atoms.positions = pos0.copy()
             self.atoms.set_cell(cell0, scale_atoms=False)
             x_plus = x0.copy()
-            x_plus[n + i] += delta
+            x_plus[idx] += delta
             self.set_x(x_plus)
             _, g_plus = self.eval()
-            logger.info("Refining initial Hessian: %d/%d force calls",
-                        2*i + 1, n_evals)
 
             self.atoms.positions = pos0.copy()
             self.atoms.set_cell(cell0, scale_atoms=False)
             x_minus = x0.copy()
-            x_minus[n + i] -= delta
+            x_minus[idx] -= delta
             self.set_x(x_minus)
             _, g_minus = self.eval()
-            logger.info("Refining initial Hessian: %d/%d force calls",
-                        2*i + 2, n_evals)
 
-            H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
+            H_cols[:, col] = (g_plus[:n_rows] - g_minus[:n_rows]) / (2 * delta)
+
+            if (col + 1) % max(n_cols // 10, 1) == 0 or col == n_cols - 1:
+                logger.info("Refining %s Hessian: %d/%d force calls",
+                            label, 2*(col+1), n_evals)
 
         self.atoms.positions = pos0
         self.atoms.set_cell(cell0, scale_atoms=False)
@@ -1675,126 +1693,19 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         return np.array(trans_indices + rot_indices)
 
     def _compute_tric_hessian_columns(self, delta: float) -> np.ndarray:
-        """Compute Hessian columns for translation/rotation DOF via finite differences.
-
-        This refines the coupling between TRICs and all other coordinates,
-        which is important for molecular crystals where fragment motions are coupled.
-
-        Parameters
-        ----------
-        delta : float
-            Finite difference step size.
-
-        Returns
-        -------
-        H_cols : ndarray
-            Array of shape (dim, n_tric) containing Hessian columns.
-        """
+        """Compute Hessian columns for translation/rotation DOF via FD."""
         tric_indices = self._get_tric_indices()
-        n_tric = len(tric_indices)
-        H_cols = np.zeros((self.dim, n_tric))
-
-        # Save current state
-        x0 = self.get_x()
-        cell0 = self.atoms.get_cell().array.copy()
-        pos0 = self.atoms.positions.copy()
-
-        n_evals = 2 * n_tric
-        logger.info("Refining TRIC Hessian: 0/%d force calls", n_evals)
-
-        for i, idx in enumerate(tric_indices):
-            # Displace TRIC parameter +delta
-            self.atoms.positions = pos0.copy()
-            self.atoms.set_cell(cell0, scale_atoms=False)
-            x_plus = x0.copy()
-            x_plus[idx] += delta
-            self.set_x(x_plus)
-            _, g_plus = self.eval()
-            logger.info("Refining TRIC Hessian: %d/%d force calls", 2*i + 1, n_evals)
-
-            # Displace TRIC parameter -delta
-            self.atoms.positions = pos0.copy()
-            self.atoms.set_cell(cell0, scale_atoms=False)
-            x_minus = x0.copy()
-            x_minus[idx] -= delta
-            self.set_x(x_minus)
-            _, g_minus = self.eval()
-            logger.info("Refining TRIC Hessian: %d/%d force calls", 2*i + 2, n_evals)
-
-            # Central difference
-            H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
-
-
-        # Restore original state
-        self.atoms.positions = pos0
-        self.atoms.set_cell(cell0, scale_atoms=False)
-        # Clear cached values to force recomputation
-        self.curr['x'] = None
-        self.curr['f'] = None
-        self.curr['g'] = None
-
-        return H_cols
+        return self._fd_hessian_columns(delta, tric_indices, self.dim, "TRIC")
 
     def _compute_internal_hessian_columns(self, delta: float) -> np.ndarray:
-        """Compute full internal-internal Hessian block via finite differences.
+        """Compute full internal-internal Hessian block via FD.
 
-        This is expensive: requires 2 * n_internal force evaluations.
-        Only use when a highly accurate initial Hessian is needed.
-
-        Parameters
-        ----------
-        delta : float
-            Finite difference step size.
-
-        Returns
-        -------
-        H_int : ndarray
-            Array of shape (n_internal, n_internal) containing the internal Hessian.
+        Expensive: requires 2 * n_internal force evaluations.
         """
-        H_int = np.zeros((self.n_internal, self.n_internal))
-
-        # Save current state
-        x0 = self.get_x()
-        cell0 = self.atoms.get_cell().array.copy()
-        pos0 = self.atoms.positions.copy()
-
-        n_evals = 2 * self.n_internal
-        logger.info("Refining internal Hessian: 0/%d force calls", n_evals)
-
-        for i in range(self.n_internal):
-            # Displace internal coordinate +delta
-            self.atoms.positions = pos0.copy()
-            self.atoms.set_cell(cell0, scale_atoms=False)
-            x_plus = x0.copy()
-            x_plus[i] += delta
-            self.set_x(x_plus)
-            _, g_plus = self.eval()
-
-            # Displace internal coordinate -delta
-            self.atoms.positions = pos0.copy()
-            self.atoms.set_cell(cell0, scale_atoms=False)
-            x_minus = x0.copy()
-            x_minus[i] -= delta
-            self.set_x(x_minus)
-            _, g_minus = self.eval()
-
-            # Central difference - only internal part
-            H_int[:, i] = (g_plus[:self.n_internal] - g_minus[:self.n_internal]) / (2 * delta)
-
-            # Progress update every 10 columns or at the end
-            if (i + 1) % 10 == 0 or i == self.n_internal - 1:
-                logger.info("Refining internal Hessian: %d/%d force calls", 2*(i+1), n_evals)
-
-
-        # Restore original state
-        self.atoms.positions = pos0
-        self.atoms.set_cell(cell0, scale_atoms=False)
-        # Clear cached values to force recomputation
-        self.curr['x'] = None
-        self.curr['f'] = None
-        self.curr['g'] = None
-
-        return H_int
+        indices = list(range(self.n_internal))
+        return self._fd_hessian_columns(
+            delta, indices, self.n_internal, "internal"
+        )
 
     def get_x(self) -> np.ndarray:
         """Return combined internal coordinates + cell parameters.

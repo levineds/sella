@@ -38,104 +38,58 @@ def make_water_crystal():
 class TestCellDerivatives:
     """Test cell derivative functions for internal coordinates."""
 
-    def test_bond_cell_derivative_numerical_molecular(self):
-        """Verify bond cell derivative against numerical finite difference.
-
-        Uses a molecular system with explicit bonds that cross the periodic
-        boundary when the cell is compressed.
-        """
-        # Create CH4 in a periodic cell
-        atoms = make_molecular_crystal()
-
-        # Create internals and find bonds (C-H bonds)
-        internals = Internals(atoms)
-        internals.find_all_bonds()
-
-        assert len(internals.internals['bonds']) > 0, "No bonds found"
-
-        # Test the first bond
-        bond = internals.internals['bonds'][0]
-
-        # Analytical gradient
-        grad_analytic = bond.calc_cell_gradient(atoms)
-
-        # Numerical gradient using finite differences
-        delta = 1e-5
+    @staticmethod
+    def _cell_deriv_fd(atoms, coord, delta=1e-5):
+        """Compute d(coord)/d(cell) via central finite differences."""
         cell0 = atoms.get_cell().array.copy()
         grad_numeric = np.zeros((3, 3))
-
         for i in range(3):
             for j in range(3):
-                # Forward
                 cell_plus = cell0.copy()
                 cell_plus[i, j] += delta
                 atoms.set_cell(cell_plus, scale_atoms=False)
-                val_plus = bond.calc(atoms)
+                val_plus = coord.calc(atoms)
 
-                # Backward
                 cell_minus = cell0.copy()
                 cell_minus[i, j] -= delta
                 atoms.set_cell(cell_minus, scale_atoms=False)
-                val_minus = bond.calc(atoms)
+                val_minus = coord.calc(atoms)
 
                 grad_numeric[i, j] = (val_plus - val_minus) / (2 * delta)
-
-        # Restore cell
         atoms.set_cell(cell0, scale_atoms=False)
+        return grad_numeric
 
+    def test_bond_cell_derivative_numerical_molecular(self):
+        """Verify bond cell derivative against numerical finite difference."""
+        atoms = make_molecular_crystal()
+        internals = Internals(atoms)
+        internals.find_all_bonds()
+        assert len(internals.internals['bonds']) > 0, "No bonds found"
+
+        bond = internals.internals['bonds'][0]
+        grad_analytic = bond.calc_cell_gradient(atoms)
+        grad_numeric = self._cell_deriv_fd(atoms, bond)
         assert_allclose(grad_analytic, grad_numeric, atol=1e-6, rtol=1e-5)
 
     def test_bond_cell_derivative_with_periodic_image(self):
-        """Test bond cell derivative for bond crossing periodic boundary.
-
-        Create a diatomic that spans the periodic boundary to ensure
-        ncvec contribution to cell derivative is tested.
-        """
-        # Create H2 spanning the periodic boundary
+        """Test bond cell derivative for bond crossing periodic boundary."""
         atoms = Atoms('H2', positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 2.5]])
         atoms.set_cell([3.0, 3.0, 3.0])
         atoms.pbc = True
 
-        # Create a bond that crosses the boundary (using ncvec)
-        # Bond between atom 0 and atom 1 via periodic image
         bond = Bond(
             indices=np.array([0, 1], dtype=np.int32),
-            ncvecs=np.array([[0, 0, -1]], dtype=np.int32)  # Wrap in -z direction
+            ncvecs=np.array([[0, 0, -1]], dtype=np.int32)
         )
 
-        # Analytical gradient
         grad_analytic = bond.calc_cell_gradient(atoms)
-
-        # Numerical gradient
-        delta = 1e-5
-        cell0 = atoms.get_cell().array.copy()
-        grad_numeric = np.zeros((3, 3))
-
-        for i in range(3):
-            for j in range(3):
-                cell_plus = cell0.copy()
-                cell_plus[i, j] += delta
-                atoms.set_cell(cell_plus, scale_atoms=False)
-                val_plus = bond.calc(atoms)
-
-                cell_minus = cell0.copy()
-                cell_minus[i, j] -= delta
-                atoms.set_cell(cell_minus, scale_atoms=False)
-                val_minus = bond.calc(atoms)
-
-                grad_numeric[i, j] = (val_plus - val_minus) / (2 * delta)
-
-        atoms.set_cell(cell0, scale_atoms=False)
-
-        # The bond crosses the boundary, so cell derivatives should be non-zero
+        grad_numeric = self._cell_deriv_fd(atoms, bond)
         assert not np.allclose(grad_analytic, 0), "Cell gradient should be non-zero for PBC bond"
         assert_allclose(grad_analytic, grad_numeric, atol=1e-6, rtol=1e-5)
 
     def test_angle_cell_derivative_numerical(self):
         """Verify angle cell derivative against numerical finite difference."""
-        # Use water - has a well-defined H-O-H angle
         atoms = make_water_crystal()
-
         internals = Internals(atoms)
         internals.find_all_bonds()
         internals.find_all_angles()
@@ -143,32 +97,9 @@ class TestCellDerivatives:
         if not internals.internals['angles']:
             pytest.skip("No angles found in structure")
 
-        # Get an angle (H-O-H)
         angle = internals.internals['angles'][0]
-
-        # Analytical gradient
         grad_analytic = angle.calc_cell_gradient(atoms)
-
-        # Numerical gradient
-        delta = 1e-5
-        cell0 = atoms.get_cell().array.copy()
-        grad_numeric = np.zeros((3, 3))
-
-        for i in range(3):
-            for j in range(3):
-                cell_plus = cell0.copy()
-                cell_plus[i, j] += delta
-                atoms.set_cell(cell_plus, scale_atoms=False)
-                val_plus = angle.calc(atoms)
-
-                cell_minus = cell0.copy()
-                cell_minus[i, j] -= delta
-                atoms.set_cell(cell_minus, scale_atoms=False)
-                val_minus = angle.calc(atoms)
-
-                grad_numeric[i, j] = (val_plus - val_minus) / (2 * delta)
-
-        atoms.set_cell(cell0, scale_atoms=False)
+        grad_numeric = self._cell_deriv_fd(atoms, angle)
 
         assert_allclose(grad_analytic, grad_numeric, atol=1e-6, rtol=1e-5)
 
