@@ -1303,7 +1303,205 @@ def full_3x3_to_voigt_6_stress(stress_3x3: np.ndarray) -> np.ndarray:
     ])
 
 
-class CellInternalPES(InternalPES):
+class _CellPESMixin:
+    """Shared cell-parameterization logic for CellInternalPES and CellCartesianPES.
+
+    Provides the log-deformation cell parameterization, Niggli reduction,
+    finite-difference Hessian refinement, and save/restore of cell state.
+
+    Subclasses must define:
+    - ``n_coords`` property: number of non-cell DOF (n_internal or n_cart)
+    - ``_scale_atoms_on_cell_change`` property: whether set_cell uses
+      scale_atoms=True (fractional coords fixed) or False
+    """
+
+    @property
+    def n_coords(self) -> int:
+        raise NotImplementedError
+
+    @property
+    def _scale_atoms_on_cell_change(self) -> bool:
+        return False
+
+    def _init_cell_params(
+        self, atoms, exp_cell_factor, cell_mask, scalar_pressure,
+    ):
+        self.orig_cell = atoms.get_cell().array.copy()
+        if exp_cell_factor is None:
+            exp_cell_factor = float(len(atoms))
+        self.exp_cell_factor = exp_cell_factor
+        if cell_mask is None:
+            cell_mask = np.ones((3, 3), dtype=bool)
+        self.cell_mask = np.asarray(cell_mask, dtype=bool).reshape((3, 3))
+        self.n_cell_dof = int(self.cell_mask.sum())
+        self.scalar_pressure = scalar_pressure
+
+    def _get_deformation_gradient(self) -> np.ndarray:
+        """Get current deformation gradient F = cell @ inv(orig_cell)."""
+        return self.atoms.get_cell().array @ np.linalg.inv(self.orig_cell)
+
+    def _get_log_deform(self) -> np.ndarray:
+        """Get log of deformation gradient, scaled by exp_cell_factor."""
+        F = self._get_deformation_gradient()
+        return _logm_3x3(F) * self.exp_cell_factor
+
+    def _set_cell_from_log_deform(self, log_deform_scaled: np.ndarray) -> None:
+        """Set cell from scaled log-deformation gradient."""
+        log_deform = log_deform_scaled / self.exp_cell_factor
+        F = expm(log_deform.real)
+        new_cell = F @ self.orig_cell
+        self.atoms.set_cell(new_cell,
+                            scale_atoms=self._scale_atoms_on_cell_change)
+
+    def _masked_cell_params(self) -> np.ndarray:
+        """Get cell parameters as flat array (only free DOF)."""
+        log_deform = self._get_log_deform()
+        return log_deform[self.cell_mask]
+
+    def _set_masked_cell_params(self, params: np.ndarray) -> None:
+        """Set cell from flat array of free DOF."""
+        log_deform = self._get_log_deform()
+        log_deform[self.cell_mask] = params
+        self._set_cell_from_log_deform(log_deform)
+
+    def save(self):
+        """Save current state including cell."""
+        super().save()
+        self.savepoint['cell'] = self.atoms.get_cell().array.copy()
+
+    def restore(self):
+        """Restore saved state including cell."""
+        super().restore()
+        if 'cell' in self.savepoint:
+            self.atoms.set_cell(self.savepoint['cell'], scale_atoms=False)
+
+    def _compute_cell_hessian_columns(self, delta: float) -> np.ndarray:
+        """Compute Hessian columns for cell DOF via central finite differences.
+
+        Returns array of shape (dim, n_cell_dof).
+        """
+        H_cols = np.zeros((self.dim, self.n_cell_dof))
+        x0 = self.get_x()
+        cell0 = self.atoms.get_cell().array.copy()
+        pos0 = self.atoms.positions.copy()
+        n = self.n_coords
+        n_evals = 2 * self.n_cell_dof
+        logger.info("Refining initial Hessian: 0/%d force calls", n_evals)
+
+        for i in range(self.n_cell_dof):
+            self.atoms.positions = pos0.copy()
+            self.atoms.set_cell(cell0, scale_atoms=False)
+            x_plus = x0.copy()
+            x_plus[n + i] += delta
+            self.set_x(x_plus)
+            _, g_plus = self.eval()
+            logger.info("Refining initial Hessian: %d/%d force calls",
+                        2*i + 1, n_evals)
+
+            self.atoms.positions = pos0.copy()
+            self.atoms.set_cell(cell0, scale_atoms=False)
+            x_minus = x0.copy()
+            x_minus[n + i] -= delta
+            self.set_x(x_minus)
+            _, g_minus = self.eval()
+            logger.info("Refining initial Hessian: %d/%d force calls",
+                        2*i + 2, n_evals)
+
+            H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
+
+        self.atoms.positions = pos0
+        self.atoms.set_cell(cell0, scale_atoms=False)
+        self.curr['x'] = None
+        self.curr['f'] = None
+        self.curr['g'] = None
+        return H_cols
+
+    def maybe_niggli_reduce(self, angle_threshold=30.0):
+        """Apply Niggli reduction if cell angles deviate too far from 90 deg.
+
+        Returns True if reduction was applied.
+        """
+        angles = self.atoms.get_cell().angles()
+        max_deviation = max(abs(a - 90.0) for a in angles)
+        if max_deviation <= angle_threshold:
+            return False
+
+        H = self.H.B.copy()
+        n = self.n_coords
+        T_masked = _niggli_hessian_transform(
+            self.atoms, self.orig_cell, self.exp_cell_factor, self.cell_mask
+        )
+        H_cell_new = T_masked.T @ H[n:, n:] @ T_masked
+        H[n:, n:] = H_cell_new
+        H[:n, n:] = H[:n, n:] @ T_masked
+        H[n:, :n] = T_masked.T @ H[n:, :n]
+
+        self.orig_cell = self.atoms.get_cell().array.copy()
+        self.set_H(H, initialized=True)
+        self.curr = dict(x=None, f=None, g=None)
+        self.last = self.curr.copy()
+        return True
+
+    def refine_hessian(self, refine_level: int = 1, delta: float = 1e-5):
+        """Re-refine Hessian cell blocks via finite differences."""
+        if refine_level < 1:
+            return
+        H = self.H.asarray()
+        n = self.n_coords
+        H_cell_cols = self._compute_cell_hessian_columns(delta)
+        H[:n, n:] = H_cell_cols[:n, :]
+        H[n:, :n] = H_cell_cols[:n, :].T
+        H_cell_cell = H_cell_cols[n:, :]
+        H[n:, n:] = (H_cell_cell + H_cell_cell.T) / 2
+        self.set_H(H, initialized=True)
+        logger.info("Hessian re-refined at level %d", refine_level)
+
+    def _init_cell_hessian(self, H_old, refine_initial_hessian, hessian_delta,
+                           save_hessian, H_coords_default):
+        """Build the block-diagonal initial Hessian (shared init logic).
+
+        H_coords_default is used when H_old is None (caller-specific guess).
+        """
+        H0_full = np.zeros((self.dim, self.dim))
+        n = self.n_coords
+        if H_old is not None:
+            H0_full[:n, :n] = H_old
+        else:
+            H0_full[:n, :n] = H_coords_default
+
+        if refine_initial_hessian is True:
+            refine_level = 1
+        elif refine_initial_hessian is False:
+            refine_level = 0
+        else:
+            refine_level = int(refine_initial_hessian)
+
+        if refine_level >= 1:
+            H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
+            H0_full[:n, n:] = H_cell_cols[:n, :]
+            H0_full[n:, :n] = H_cell_cols[:n, :].T
+            H_cell_cell = H_cell_cols[n:, :]
+            H0_full[n:, n:] = (H_cell_cell + H_cell_cell.T) / 2
+
+        if refine_level == 0:
+            H0_full[n:, n:] = np.eye(self.n_cell_dof)
+
+        if save_hessian is not None:
+            np.save(save_hessian, H0_full)
+            logger.info("Initial Hessian saved to %s", save_hessian)
+
+        return H0_full, refine_level
+
+    def get_drdx(self):
+        """Get constraint Jacobian extended with zeros for cell DOF."""
+        drdx_coords = super().get_drdx()
+        n_cons = drdx_coords.shape[0]
+        drdx = np.zeros((n_cons, self.dim))
+        drdx[:, :self.n_coords] = drdx_coords
+        return drdx
+
+
+class CellInternalPES(_CellPESMixin, InternalPES):
     """Internal coordinate PES with unit cell optimization.
 
     This class extends InternalPES to simultaneously optimize both internal
@@ -1379,101 +1577,50 @@ class CellInternalPES(InternalPES):
         save_hessian : str, optional
             Path to save the initial Hessian as .npy file for analysis.
         """
-        # Store original cell as reference before any optimization
-        self.orig_cell = atoms.get_cell().array.copy()
-
-        # Cell parameterization scaling (like ASE's FrechetCellFilter)
-        if exp_cell_factor is None:
-            exp_cell_factor = float(len(atoms))
-        self.exp_cell_factor = exp_cell_factor
-
-        # Cell mask: which of the 9 cell matrix elements are free
-        if cell_mask is None:
-            cell_mask = np.ones((3, 3), dtype=bool)
-        self.cell_mask = np.asarray(cell_mask, dtype=bool).reshape((3, 3))
-        self.n_cell_dof = int(self.cell_mask.sum())
-
-        # External pressure
-        self.scalar_pressure = scalar_pressure
+        self._init_cell_params(atoms, exp_cell_factor, cell_mask,
+                               scalar_pressure)
 
         # Store rigid_fragments request; auto-detection deferred until after
         # parent init populates translations via find_all_bonds()
         self._rigid_fragments_request = rigid_fragments
 
-        # Flag to control get_x behavior during parent initialization
-        # When True, get_x returns only internal coords (for parent __init__)
         self._initializing = True
-        self.n_internal = None  # Will be set by parent
+        self.n_internal = None
 
-        # Initialize parent class - this will set up internal coords
-        # (including finding bonds/angles/translations if auto_find_internals)
         InternalPES.__init__(self, atoms, internals, *args, H0=H0, **kwargs)
 
-        # Now parent is initialized. Store internal-only dimension.
-        self.n_internal = self.dim  # Parent set dim to internal coords count
+        self.n_internal = self.dim
 
-        # Rigid fragment mode: auto-detect from translations in internals
-        # (must be after parent init, which calls find_all_bonds and adds translations)
         if self._rigid_fragments_request is None:
             self.rigid_fragments = bool(self.int.internals.get('translations', []))
         else:
             self.rigid_fragments = self._rigid_fragments_request
 
         if self.rigid_fragments:
-            # Extract fragment atom groups from Translation coordinates
             self.fragment_groups, self.fragment_dummy_groups = \
                 self._extract_fragment_groups(self.int)
 
-        # Update dimension to include cell DOF
         self.dim = self.n_internal + self.n_cell_dof
 
-        # Cache for the cell-extended constraint Hessian (separate from the
-        # parent's internal-only _Hc_cache).
         self._Hc_cell_cache = _LRU2()
-
-        # Cache for the cell-extended basis (parent's _basis_cache only covers
-        # the internal-coords-only basis; CellInternalPES._calc_basis adds the
-        # cell-DOF zero-padding which we cache here).
         self._cell_basis_cache = _LRU2()
-
-        # Done initializing - now get_x returns full vector
         self._initializing = False
 
-        # Create proper Hessian with correct dimensions
-        # Use block-diagonal structure: internal Hessian + cell Hessian
         H_old = self.H.B if self.H is not None and self.H.B is not None else None
-
-        # Pad internal Hessian and add cell block
-        H0_full = np.zeros((self.dim, self.dim))
-        if H_old is not None:
-            H0_full[:self.n_internal, :self.n_internal] = H_old
-        else:
+        if H_old is None:
             B = self.int.jacobian()
             Q, _ = qr(B, mode='economic')
             P = Q @ Q.T
-            H_internal = P @ self.int.guess_hessian() @ P
-            H0_full[:self.n_internal, :self.n_internal] = H_internal
-
-        # Convert bool to int for refinement level
-        if refine_initial_hessian is True:
-            refine_level = 1
-        elif refine_initial_hessian is False:
-            refine_level = 0
+            H_coords_default = P @ self.int.guess_hessian() @ P
         else:
-            refine_level = int(refine_initial_hessian)
+            H_coords_default = None
 
-        if refine_level >= 1:
-            # Level 1: Refine cell-related blocks
-            H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
-            # Set internal-cell coupling (and its transpose for symmetry)
-            H0_full[:self.n_internal, self.n_internal:] = H_cell_cols[:self.n_internal, :]
-            H0_full[self.n_internal:, :self.n_internal] = H_cell_cols[:self.n_internal, :].T
-            # Set cell-cell block with explicit symmetrization
-            H_cell_cell = H_cell_cols[self.n_internal:, :]
-            H0_full[self.n_internal:, self.n_internal:] = (H_cell_cell + H_cell_cell.T) / 2
+        H0_full, refine_level = self._init_cell_hessian(
+            H_old, refine_initial_hessian, hessian_delta,
+            save_hessian, H_coords_default,
+        )
 
         if refine_level >= 2:
-            # Level 2: Also refine translation and rotation blocks
             H_tric_cols = self._compute_tric_hessian_columns(hessian_delta)
             tric_indices = self._get_tric_indices()
             for i, idx in enumerate(tric_indices):
@@ -1481,198 +1628,36 @@ class CellInternalPES(InternalPES):
                 H0_full[idx, :] = H_tric_cols[:, i]
 
         if refine_level >= 3:
-            # Level 3: Refine full internal Hessian (expensive!)
             H_int_cols = self._compute_internal_hessian_columns(hessian_delta)
-            # Symmetrize and set the internal-internal block
             H0_full[:self.n_internal, :self.n_internal] = (H_int_cols + H_int_cols.T) / 2
 
-        if refine_level == 0:
-            # No refinement: use diagonal guess for cell block
-            h0_cell = 1.0
-            H0_full[self.n_internal:, self.n_internal:] = h0_cell * np.eye(self.n_cell_dof)
-
-        # Save Hessian if requested
-        if save_hessian is not None:
-            np.save(save_hessian, H0_full)
-            logger.info("Initial Hessian saved to %s", save_hessian)
-
-        # With FD-refined Hessian (refine_level >= 1), use initialized=False
-        # to preserve the refined cell block on the first BFGS update — the
-        # uninitialized path only updates B[:ncart, :ncart] (internal block),
-        # which is appropriate since the FD-refined cell block is better than
-        # what one BFGS update would produce.
-        # Without refinement, use initialized=True so the first BFGS update
-        # covers all DOF including cell.
         self.set_H(H0_full, initialized=(refine_level == 0))
 
-    def maybe_niggli_reduce(self, angle_threshold=30.0):
-        """Apply Niggli reduction if cell angles deviate too far from 90 deg.
+    @property
+    def n_coords(self) -> int:
+        return self.n_internal
 
-        When the unit cell becomes highly skewed during optimization, this
-        remaps to the most compact (Niggli-reduced) cell and resets the
-        log-deformation reference. The cell block of the Hessian is
-        transformed to the new parameterization basis via the Jacobian of
-        the log-deformation map.
-
-        Parameters
-        ----------
-        angle_threshold : float
-            Maximum deviation from 90 deg before triggering reduction.
-            Default 30 means reduction triggers when any angle < 60 or > 120.
-
-        Returns
-        -------
-        bool
-            True if reduction was applied.
-        """
-        angles = self.atoms.get_cell().angles()
-        max_deviation = max(abs(a - 90.0) for a in angles)
-        if max_deviation <= angle_threshold:
-            return False
-
-        H = self.H.B.copy()
-        n = self.n_internal
-        T_masked = _niggli_hessian_transform(
-            self.atoms, self.orig_cell, self.exp_cell_factor, self.cell_mask
-        )
-
-        # Transform cell-cell block: H_new = T^T @ H_old @ T
-        H_cell_new = T_masked.T @ H[n:, n:] @ T_masked
-        H[n:, n:] = H_cell_new
-
-        # Transform coupling blocks
-        H[:n, n:] = H[:n, n:] @ T_masked
-        H[n:, :n] = T_masked.T @ H[n:, :n]
-
-        self.orig_cell = self.atoms.get_cell().array.copy()
-        self.set_H(H, initialized=True)
-
-        # Reset cached state so next evaluation recomputes everything
-        self.curr = dict(x=None, f=None, g=None)
-        self.last = self.curr.copy()
-
-        return True
-
-    def save(self):
-        """Save current state including cell."""
-        InternalPES.save(self)
-        self.savepoint['cell'] = self.atoms.get_cell().array.copy()
-
-    def restore(self):
-        """Restore saved state including cell."""
-        InternalPES.restore(self)
-        if 'cell' in self.savepoint:
-            self.atoms.set_cell(self.savepoint['cell'], scale_atoms=False)
+    @property
+    def _scale_atoms_on_cell_change(self) -> bool:
+        return not self.rigid_fragments
 
     def refine_hessian(self, refine_level: int = 1, delta: float = 1e-5):
-        """Re-refine Hessian blocks via finite differences during optimization.
-
-        This can help recover from accumulated bad curvature in the Hessian
-        that develops during BFGS updates.
-
-        Parameters
-        ----------
-        refine_level : int
-            Level of refinement (1=cell, 2=cell+TRIC, 3=full internal).
-        delta : float
-            Finite difference step size.
-        """
-        if refine_level < 1:
+        """Re-refine Hessian blocks (extends base with levels 2-3)."""
+        _CellPESMixin.refine_hessian(self, min(refine_level, 1), delta)
+        if refine_level < 2:
             return
-
-        # Get current Hessian
         H = self.H.asarray()
-
-        if refine_level >= 1:
-            # Level 1: Refine cell-related blocks
-            H_cell_cols = self._compute_cell_hessian_columns(delta)
-            # Set internal-cell coupling (and its transpose for symmetry)
-            H[:self.n_internal, self.n_internal:] = H_cell_cols[:self.n_internal, :]
-            H[self.n_internal:, :self.n_internal] = H_cell_cols[:self.n_internal, :].T
-            # Set cell-cell block with explicit symmetrization
-            H_cell_cell = H_cell_cols[self.n_internal:, :]
-            H[self.n_internal:, self.n_internal:] = (H_cell_cell + H_cell_cell.T) / 2
-
         if refine_level >= 2:
-            # Level 2: Also refine translation and rotation blocks
             H_tric_cols = self._compute_tric_hessian_columns(delta)
             tric_indices = self._get_tric_indices()
             for i, idx in enumerate(tric_indices):
                 H[:, idx] = H_tric_cols[:, i]
                 H[idx, :] = H_tric_cols[:, i]
-
         if refine_level >= 3:
-            # Level 3: Refine full internal Hessian (expensive!)
             H_int_cols = self._compute_internal_hessian_columns(delta)
-            # Symmetrize and set the internal-internal block
             H[:self.n_internal, :self.n_internal] = (H_int_cols + H_int_cols.T) / 2
-
-        # Update the Hessian (preserves eigenvalue tracking, etc.)
         self.set_H(H, initialized=True)
         logger.info("Hessian re-refined at level %d", refine_level)
-
-    def _compute_cell_hessian_columns(self, delta: float) -> np.ndarray:
-        """Compute Hessian columns for cell DOF via finite differences.
-
-        This computes d(gradient)/d(cell_param) for all cell parameters,
-        giving us both the internal-cell coupling block and the cell-cell block.
-
-        Parameters
-        ----------
-        delta : float
-            Finite difference step size.
-
-        Returns
-        -------
-        H_cols : ndarray
-            Array of shape (dim, n_cell_dof) containing Hessian columns.
-        """
-        H_cols = np.zeros((self.dim, self.n_cell_dof))
-
-        # Save current state
-        x0 = self.get_x()
-        cell0 = self.atoms.get_cell().array.copy()
-        pos0 = self.atoms.positions.copy()
-
-        n_evals = 2 * self.n_cell_dof
-        logger.info("Refining initial Hessian: 0/%d force calls", n_evals)
-
-        for i in range(self.n_cell_dof):
-            # Restore state before each FD probe to ensure path-independence
-            self.atoms.positions = pos0.copy()
-            self.atoms.set_cell(cell0, scale_atoms=False)
-
-            # Displace cell parameter +delta
-            x_plus = x0.copy()
-            x_plus[self.n_internal + i] += delta
-            self.set_x(x_plus)
-            _, g_plus = self.eval()
-            logger.info("Refining initial Hessian: %d/%d force calls", 2*i + 1, n_evals)
-
-            # Restore before -delta
-            self.atoms.positions = pos0.copy()
-            self.atoms.set_cell(cell0, scale_atoms=False)
-
-            # Displace cell parameter -delta
-            x_minus = x0.copy()
-            x_minus[self.n_internal + i] -= delta
-            self.set_x(x_minus)
-            _, g_minus = self.eval()
-            logger.info("Refining initial Hessian: %d/%d force calls", 2*i + 2, n_evals)
-
-            # Central difference
-            H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
-
-
-        # Restore original state
-        self.atoms.positions = pos0
-        self.atoms.set_cell(cell0, scale_atoms=False)
-        # Clear cached values to force recomputation
-        self.curr['x'] = None
-        self.curr['f'] = None
-        self.curr['g'] = None
-
-        return H_cols
 
     def _get_tric_indices(self) -> np.ndarray:
         """Get indices of translation and rotation coordinates in internal space."""
@@ -1838,42 +1823,6 @@ class CellInternalPES(InternalPES):
                     + (dx + np.pi) % (2 * np.pi) - np.pi
                 )
         return x
-
-    def _get_deformation_gradient(self) -> np.ndarray:
-        """Get current deformation gradient F = cell @ inv(orig_cell)."""
-        return self.atoms.get_cell().array @ np.linalg.inv(self.orig_cell)
-
-    def _get_log_deform(self) -> np.ndarray:
-        """Get log of deformation gradient, scaled by exp_cell_factor."""
-        F = self._get_deformation_gradient()
-        return _logm_3x3(F) * self.exp_cell_factor
-
-    def _set_cell_from_log_deform(self, log_deform_scaled: np.ndarray) -> None:
-        """Set cell from scaled log-deformation gradient.
-
-        When rigid_fragments is False, scales atomic positions with cell
-        (fixed fractional coords), matching the virial stress definition.
-
-        When rigid_fragments is True, keeps Cartesian positions fixed here.
-        The rigid fragment CoM translation in set_x() then moves each fragment
-        to maintain its fractional CoM position while preserving intramolecular
-        geometry.
-        """
-        log_deform = log_deform_scaled / self.exp_cell_factor
-        F = expm(log_deform.real)
-        new_cell = F @ self.orig_cell
-        self.atoms.set_cell(new_cell, scale_atoms=not self.rigid_fragments)
-
-    def _masked_cell_params(self) -> np.ndarray:
-        """Get cell parameters as flat array (only free DOF)."""
-        log_deform = self._get_log_deform()
-        return log_deform[self.cell_mask]
-
-    def _set_masked_cell_params(self, params: np.ndarray) -> None:
-        """Set cell from flat array of free DOF."""
-        log_deform = self._get_log_deform()
-        log_deform[self.cell_mask] = params
-        self._set_cell_from_log_deform(log_deform)
 
     @staticmethod
     def _extract_fragment_groups(internals):
@@ -2316,23 +2265,6 @@ class CellInternalPES(InternalPES):
         B = self.int.jacobian()
         return -(Ufree_int @ (Ufree_int.T @ g_internal) @ B).reshape((-1, 3))
 
-    def get_drdx(self):
-        """Get constraint Jacobian extended for cell DOF.
-
-        The constraint Jacobian from the parent class only has columns for
-        internal coordinates. We extend it with zero columns for cell DOF
-        since there are no constraints on the cell.
-        """
-        # Get internal constraint Jacobian from parent
-        drdx_int = InternalPES.get_drdx(self)
-
-        # Extend with zeros for cell DOF
-        n_cons = drdx_int.shape[0]
-        drdx = np.zeros((n_cons, self.dim))
-        drdx[:, :self.n_internal] = drdx_int
-
-        return drdx
-
     def get_Hc(self):
         """Get constraint Hessian extended for cell DOF.
 
@@ -2360,7 +2292,7 @@ class CellInternalPES(InternalPES):
         return Hc
 
 
-class CellCartesianPES(PES):
+class CellCartesianPES(_CellPESMixin, PES):
     """Cartesian PES with unit cell optimization.
 
     This class extends PES to simultaneously optimize both atomic Cartesian
@@ -2422,279 +2354,35 @@ class CellCartesianPES(PES):
         save_hessian : str, optional
             Path to save the initial Hessian as .npy file for analysis.
         """
-        # Store original cell as reference before any optimization
-        self.orig_cell = atoms.get_cell().array.copy()
+        self._init_cell_params(atoms, exp_cell_factor, cell_mask,
+                               scalar_pressure)
 
-        # Cell parameterization scaling (like ASE's FrechetCellFilter)
-        if exp_cell_factor is None:
-            exp_cell_factor = float(len(atoms))
-        self.exp_cell_factor = exp_cell_factor
-
-        # Cell mask: which of the 9 cell matrix elements are free
-        if cell_mask is None:
-            cell_mask = np.ones((3, 3), dtype=bool)
-        self.cell_mask = np.asarray(cell_mask, dtype=bool).reshape((3, 3))
-        self.n_cell_dof = int(self.cell_mask.sum())
-
-        # External pressure
-        self.scalar_pressure = scalar_pressure
-
-        # Flag to control get_x behavior during parent initialization
         self._initializing = True
-
-        # Initialize parent class - PES uses 3*natoms as dimension
         PES.__init__(self, atoms, *args, H0=H0, **kwargs)
-
-        # Store Cartesian dimension (set by parent)
-        self.n_cart = self.dim  # 3 * natoms
-
-        # Update dimension to include cell DOF
+        self.n_cart = self.dim
         self.dim = self.n_cart + self.n_cell_dof
-
-        # Done initializing - now get_x returns full vector
         self._initializing = False
 
-        # Create proper Hessian with correct dimensions
-        # Use block-diagonal structure: Cartesian Hessian + cell Hessian
         H_old = self.H.B if self.H is not None and self.H.B is not None else None
+        H_coords_default = 70.0 * np.eye(self.n_cart) if H_old is None else None
 
-        H0_full = np.zeros((self.dim, self.dim))
-        if H_old is not None:
-            H0_full[:self.n_cart, :self.n_cart] = H_old
-        else:
-            # Default: 70 eV/Å² is reasonable for stiff materials
-            H0_full[:self.n_cart, :self.n_cart] = 70.0 * np.eye(self.n_cart)
-
-        # Convert bool to int for refinement level
-        if refine_initial_hessian is True:
-            refine_level = 1
-        elif refine_initial_hessian is False:
-            refine_level = 0
-        else:
-            refine_level = int(refine_initial_hessian)
-
-        if refine_level >= 1:
-            # Level 1: Refine cell-related blocks
-            H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
-            # Set Cartesian-cell coupling (and its transpose for symmetry)
-            H0_full[:self.n_cart, self.n_cart:] = H_cell_cols[:self.n_cart, :]
-            H0_full[self.n_cart:, :self.n_cart] = H_cell_cols[:self.n_cart, :].T
-            # Set cell-cell block with explicit symmetrization
-            H_cell_cell = H_cell_cols[self.n_cart:, :]
-            H0_full[self.n_cart:, self.n_cart:] = (H_cell_cell + H_cell_cell.T) / 2
-
-        if refine_level == 0:
-            # No refinement: use diagonal guess for cell block
-            h0_cell = 1.0
-            H0_full[self.n_cart:, self.n_cart:] = h0_cell * np.eye(self.n_cell_dof)
-
-        # Save Hessian if requested
-        if save_hessian is not None:
-            np.save(save_hessian, H0_full)
-            logger.info("Initial Hessian saved to %s", save_hessian)
-
+        H0_full, refine_level = self._init_cell_hessian(
+            H_old, refine_initial_hessian, hessian_delta,
+            save_hessian, H_coords_default,
+        )
         self.set_H(H0_full, initialized=(refine_level == 0))
 
-    def maybe_niggli_reduce(self, angle_threshold=30.0):
-        """Apply Niggli reduction if cell angles deviate too far from 90 deg.
-
-        When the unit cell becomes highly skewed during optimization, this
-        remaps to the most compact (Niggli-reduced) cell and resets the
-        log-deformation reference. The cell block of the Hessian is
-        transformed to the new parameterization basis via the Jacobian of
-        the log-deformation map.
-
-        Parameters
-        ----------
-        angle_threshold : float
-            Maximum deviation from 90 deg before triggering reduction.
-            Default 30 means reduction triggers when any angle < 60 or > 120.
-
-        Returns
-        -------
-        bool
-            True if reduction was applied.
-        """
-        angles = self.atoms.get_cell().angles()
-        max_deviation = max(abs(a - 90.0) for a in angles)
-        if max_deviation <= angle_threshold:
-            return False
-
-        H = self.H.B.copy()
-        n = self.n_cart
-        T_masked = _niggli_hessian_transform(
-            self.atoms, self.orig_cell, self.exp_cell_factor, self.cell_mask
-        )
-
-        # Transform cell-cell block: H_new = T^T @ H_old @ T
-        H_cell_new = T_masked.T @ H[n:, n:] @ T_masked
-        H[n:, n:] = H_cell_new
-
-        # Transform coupling blocks
-        H[:n, n:] = H[:n, n:] @ T_masked
-        H[n:, :n] = T_masked.T @ H[n:, :n]
-
-        self.orig_cell = self.atoms.get_cell().array.copy()
-        self.set_H(H, initialized=True)
-
-        # Reset cached state so next evaluation recomputes everything
-        self.curr = dict(x=None, f=None, g=None)
-        self.last = self.curr.copy()
-
-        return True
-
-    def save(self):
-        """Save current state including cell."""
-        PES.save(self)
-        self.savepoint['cell'] = self.atoms.get_cell().array.copy()
-
-    def restore(self):
-        """Restore saved state including cell."""
-        PES.restore(self)
-        if 'cell' in self.savepoint:
-            self.atoms.set_cell(self.savepoint['cell'], scale_atoms=False)
-
-    def refine_hessian(self, refine_level: int = 1, delta: float = 1e-5):
-        """Re-refine Hessian blocks via finite differences during optimization.
-
-        This can help recover from accumulated bad curvature in the Hessian
-        that develops during BFGS updates.
-
-        Parameters
-        ----------
-        refine_level : int
-            Level of refinement (only level 1 supported for Cartesian).
-        delta : float
-            Finite difference step size.
-        """
-        if refine_level < 1:
-            return
-
-        # Get current Hessian
-        H = self.H.asarray()
-
-        # Level 1: Refine cell-related blocks
-        H_cell_cols = self._compute_cell_hessian_columns(delta)
-        # Set Cartesian-cell coupling (and its transpose for symmetry)
-        H[:self.n_cart, self.n_cart:] = H_cell_cols[:self.n_cart, :]
-        H[self.n_cart:, :self.n_cart] = H_cell_cols[:self.n_cart, :].T
-        # Set cell-cell block with explicit symmetrization
-        H_cell_cell = H_cell_cols[self.n_cart:, :]
-        H[self.n_cart:, self.n_cart:] = (H_cell_cell + H_cell_cell.T) / 2
-
-        # Update the Hessian (preserves eigenvalue tracking, etc.)
-        self.set_H(H, initialized=True)
-        logger.info("Hessian re-refined at level %d", refine_level)
-
-    def _compute_cell_hessian_columns(self, delta: float) -> np.ndarray:
-        """Compute Hessian columns for cell DOF via finite differences.
-
-        This computes d(gradient)/d(cell_param) for all cell parameters,
-        giving us both the Cartesian-cell coupling block and the cell-cell block.
-
-        Parameters
-        ----------
-        delta : float
-            Finite difference step size.
-
-        Returns
-        -------
-        H_cols : ndarray
-            Array of shape (dim, n_cell_dof) containing Hessian columns.
-        """
-        H_cols = np.zeros((self.dim, self.n_cell_dof))
-
-        # Save current state
-        x0 = self.get_x()
-        cell0 = self.atoms.get_cell().array.copy()
-        pos0 = self.atoms.positions.copy()
-
-        n_evals = 2 * self.n_cell_dof
-        logger.info("Refining initial Hessian: 0/%d force calls", n_evals)
-
-        for i in range(self.n_cell_dof):
-            # Restore state before each FD probe
-            self.atoms.positions = pos0.copy()
-            self.atoms.set_cell(cell0, scale_atoms=False)
-
-            # Displace cell parameter +delta
-            x_plus = x0.copy()
-            x_plus[self.n_cart + i] += delta
-            self.set_x(x_plus)
-            _, g_plus = self.eval()
-            logger.info("Refining initial Hessian: %d/%d force calls", 2*i + 1, n_evals)
-
-            # Restore before -delta
-            self.atoms.positions = pos0.copy()
-            self.atoms.set_cell(cell0, scale_atoms=False)
-
-            # Displace cell parameter -delta
-            x_minus = x0.copy()
-            x_minus[self.n_cart + i] -= delta
-            self.set_x(x_minus)
-            _, g_minus = self.eval()
-            logger.info("Refining initial Hessian: %d/%d force calls", 2*i + 2, n_evals)
-
-            # Central difference
-            H_cols[:, i] = (g_plus - g_minus) / (2 * delta)
-
-
-        # Restore original state
-        self.atoms.positions = pos0
-        self.atoms.set_cell(cell0, scale_atoms=False)
-        # Clear cached values to force recomputation
-        self.curr['x'] = None
-        self.curr['f'] = None
-        self.curr['g'] = None
-
-        return H_cols
+    @property
+    def n_coords(self) -> int:
+        return self.n_cart
 
     def get_x(self) -> np.ndarray:
-        """Return Cartesian positions + cell parameters.
-
-        During initialization (_initializing=True), returns only Cartesian coords
-        to be compatible with parent class initialization.
-        """
+        """Return Cartesian positions + cell parameters."""
         x_cart = self.apos.ravel().copy()
-
-        # During parent initialization, return only Cartesian coords
         if self._initializing:
             return x_cart
-
         cell_params = self._masked_cell_params()
         return np.concatenate([x_cart, cell_params])
-
-    def _get_deformation_gradient(self) -> np.ndarray:
-        """Get current deformation gradient F = cell @ inv(orig_cell)."""
-        return self.atoms.get_cell().array @ np.linalg.inv(self.orig_cell)
-
-    def _get_log_deform(self) -> np.ndarray:
-        """Get log of deformation gradient, scaled by exp_cell_factor."""
-        F = self._get_deformation_gradient()
-        return _logm_3x3(F) * self.exp_cell_factor
-
-    def _set_cell_from_log_deform(self, log_deform_scaled: np.ndarray) -> None:
-        """Set cell from scaled log-deformation gradient.
-
-        Does not scale atoms — in CellCartesianPES, positions are set
-        explicitly by set_x() after the cell change. The gradient formula
-        already accounts for fixed-Cartesian positions via the r^T @ f term.
-        """
-        log_deform = log_deform_scaled / self.exp_cell_factor
-        F = expm(log_deform.real)
-        new_cell = F @ self.orig_cell
-        self.atoms.set_cell(new_cell, scale_atoms=False)
-
-    def _masked_cell_params(self) -> np.ndarray:
-        """Get cell parameters as flat array (only free DOF)."""
-        log_deform = self._get_log_deform()
-        return log_deform[self.cell_mask]
-
-    def _set_masked_cell_params(self, params: np.ndarray) -> None:
-        """Set cell from flat array of free DOF."""
-        log_deform = self._get_log_deform()
-        log_deform[self.cell_mask] = params
-        self._set_cell_from_log_deform(log_deform)
 
     def set_x(self, target: np.ndarray):
         """Set Cartesian positions and cell parameters.
@@ -2903,14 +2591,6 @@ class CellCartesianPES(PES):
         Ufree = self.get_Ufree()
         Ufree_cart = Ufree[:self.n_cart, :]
         return -(Ufree_cart @ (Ufree_cart.T @ g_cart)).reshape((-1, 3))
-
-    def get_drdx(self):
-        """Get constraint Jacobian extended for cell DOF."""
-        drdx_cart = PES.get_drdx(self)
-        n_cons = drdx_cart.shape[0]
-        drdx = np.zeros((n_cons, self.dim))
-        drdx[:, :self.n_cart] = drdx_cart
-        return drdx
 
     def get_Hc(self):
         """Get constraint Hessian extended for cell DOF."""
