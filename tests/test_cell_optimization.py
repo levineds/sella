@@ -411,75 +411,35 @@ class TestCellCartesianPES:
 class TestCellCartesianGradient:
     """Test cell gradient calculations in CellCartesianPES."""
 
-    def test_cell_gradient_numerical(self):
-        """Test cell gradient matches numerical finite difference for bulk Cu."""
+    def test_gradient_numerical(self):
+        """Test full gradient (Cartesian + cell) matches numerical FD for bulk Cu."""
         atoms = bulk('Cu', 'fcc', a=3.6)
         atoms.calc = EMT()
-
         pes = CellCartesianPES(atoms)
 
-        # Get analytical gradient
         _, g = pes.eval()
-        g_cell = g[pes.n_cart:]  # Cell part of gradient
-
-        # Numerical gradient via finite difference on cell parameters
         delta = 1e-6
         x0 = pes.get_x()
-        g_cell_numeric = np.zeros(pes.n_cell_dof)
+        g_numeric = np.zeros(pes.dim)
 
-        for i in range(pes.n_cell_dof):
-            pes.set_x(x0)  # Restore before each probe
-            x_plus = x0.copy()
-            x_plus[pes.n_cart + i] += delta
-            pes.set_x(x_plus)
-            e_plus, _ = pes.eval()
-
-            pes.set_x(x0)  # Restore before -delta
-            x_minus = x0.copy()
-            x_minus[pes.n_cart + i] -= delta
-            pes.set_x(x_minus)
-            e_minus, _ = pes.eval()
-
-            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
-
-        pes.set_x(x0)
-
-        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
-
-    def test_cartesian_gradient_numerical(self):
-        """Test Cartesian gradient matches numerical finite difference."""
-        atoms = bulk('Cu', 'fcc', a=3.6)
-        atoms.calc = EMT()
-
-        pes = CellCartesianPES(atoms)
-
-        # Get analytical gradient
-        _, g = pes.eval()
-        g_cart = g[:pes.n_cart]  # Cartesian part of gradient
-
-        # Numerical gradient via finite difference
-        delta = 1e-6
-        x0 = pes.get_x()
-        g_cart_numeric = np.zeros(pes.n_cart)
-
-        for i in range(pes.n_cart):
-            pes.set_x(x0)  # Restore before each probe
+        for i in range(pes.dim):
+            pes.set_x(x0)
             x_plus = x0.copy()
             x_plus[i] += delta
             pes.set_x(x_plus)
             e_plus, _ = pes.eval()
 
-            pes.set_x(x0)  # Restore before -delta
+            pes.set_x(x0)
             x_minus = x0.copy()
             x_minus[i] -= delta
             pes.set_x(x_minus)
             e_minus, _ = pes.eval()
 
-            g_cart_numeric[i] = (e_plus - e_minus) / (2 * delta)
+            g_numeric[i] = (e_plus - e_minus) / (2 * delta)
 
         pes.set_x(x0)
 
-        assert_allclose(g_cart, g_cart_numeric, atol=1e-4, rtol=1e-3)
+        assert_allclose(g, g_numeric, atol=1e-4, rtol=1e-3)
 
 
 class TestSellaWithCellOptimization:
@@ -1186,56 +1146,13 @@ class TestRigidFragments:
         for group in pes.fragment_groups:
             assert_allclose(delta_r[group].mean(axis=0), 0, atol=1e-12)
 
-    def test_rigid_fragment_cell_gradient_numerical(self):
-        """Test rigid fragment cell gradient matches numerical finite difference.
-
-        This is the key correctness test: the analytical cell gradient with
-        rigid fragment mode should match the energy change when we actually
-        move fragment CoMs to maintain fractional positions.
-        """
-        atoms = self._make_two_water_crystal()
-        internals = Internals(atoms, allow_fragments=True)
-
-        pes = CellInternalPES(atoms, internals)
-        assert pes.rigid_fragments is True
-
-        # Get analytical gradient
-        _, g = pes.eval()
-        g_cell = g[pes.n_internal:]
-
-        # Numerical gradient via finite difference on cell parameters
-        delta = 1e-6
-        x0 = pes.get_x()
-        g_cell_numeric = np.zeros(pes.n_cell_dof)
-
-        for i in range(pes.n_cell_dof):
-            pes.set_x(x0)  # Restore before each probe
-            x_plus = x0.copy()
-            x_plus[pes.n_internal + i] += delta
-            pes.set_x(x_plus)
-            e_plus, _ = pes.eval()
-
-            pes.set_x(x0)  # Restore before -delta
-            x_minus = x0.copy()
-            x_minus[pes.n_internal + i] -= delta
-            pes.set_x(x_minus)
-            e_minus, _ = pes.eval()
-
-            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
-
-        pes.set_x(x0)
-
-        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
-
-    def test_rigid_fragment_cell_gradient_nonorthogonal(self):
-        """Test rigid fragment gradient with non-orthogonal cell."""
+    def _make_triclinic_crystal(self):
+        """Create two water molecules in a triclinic periodic box."""
         water1 = molecule('H2O')
         water2 = molecule('H2O')
         water1.positions += [1.0, 1.0, 1.0]
         water2.positions += [4.0, 4.0, 4.0]
         atoms = water1 + water2
-
-        # Non-orthogonal cell (triclinic)
         cell = np.array([
             [7.0, 0.5, 0.3],
             [0.0, 6.8, 0.4],
@@ -1244,38 +1161,72 @@ class TestRigidFragments:
         atoms.set_cell(cell)
         atoms.pbc = True
         atoms.calc = LennardJones()
+        return atoms
 
-        internals = Internals(atoms, allow_fragments=True)
+    def _make_sheared_crystal(self):
+        """Create two water molecules in a heavily sheared triclinic cell."""
+        water1 = molecule('H2O')
+        water2 = molecule('H2O')
+        water1.positions += [1.0, 1.0, 1.0]
+        water2.positions += [4.0, 4.0, 4.0]
+        atoms = water1 + water2
+        cell = np.array([
+            [7.0, 1.5, 0.8],
+            [0.0, 6.5, 1.2],
+            [0.0, 0.0, 7.5],
+        ])
+        atoms.set_cell(cell)
+        atoms.pbc = True
+        atoms.calc = LennardJones()
+        return atoms
 
-        pes = CellInternalPES(atoms, internals)
-        assert pes.rigid_fragments is True
-
-        # Get analytical gradient
+    def _cell_gradient_fd(self, pes, delta=1e-6):
+        """Compute cell DOF gradient via central finite differences."""
         _, g = pes.eval()
         g_cell = g[pes.n_internal:]
-
-        # Numerical gradient
-        delta = 1e-6
         x0 = pes.get_x()
         g_cell_numeric = np.zeros(pes.n_cell_dof)
-
         for i in range(pes.n_cell_dof):
-            pes.set_x(x0)  # Restore before each probe
+            pes.set_x(x0)
             x_plus = x0.copy()
             x_plus[pes.n_internal + i] += delta
             pes.set_x(x_plus)
             e_plus, _ = pes.eval()
-
-            pes.set_x(x0)  # Restore before -delta
+            pes.set_x(x0)
             x_minus = x0.copy()
             x_minus[pes.n_internal + i] -= delta
             pes.set_x(x_minus)
             e_minus, _ = pes.eval()
-
             g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
-
         pes.set_x(x0)
+        return g_cell, g_cell_numeric
 
+    @pytest.mark.parametrize("setup", [
+        "orthogonal", "triclinic", "sheared", "deformed",
+    ])
+    def test_rigid_fragment_cell_gradient_numerical(self, setup):
+        """Test rigid fragment cell gradient matches numerical FD."""
+        if setup == "orthogonal":
+            atoms = self._make_two_water_crystal()
+        elif setup == "triclinic":
+            atoms = self._make_triclinic_crystal()
+        elif setup == "sheared":
+            atoms = self._make_sheared_crystal()
+        elif setup == "deformed":
+            atoms = self._make_two_water_crystal()
+
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals)
+        assert pes.rigid_fragments is True
+
+        if setup == "deformed":
+            x0 = pes.get_x()
+            x_deformed = x0.copy()
+            for i in range(pes.n_cell_dof):
+                x_deformed[pes.n_internal + i] += 0.02 * ((-1)**i)
+            pes.set_x(x_deformed)
+
+        g_cell, g_cell_numeric = self._cell_gradient_fd(pes)
         assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
 
     def test_intramolecular_geometry_preserved_after_cell_step(self):
@@ -1390,106 +1341,6 @@ class TestRigidFragments:
                     "Fragment atoms should rotate under shear deformation"
                 )
 
-    def test_gradient_numerical_large_shear(self):
-        """Test gradient correctness with a heavily sheared cell.
-
-        This stress-tests the rotation correction at large deformation
-        where the rotation component R deviates significantly from identity.
-        """
-        water1 = molecule('H2O')
-        water2 = molecule('H2O')
-        water1.positions += [1.0, 1.0, 1.0]
-        water2.positions += [4.0, 4.0, 4.0]
-        atoms = water1 + water2
-
-        # Heavily sheared triclinic cell
-        cell = np.array([
-            [7.0, 1.5, 0.8],
-            [0.0, 6.5, 1.2],
-            [0.0, 0.0, 7.5],
-        ])
-        atoms.set_cell(cell)
-        atoms.pbc = True
-        atoms.calc = LennardJones()
-
-        internals = Internals(atoms, allow_fragments=True)
-        pes = CellInternalPES(atoms, internals)
-        assert pes.rigid_fragments is True
-
-        # Get analytical gradient
-        _, g = pes.eval()
-        g_cell = g[pes.n_internal:]
-
-        # Numerical gradient via finite difference
-        delta = 1e-6
-        x0 = pes.get_x()
-        g_cell_numeric = np.zeros(pes.n_cell_dof)
-
-        for i in range(pes.n_cell_dof):
-            pes.set_x(x0)
-            x_plus = x0.copy()
-            x_plus[pes.n_internal + i] += delta
-            pes.set_x(x_plus)
-            e_plus, _ = pes.eval()
-
-            pes.set_x(x0)
-            x_minus = x0.copy()
-            x_minus[pes.n_internal + i] -= delta
-            pes.set_x(x_minus)
-            e_minus, _ = pes.eval()
-
-            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
-
-        pes.set_x(x0)
-
-        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
-
-    def test_gradient_after_cell_step(self):
-        """Test gradient correctness after the cell has already been deformed.
-
-        After a cell step, F != I and the rotation correction is nonzero.
-        Verify gradient still matches numerical FD at the deformed geometry.
-        """
-        atoms = self._make_two_water_crystal()
-        internals = Internals(atoms, allow_fragments=True)
-        pes = CellInternalPES(atoms, internals)
-
-        # First, apply a cell deformation to move away from F = I
-        x0 = pes.get_x()
-        x_deformed = x0.copy()
-        # Apply a mix of diagonal and off-diagonal strains
-        n_cell = pes.n_cell_dof
-        for i in range(n_cell):
-            x_deformed[pes.n_internal + i] += 0.02 * ((-1)**i)
-        pes.set_x(x_deformed)
-
-        # Now verify gradient at this deformed state
-        _, g = pes.eval()
-        g_cell = g[pes.n_internal:]
-
-        delta = 1e-6
-        x1 = pes.get_x()
-        g_cell_numeric = np.zeros(n_cell)
-
-        for i in range(n_cell):
-            pes.set_x(x1)
-            x_plus = x1.copy()
-            x_plus[pes.n_internal + i] += delta
-            pes.set_x(x_plus)
-            e_plus, _ = pes.eval()
-
-            pes.set_x(x1)
-            x_minus = x1.copy()
-            x_minus[pes.n_internal + i] -= delta
-            pes.set_x(x_minus)
-            e_minus, _ = pes.eval()
-
-            g_cell_numeric[i] = (e_plus - e_minus) / (2 * delta)
-
-        pes.set_x(x1)
-
-        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
-
     def _full_gradient_fd(self, pes, delta_int=1e-5, delta_cell=1e-6):
         """Compute full numerical gradient via central finite differences."""
         _, g_analytical = pes.eval()
@@ -1516,51 +1367,26 @@ class TestRigidFragments:
         pes.set_x(x0)
         return g_analytical, g_numeric
 
-    def test_full_gradient_numerical_rigid_fragments(self):
-        """Verify analytical gradient matches FD for ALL DOFs (internal + cell)."""
-        atoms = self._make_two_water_crystal()
-        internals = Internals(atoms, allow_fragments=True)
-        pes = CellInternalPES(atoms, internals)
-        assert pes.rigid_fragments is True
-
-        g_analytical, g_numeric = self._full_gradient_fd(pes)
-        assert_allclose(g_analytical, g_numeric, atol=1e-4, rtol=1e-3)
-
-    def test_full_gradient_numerical_triclinic(self):
-        """Verify full gradient with non-orthogonal cell (rotation correction active)."""
-        water1 = molecule('H2O')
-        water2 = molecule('H2O')
-        water1.positions += [1.0, 1.0, 1.0]
-        water2.positions += [4.0, 4.0, 4.0]
-        atoms = water1 + water2
-
-        cell = np.array([
-            [7.0, 0.5, 0.3],
-            [0.0, 6.8, 0.4],
-            [0.0, 0.0, 7.2],
-        ])
-        atoms.set_cell(cell)
-        atoms.pbc = True
-        atoms.calc = LennardJones()
+    @pytest.mark.parametrize("setup", [
+        "orthogonal", "triclinic", "deformed",
+    ])
+    def test_full_gradient_numerical(self, setup):
+        """Verify analytical gradient matches FD for ALL DOFs."""
+        if setup == "triclinic":
+            atoms = self._make_triclinic_crystal()
+        else:
+            atoms = self._make_two_water_crystal()
 
         internals = Internals(atoms, allow_fragments=True)
         pes = CellInternalPES(atoms, internals)
         assert pes.rigid_fragments is True
 
-        g_analytical, g_numeric = self._full_gradient_fd(pes)
-        assert_allclose(g_analytical, g_numeric, atol=1e-4, rtol=1e-3)
-
-    def test_full_gradient_numerical_after_deformation(self):
-        """Verify full gradient after cell deformation (F != I)."""
-        atoms = self._make_two_water_crystal()
-        internals = Internals(atoms, allow_fragments=True)
-        pes = CellInternalPES(atoms, internals)
-
-        x0 = pes.get_x()
-        x_deformed = x0.copy()
-        for i in range(pes.n_cell_dof):
-            x_deformed[pes.n_internal + i] += 0.02 * ((-1)**i)
-        pes.set_x(x_deformed)
+        if setup == "deformed":
+            x0 = pes.get_x()
+            x_deformed = x0.copy()
+            for i in range(pes.n_cell_dof):
+                x_deformed[pes.n_internal + i] += 0.02 * ((-1)**i)
+            pes.set_x(x_deformed)
 
         g_analytical, g_numeric = self._full_gradient_fd(pes)
         assert_allclose(g_analytical, g_numeric, atol=1e-4, rtol=1e-3)
