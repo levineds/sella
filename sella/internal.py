@@ -3466,7 +3466,11 @@ class Internals(BaseInternals):
 
         if ndeloc != ndof:
             warnings.warn(
-                f'{ndeloc} coords found! Expected {ndof}.'
+                f'Internal coordinates ({ndeloc} DOF) do not span the '
+                f'full coordinate space ({ndof} DOF). This is expected '
+                f'when using user-specified internals or constraint-only '
+                f'coordinates, but may indicate missing coordinates if '
+                f'auto-detection was used.'
             )
 
     def check_for_bad_internals(self) -> Optional[Dict[str, List[Coordinate]]]:
