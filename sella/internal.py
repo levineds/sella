@@ -3797,9 +3797,16 @@ class Internals(BaseInternals):
         nbonds = np.zeros(len(self.all_atoms), dtype=np.int32)
         h0 = np.zeros(self.nint, dtype=np.float64)
         h0_tr = 0.05 * units.Hartree
+        periodic = np.any(self.atoms.pbc)
+        if periodic and self.allow_fragments:
+            h0_trans = 5.0
+            h0_rot = 15.0
+        else:
+            h0_trans = h0_tr
+            h0_rot = h0_tr
         idx = 0
         for trans in self.internals['translations']:
-            h0[idx] = h0_tr if self.allow_fragments else h0cart
+            h0[idx] = h0_trans if self.allow_fragments else h0cart
             idx += 1
         for bond in self.internals['bonds']:
             h0[idx] = self._h0_bond(bond)
@@ -3819,6 +3826,6 @@ class Internals(BaseInternals):
                 h0[idx] = self._h0_dihedral(dihedral, nbonds)
             idx += 1
         for rot in self.internals['rotations']:
-            h0[idx] = h0_tr if self.allow_fragments else h0cart
+            h0[idx] = h0_rot if self.allow_fragments else h0cart
             idx += 1
         return np.diag(np.abs(h0))
