@@ -3468,8 +3468,10 @@ class Internals(BaseInternals):
         for j, jbonds in enumerate(bonds):
             linear = []
             for b1, b2 in combinations(jbonds, 2):
-                new = b1 + b2
-                assert new.indices[1] == j, new.indices
+                new = Angle(
+                    (b1.indices[1], j, b2.indices[1]),
+                    (-b1.kwargs['ncvecs'][0], b2.kwargs['ncvecs'][0]),
+                )
                 if self.atol < new.calc(self.atoms) < np.pi - self.atol:
                     try:
                         self.add_angle(new)

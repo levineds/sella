@@ -226,3 +226,58 @@ class TestTRICs:
         opt = Sella(atoms, internal=ints)
         # Just run a few steps to verify ODE works
         opt.run(fmax=1.0, steps=5)
+
+    def test_periodic_multi_image_bonds(self):
+        """Angle construction with two bonds connecting the same atom pair
+        through different periodic images.
+
+        Regression test for a bug where Internal.__add__ picked the wrong
+        orientation, producing degenerate angles like [4, 16, 4].
+        """
+        atoms = Atoms(
+            symbols=['F', 'C', 'C', 'C', 'Br', 'C', 'Cl', 'C', 'Br', 'C',
+                     'H', 'H', 'F', 'C', 'C', 'C', 'Br', 'C', 'Cl', 'C',
+                     'Br', 'C', 'H', 'H'],
+            positions=[
+                [0.0000, 7.4288, 8.1335],
+                [0.0000, 7.4288, 0.9168],
+                [0.1080, 6.2248, 1.5800],
+                [0.1073, 6.2349, 2.9650],
+                [0.2550, 4.5837, 3.8585],
+                [0.0000, 7.4288, 3.6780],
+                [0.0000, 7.4288, 5.3959],
+                [4.4338, 8.6227, 2.9650],
+                [4.2861, 10.2738, 3.8585],
+                [4.4331, 8.6328, 1.5800],
+                [0.1903, 5.3016, 1.0250],
+                [4.3508, 9.5560, 1.0250],
+                [2.2705, 14.8576, 0.4253],
+                [2.2705, 14.8576, 7.6420],
+                [2.3785, 1.2040, 6.9788],
+                [2.3778, 1.1939, 5.5938],
+                [2.5255, 2.8451, 4.7003],
+                [2.2705, 14.8576, 4.8809],
+                [2.2705, 14.8576, 3.1629],
+                [2.1633, 13.6637, 5.5938],
+                [2.0155, 12.0125, 4.7003],
+                [2.1626, 13.6536, 6.9788],
+                [2.4608, 2.1272, 7.5338],
+                [2.0802, 12.7304, 7.5338],
+            ],
+            cell=[[4.541073, 0.0, 0.0], [0.0, 14.857576, 0.0],
+                  [0.0, 0.0, 8.55882]],
+            pbc=True,
+        )
+
+        ints = Internals(atoms, allow_fragments=True)
+        ints.find_all_bonds()
+        ints.find_all_angles()
+
+        for angle in ints.internals['angles']:
+            if angle.indices[0] == angle.indices[2]:
+                assert not np.array_equal(
+                    angle.kwargs['ncvecs'][0], angle.kwargs['ncvecs'][1]
+                ), (
+                    f"Degenerate angle {angle.indices} with identical "
+                    f"ncvecs {angle.kwargs['ncvecs']}"
+                )
