@@ -3441,7 +3441,20 @@ class Internals(BaseInternals):
                 self.add_translation(group)
                 if len(group) >= 2:
                     self.add_rotation(group)
+        elif (self.allow_fragments and nlabels == 1
+              and np.any(self.atoms.pbc)
+              and len(self.internals['bonds']) > 0):
+            group = list(range(self.natoms))
+            cumshifts = {}
+            self._wrap_fragment_positions(group, cumshifts)
+            self.fragment_atom_groups = [np.array(group, dtype=np.int32)]
+            self.add_translation(group)
+            if len(group) >= 2:
+                self.add_rotation(group)
+        else:
+            cumshifts = {}
 
+        if cumshifts:
             # Update bond ncvecs to match the new wrapped positions.
             # ncvec_new = ncvec_old - cumshift[j] + cumshift[i]
             zero = np.zeros(3, dtype=int)

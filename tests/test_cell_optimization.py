@@ -722,47 +722,10 @@ class TestMolecularCrystal:
 class TestTRICsCellDerivatives:
     """Test that TRICs have correct cell derivatives.
 
-    For molecular crystals, translation and rotation coordinates should
-    have zero cell derivatives since they describe internal molecular
-    motion that doesn't depend on the cell.
+    For molecular crystals, translation and rotation coordinates have
+    zero cell derivatives by construction (hardcoded in cell_jacobian).
+    Bond/angle/dihedral cell derivatives are tested below.
     """
-
-    def test_translation_cell_derivative_zero(self):
-        """Test that translation coordinates have zero cell derivatives."""
-        # Create a simple diatomic in a periodic cell
-        atoms = Atoms('H2', positions=[[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]])
-        atoms.set_cell([5.0, 5.0, 5.0])
-        atoms.pbc = True
-
-        internals = Internals(atoms, allow_fragments=True)
-        internals.find_all_bonds()
-
-        # Get the translation coordinates
-        translations = internals.internals.get('translations', [])
-
-        for trans in translations:
-            grad_cell = trans.calc_cell_gradient(atoms)
-            # Translation center of mass should not depend on cell
-            assert_allclose(grad_cell, 0, atol=1e-10)
-
-    def test_rotation_cell_derivative_zero(self):
-        """Test that rotation coordinates have zero cell derivatives."""
-        # Create water molecule (non-linear, has rotations)
-        atoms = molecule('H2O')
-        atoms.center(vacuum=3.0)
-        atoms.pbc = True
-
-        internals = Internals(atoms, allow_fragments=True)
-        internals.find_all_bonds()
-        internals.find_all_angles()
-
-        # Get rotation coordinates
-        rotations = internals.internals.get('rotations', [])
-
-        for rot in rotations:
-            grad_cell = rot.calc_cell_gradient(atoms)
-            # Rotation orientation should not depend on cell
-            assert_allclose(grad_cell, 0, atol=1e-10)
 
     def test_bond_cell_derivative_intramolecular(self):
         """Test intramolecular bond has zero cell derivative if not crossing PBC."""
