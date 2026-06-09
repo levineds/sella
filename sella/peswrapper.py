@@ -869,7 +869,8 @@ class InternalPES(PES):
     def set_x(self, target):
         """Update internal coordinates to target values.
 
-        Uses fast iterative stepper by default, with ODE fallback for robustness.
+        Uses ODE integrator by default. If iterative_stepper is enabled,
+        tries Newton-Raphson first and falls back to ODE on failure.
         """
         if self.iterative_stepper:
             res = self._set_x_iterative(target)
