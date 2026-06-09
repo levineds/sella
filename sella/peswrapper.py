@@ -602,6 +602,7 @@ class InternalPES(PES):
         H0: np.ndarray = None,
         iterative_stepper: int = 0,
         auto_find_internals: bool = True,
+        exact_geodesic: bool = False,
         **kwargs
     ):
         self.int_orig = internals
@@ -641,6 +642,7 @@ class InternalPES(PES):
         # Flag used to indicate that new internal coordinates are required
         self.bad_int = None
         self.iterative_stepper = iterative_stepper
+        self.exact_geodesic = exact_geodesic
 
         self._pinv_cache = _LRU2()
         self._qr_cache = _LRU2()
@@ -1199,7 +1201,7 @@ class InternalPES(PES):
         # Batch the two D_rdot @ vector products into one (D_rdot @ matrix)
         # matmul, then one Binv @ matrix matmul, halving the matmul count.
         D_rdot = self.int.hessian_rdot(dxdt)
-        Binv = self._ode_Binv
+        Binv = self._get_Binv() if self.exact_geodesic else self._ode_Binv
         rhs = np.column_stack((dxdt, g))     # (ndof, 2)
         out = -Binv @ (D_rdot @ rhs)          # (ndof, 2)
         dydt[1] = out[:, 0]

@@ -76,6 +76,7 @@ class Sella(Optimizer):
         niggli: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
+        exact_geodesic: bool = False,
         **kwargs
     ):
         """Initialize Sella optimizer.
@@ -125,6 +126,7 @@ class Sella(Optimizer):
         self.optimize_cell = optimize_cell
         self.allow_fragments = allow_fragments
         self.niggli = niggli
+        self.exact_geodesic = exact_geodesic
         self.smax = smax
         if optimize_cell:
             if order != 0:
@@ -165,6 +167,7 @@ class Sella(Optimizer):
             allow_fragments=allow_fragments,
             refine_initial_hessian=refine_initial_hessian,
             save_hessian=save_hessian,
+            exact_geodesic=exact_geodesic,
             **kwargs
         )
 
@@ -229,6 +232,7 @@ class Sella(Optimizer):
         allow_fragments: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
+        exact_geodesic: bool = False,
         **kwargs
     ):
         if internal:
@@ -264,6 +268,7 @@ class Sella(Optimizer):
                     scalar_pressure=scalar_pressure,
                     refine_initial_hessian=refine_initial_hessian,
                     save_hessian=save_hessian,
+                    exact_geodesic=exact_geodesic,
                     **kwargs
                 )
             else:
@@ -275,6 +280,7 @@ class Sella(Optimizer):
                     v0=v0,
                     auto_find_internals=auto_find_internals,
                     hessian_function=hessian_function,
+                    exact_geodesic=exact_geodesic,
                     **kwargs
                 )
         else:
@@ -400,6 +406,7 @@ class Sella(Optimizer):
                 exp_cell_factor=exp_cell_factor,
                 scalar_pressure=scalar_pressure,
                 allow_fragments=self.allow_fragments,
+                exact_geodesic=self.exact_geodesic,
             )
             self.initialized = False
             self.rho = 1
