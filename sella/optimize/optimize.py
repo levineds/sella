@@ -76,7 +76,7 @@ class Sella(Optimizer):
         niggli: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
-        exact_geodesic: bool = False,
+        exact_geodesic: bool = None,
         **kwargs
     ):
         """Initialize Sella optimizer.
@@ -126,7 +126,7 @@ class Sella(Optimizer):
         self.optimize_cell = optimize_cell
         self.allow_fragments = allow_fragments
         self.niggli = niggli
-        self.exact_geodesic = exact_geodesic
+        self.exact_geodesic = exact_geodesic if exact_geodesic is not None else (order > 0)
         self.smax = smax
         if optimize_cell:
             if order != 0:
@@ -232,7 +232,7 @@ class Sella(Optimizer):
         allow_fragments: bool = False,
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
-        exact_geodesic: bool = False,
+        exact_geodesic: bool = None,
         **kwargs
     ):
         if internal:
