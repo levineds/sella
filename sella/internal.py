@@ -3749,27 +3749,45 @@ class Internals(BaseInternals):
                 for idx in bad_indices:
                     bad['angles'].append(angles[idx])
 
-        # Check rotation F-matrix eigenvalue gaps
+        # Check rotation F-matrix eigenvalue gaps using cached eigenvalues
+        # from _get_stabilized_quaternions (computed during Jacobian eval).
         rotations = self.internals['rotations']
         if rotations:
-            positions = self.all_positions
-            seen_fragments = set()
-            for rot in rotations:
-                frag_key = tuple(rot.indices)
-                if frag_key in seen_fragments:
-                    continue
-                seen_fragments.add(frag_key)
-                idx = np.array(rot.indices)
-                pos = positions[idx]
-                dx = pos - pos.mean(0)
-                refpos = rot.kwargs['refpos']
-                F = _build_F_matrix_np(dx, refpos)
-                ws = np.linalg.eigvalsh(F)
-                gap = ws[-1] - ws[-2]
-                spread = ws[-1] - ws[0]
-                if spread > 0 and gap / spread < 0.02:
-                    bad['angles'].append(rot)
-                    break
+            cached_eigh = self._cache.get('stabilized_q_eigh')
+            if cached_eigh is not None:
+                ws_all, _ = cached_eigh
+                if ws_all is not None:
+                    _, _, _, _, slots, valid = self._rotation_padded_inputs(
+                        self.all_positions
+                    )
+                    if valid:
+                        for fi, slot in enumerate(slots):
+                            ws = ws_all[fi]
+                            gap = ws[-1] - ws[-2]
+                            spread = ws[-1] - ws[0]
+                            if spread > 0 and gap / spread < 0.02:
+                                bad['angles'].append(rotations[slot[0]])
+                                break
+            else:
+                # No cached eigenvalues — compute directly (first step)
+                positions = self.all_positions
+                seen_fragments = set()
+                for rot in rotations:
+                    frag_key = tuple(rot.indices)
+                    if frag_key in seen_fragments:
+                        continue
+                    seen_fragments.add(frag_key)
+                    idx = np.array(rot.indices)
+                    pos = positions[idx]
+                    dx = pos - pos.mean(0)
+                    refpos = rot.kwargs['refpos']
+                    F = _build_F_matrix_np(dx, refpos)
+                    ws = np.linalg.eigvalsh(F)
+                    gap = ws[-1] - ws[-2]
+                    spread = ws[-1] - ws[0]
+                    if spread > 0 and gap / spread < 0.02:
+                        bad['angles'].append(rot)
+                        break
 
         for ints in bad.values():
             if ints:
