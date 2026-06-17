@@ -1338,6 +1338,7 @@ class _CellPESMixin:
         self, atoms, exp_cell_factor, cell_mask, scalar_pressure,
     ):
         self.orig_cell = atoms.get_cell().array.copy()
+        self._exp_cell_factor_request = exp_cell_factor
         if exp_cell_factor is None:
             exp_cell_factor = float(len(atoms))
         self.exp_cell_factor = exp_cell_factor
@@ -1389,11 +1390,17 @@ class _CellPESMixin:
     def _compute_cell_hessian_columns(self, delta: float) -> np.ndarray:
         """Compute Hessian columns for cell DOF via central finite differences.
 
+        ``delta`` is interpreted in physical log(F) space and scaled by
+        ``exp_cell_factor`` so the perturbation magnitude is independent
+        of the cell parameterization scaling.
+
         Returns array of shape (dim, n_cell_dof).
         """
         n = self.n_coords
         indices = list(range(n, n + self.n_cell_dof))
-        return self._fd_hessian_columns(delta, indices, self.dim, "cell")
+        return self._fd_hessian_columns(
+            delta * self.exp_cell_factor, indices, self.dim, "cell"
+        )
 
     def _fd_hessian_columns(self, delta, indices, n_rows, label=""):
         """Central-difference Hessian columns for arbitrary coordinate indices.
@@ -1552,7 +1559,8 @@ class CellInternalPES(_CellPESMixin, InternalPES):
     internals : Internals
         Internal coordinate system definition.
     exp_cell_factor : float, optional
-        Scaling factor for cell parameterization. Default is number of atoms.
+        Scaling factor for cell parameterization. Default is sqrt(n_atoms)
+        when rigid_fragments is active, else n_atoms.
     cell_mask : ndarray, optional
         Boolean mask of shape (3, 3) indicating which cell DOF are free.
         Default is all True (full cell optimization).
@@ -1624,6 +1632,13 @@ class CellInternalPES(_CellPESMixin, InternalPES):
             self.rigid_fragments = bool(self.int.internals.get('translations', []))
         else:
             self.rigid_fragments = self._rigid_fragments_request
+
+        # When rigid_fragments is active and the user didn't specify
+        # exp_cell_factor, use sqrt(n_atoms).  Cell strain doesn't deform
+        # intramolecular bonds, so the effective stiffness scales more
+        # weakly with system size than the n_atoms default.
+        if self.rigid_fragments and self._exp_cell_factor_request is None:
+            self.exp_cell_factor = float(np.sqrt(len(atoms)))
 
         if self.rigid_fragments:
             self.fragment_groups, self.fragment_dummy_groups = \
@@ -2234,7 +2249,8 @@ class CellCartesianPES(_CellPESMixin, PES):
     atoms : Atoms
         ASE Atoms object with periodic boundary conditions.
     exp_cell_factor : float, optional
-        Scaling factor for cell parameterization. Default is number of atoms.
+        Scaling factor for cell parameterization. Default is sqrt(n_atoms)
+        when rigid_fragments is active, else n_atoms.
     cell_mask : ndarray, optional
         Boolean mask of shape (3, 3) indicating which cell DOF are free.
         Default is all True (full cell optimization).
