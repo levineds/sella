@@ -1348,6 +1348,11 @@ class _CellPESMixin:
         self.n_cell_dof = int(self.cell_mask.sum())
         self.scalar_pressure = scalar_pressure
 
+    def _state_hash(self) -> bytes:
+        h = super()._state_hash()
+        h += np.float64(self.scalar_pressure).tobytes()
+        return h
+
     def _get_deformation_gradient(self) -> np.ndarray:
         """Get current deformation gradient F = cell @ inv(orig_cell)."""
         return self.atoms.get_cell().array @ np.linalg.inv(self.orig_cell)
