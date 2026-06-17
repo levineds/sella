@@ -1,3 +1,4 @@
+import warnings
 from itertools import product
 import pytest
 import numpy as np
@@ -63,13 +64,21 @@ def test_water_dimer(internal, order):
         eta=1e-6,
         delta0=1e-2,
     )
-    if internal:
-        sella_kwargs['internal'] = Internals(
-            atoms, cons=cons, allow_fragments=True
+    # The constrained water cluster intentionally has more Cartesian DOF than
+    # internal coordinates, so suppress the expected incomplete-span warning.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Internal coordinates.*do not span the full coordinate space",
+            category=UserWarning,
         )
-    else:
-        sella_kwargs['constraints'] = cons
-    opt = Sella(atoms, **sella_kwargs)
+        if internal:
+            sella_kwargs['internal'] = Internals(
+                atoms, cons=cons, allow_fragments=True
+            )
+        else:
+            sella_kwargs['constraints'] = cons
+        opt = Sella(atoms, **sella_kwargs)
 
     opt.delta = 0.05
     opt.run(fmax=1e-3)

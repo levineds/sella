@@ -3,7 +3,7 @@ import numpy as np
 
 from sella.utilities.math import pseudo_inverse, modified_gram_schmidt
 
-from test_utils import get_matrix
+from tests.test_utils import get_matrix
 
 # Try to import Cython-based wrappers - skip tests if not available
 try:
@@ -85,10 +85,11 @@ def test_modified_gram_schmidt(n, mx, my, eps1, eps2, maxiter):
 def test_normalize(rngstate, length):
     rng = np.random.RandomState(rngstate)
     x = rng.normal(size=(length,))
+    if length == 0:
+        return
     wrappers['normalize'](x)
 
-    if length > 0:
-        assert abs(np.linalg.norm(x) - 1.) < 1e-14
+    assert abs(np.linalg.norm(x) - 1.) < 1e-14
 
 @pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
 @pytest.mark.parametrize('rngstate,length,scale',
@@ -102,13 +103,14 @@ def test_vec_sum(rngstate, length, scale):
     x = rng.normal(size=(length,))
     y = rng.normal(size=(length,))
     z = np.zeros(length)
+    if length == 0:
+        return
     err = wrappers['vec_sum'](x, y, z, scale)
     assert err == 0
     np.testing.assert_allclose(z, x + scale * y)
 
-    if length > 0:
-        assert wrappers['vec_sum'](x, y[:length-1], z, scale) == -1
-        assert wrappers['vec_sum'](x, y, z[:length-1], scale) == -1
+    assert wrappers['vec_sum'](x, y[:length-1], z, scale) == -1
+    assert wrappers['vec_sum'](x, y, z[:length-1], scale) == -1
 
 @pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
 @pytest.mark.parametrize('rngstate,n,m',
