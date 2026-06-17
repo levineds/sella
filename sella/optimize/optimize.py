@@ -110,7 +110,8 @@ class Sella(Optimizer):
         refine_initial_hessian : bool or int, optional
             Level of Hessian refinement via finite differences:
             - False or 0: No refinement (default)
-            - True or 1: Refine cell-related blocks only (2 * n_cell_dof force calls)
+            - -1: Forward differences for cell blocks (n_cell_dof force calls)
+            - True or 1: Central differences for cell blocks (2 * n_cell_dof force calls)
             - 2: Also refine translation/rotation blocks for molecular crystals
               (adds 2 * n_tric force calls, where n_tric = n_fragments * 6)
             - 3: Refine full internal Hessian (2 * n_internal force calls, expensive!)

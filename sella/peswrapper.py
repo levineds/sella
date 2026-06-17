@@ -1387,19 +1387,33 @@ class _CellPESMixin:
         if 'cell' in self.savepoint:
             self.atoms.set_cell(self.savepoint['cell'], scale_atoms=False)
 
-    def _compute_cell_hessian_columns(self, delta: float) -> np.ndarray:
-        """Compute Hessian columns for cell DOF via central finite differences.
+    def _compute_cell_hessian_columns(self, delta: float,
+                                       forward: bool = False) -> np.ndarray:
+        """Compute Hessian columns for cell DOF via finite differences.
 
         ``delta`` is interpreted in physical log(F) space and scaled by
         ``exp_cell_factor`` so the perturbation magnitude is independent
         of the cell parameterization scaling.
 
+        Parameters
+        ----------
+        delta : float
+            Step size in physical log(F) space.
+        forward : bool
+            If True, use forward differences (n_cell_dof evals) instead
+            of central differences (2 * n_cell_dof evals).
+
         Returns array of shape (dim, n_cell_dof).
         """
         n = self.n_coords
         indices = list(range(n, n + self.n_cell_dof))
+        delta_u = delta * self.exp_cell_factor
+        if forward:
+            return self._fd_hessian_columns_forward(
+                delta_u, indices, self.dim, "cell"
+            )
         return self._fd_hessian_columns(
-            delta * self.exp_cell_factor, indices, self.dim, "cell"
+            delta_u, indices, self.dim, "cell"
         )
 
     def _fd_hessian_columns(self, delta, indices, n_rows, label=""):
@@ -1452,6 +1466,44 @@ class _CellPESMixin:
         self.curr['g'] = None
         return H_cols
 
+    def _fd_hessian_columns_forward(self, delta, indices, n_rows, label=""):
+        """Forward-difference Hessian columns using the current gradient as baseline.
+
+        Costs n_cols + 1 evals (one baseline + one per column).
+        """
+        n_cols = len(indices)
+        H_cols = np.zeros((n_rows, n_cols))
+        x0 = self.get_x()
+        cell0 = self.atoms.get_cell().array.copy()
+        pos0 = self.atoms.positions.copy()
+
+        _, g0 = self.eval()
+        n_evals = n_cols + 1
+
+        logger.info("Refining %s Hessian (forward): 1/%d force calls",
+                     label, n_evals)
+
+        for col, idx in enumerate(indices):
+            self.atoms.positions = pos0.copy()
+            self.atoms.set_cell(cell0, scale_atoms=False)
+            x_plus = x0.copy()
+            x_plus[idx] += delta
+            self.set_x(x_plus)
+            _, g_plus = self.eval()
+
+            H_cols[:, col] = (g_plus[:n_rows] - g0[:n_rows]) / delta
+
+            if (col + 1) % max(n_cols // 10, 1) == 0 or col == n_cols - 1:
+                logger.info("Refining %s Hessian (forward): %d/%d force calls",
+                            label, col + 2, n_evals)
+
+        self.atoms.positions = pos0
+        self.atoms.set_cell(cell0, scale_atoms=False)
+        self.curr['x'] = None
+        self.curr['f'] = None
+        self.curr['g'] = None
+        return H_cols
+
     def maybe_niggli_reduce(self, angle_threshold=30.0):
         """Apply Niggli reduction if cell angles deviate too far from 90 deg.
 
@@ -1478,7 +1530,7 @@ class _CellPESMixin:
         self.last = self.curr.copy()
         return True
 
-    def refine_hessian(self, refine_level: int = 1, delta: float = 1e-5):
+    def refine_hessian(self, refine_level: int = 1, delta: float = 1e-4):
         """Re-refine Hessian cell blocks via finite differences."""
         if refine_level < 1:
             return
@@ -1514,6 +1566,14 @@ class _CellPESMixin:
 
         if refine_level >= 1:
             H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
+            H0_full[:n, n:] = H_cell_cols[:n, :]
+            H0_full[n:, :n] = H_cell_cols[:n, :].T
+            H_cell_cell = H_cell_cols[n:, :]
+            H0_full[n:, n:] = (H_cell_cell + H_cell_cell.T) / 2
+        elif refine_level == -1:
+            H_cell_cols = self._compute_cell_hessian_columns(
+                hessian_delta, forward=True,
+            )
             H0_full[:n, n:] = H_cell_cols[:n, :]
             H0_full[n:, :n] = H_cell_cols[:n, :].T
             H_cell_cell = H_cell_cols[n:, :]
@@ -1571,13 +1631,13 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         fractional CoM positions while preserving intramolecular geometry.
         Auto-detected: defaults to True when internals have translations
         (allow_fragments=True), else False.
-    refine_initial_hessian : bool, optional
-        If True, compute cell-coordinate coupling and cell-cell Hessian blocks
-        via finite differences. This requires additional force evaluations
-        (2 * n_cell_dof) but can improve convergence for coupled systems.
-        Default is False.
+    refine_initial_hessian : bool or int, optional
+        Level of Hessian refinement via finite differences:
+        - False or 0: No refinement (default)
+        - True or 1: Central differences (2 * n_cell_dof force evals)
+        - -1: Forward differences (n_cell_dof force evals, half the cost)
     hessian_delta : float, optional
-        Finite difference step size for Hessian refinement. Default is 1e-5.
+        Finite difference step size for Hessian refinement. Default is 1e-4.
     """
 
     def __init__(
@@ -1590,7 +1650,7 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         scalar_pressure: float = 0.0,
         rigid_fragments: bool = None,
         refine_initial_hessian: Union[bool, int] = False,
-        hessian_delta: float = 1e-5,
+        hessian_delta: float = 1e-4,
         save_hessian: str = None,
         H0: np.ndarray = None,
         **kwargs
@@ -1608,7 +1668,8 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         refine_initial_hessian : bool or int
             Level of Hessian refinement via finite differences:
             - False or 0: No refinement (default)
-            - True or 1: Refine cell-related blocks only (2 * n_cell_dof evals)
+            - -1: Forward differences for cell blocks (n_cell_dof evals)
+            - True or 1: Central differences for cell blocks (2 * n_cell_dof evals)
             - 2: Also refine translation/rotation blocks (adds 2 * n_tric evals)
             - 3: Refine full internal Hessian (2 * n_internal evals, expensive!)
         save_hessian : str, optional
@@ -1685,7 +1746,7 @@ class CellInternalPES(_CellPESMixin, InternalPES):
     def _scale_atoms_on_cell_change(self) -> bool:
         return not self.rigid_fragments
 
-    def refine_hessian(self, refine_level: int = 1, delta: float = 1e-5):
+    def refine_hessian(self, refine_level: int = 1, delta: float = 1e-4):
         """Re-refine Hessian blocks (extends base with levels 2-3)."""
         _CellPESMixin.refine_hessian(self, min(refine_level, 1), delta)
         if refine_level < 2:
@@ -2259,10 +2320,10 @@ class CellCartesianPES(_CellPESMixin, PES):
     refine_initial_hessian : bool or int, optional
         Level of Hessian refinement via finite differences:
         - False or 0: No refinement (default)
-        - True or 1: Refine cell-related blocks only (2 * n_cell_dof force calls)
-        Note: Level 2 (TRICs) is not applicable for Cartesian coordinates.
+        - -1: Forward differences for cell blocks (n_cell_dof force calls)
+        - True or 1: Central differences for cell blocks (2 * n_cell_dof force calls)
     hessian_delta : float, optional
-        Finite difference step size for Hessian refinement. Default is 1e-5.
+        Finite difference step size for Hessian refinement. Default is 1e-4.
     save_hessian : str, optional
         Path to save the initial Hessian as .npy file for analysis.
     """
@@ -2275,7 +2336,7 @@ class CellCartesianPES(_CellPESMixin, PES):
         cell_mask: np.ndarray = None,
         scalar_pressure: float = 0.0,
         refine_initial_hessian: Union[bool, int] = False,
-        hessian_delta: float = 1e-5,
+        hessian_delta: float = 1e-4,
         save_hessian: str = None,
         H0: np.ndarray = None,
         **kwargs
