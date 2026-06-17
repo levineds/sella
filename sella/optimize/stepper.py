@@ -1,7 +1,10 @@
 from typing import Optional, Tuple, Type, List
+import logging
 
 import numpy as np
 from scipy.linalg import eigh
+
+logger = logging.getLogger(__name__)
 
 from sella.linalg import ApproximateHessian
 
@@ -130,30 +133,47 @@ class RationalFunctionOptimization(BaseStepper):
         A[:-1, :-1] *= alpha
         L, V = eigh(A)
 
-        # Regularize denominator to avoid division by near-zero eigenvector component
-        denom = V[-1, self.order]
+        idx = self.order
+        # For saddle-point search (order > 0): when eigenvalues near the
+        # target index are nearly degenerate, select the eigenvector with
+        # the largest |V[-1, j]| (denominator in the RFO step formula).
+        # This gives the most well-defined step and avoids noise-driven
+        # eigenvector swaps that would change the ascent direction.
+        if self.order > 0:
+            L_scale = max(np.abs(L).max(), 1.0)
+            degen_tol = 1e-8 * L_scale
+            degen_mask = np.abs(L - L[idx]) < degen_tol
+            if np.sum(degen_mask) > 1:
+                candidates = np.where(degen_mask)[0]
+                idx = candidates[np.argmax(np.abs(V[-1, candidates]))]
+                logger.debug(
+                    "RFO degenerate eigenvalues at order=%d: "
+                    "candidates=%s, selected idx=%d", self.order, candidates, idx
+                )
+
+        denom = V[-1, idx]
         if abs(denom) < 1e-12:
             denom = np.sign(denom) * 1e-12 if denom != 0 else 1e-12
-        s = V[:-1, self.order] * alpha / denom
+        s = V[:-1, idx] * alpha / denom
 
         dAda = self.A.copy()
         dAda[:-1, :-1] *= 2 * alpha
 
-        V1 = np.delete(V, self.order, 1)
-        L1 = np.delete(L, self.order)
+        V1 = np.delete(V, idx, 1)
+        L1 = np.delete(L, idx)
 
         # Regularize eigenvalue differences: clamp small values while preserving sign
-        L_diff = L1 - L[self.order]
+        L_diff = L1 - L[idx]
         L_diff = np.where(L_diff >= 0,
                          np.maximum(L_diff, 1e-12),
                          np.minimum(L_diff, -1e-12))
         # Reassociate to do two matvecs (V1.T @ dAda is otherwise a (k-1, k)
         # matmul that costs ~25× more for the same final vector result).
-        dVda = V1 @ ((V1.T @ (dAda @ V[:, self.order])) / L_diff)
+        dVda = V1 @ ((V1.T @ (dAda @ V[:, idx])) / L_diff)
 
-        dsda = (V[:-1, self.order] / denom
+        dsda = (V[:-1, idx] / denom
                 + (alpha / denom) * dVda[:-1]
-                - (V[:-1, self.order] * alpha / denom**2) * dVda[-1])
+                - (V[:-1, idx] * alpha / denom**2) * dVda[-1])
         return s, dsda
 
 

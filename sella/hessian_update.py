@@ -2,11 +2,16 @@
 
 from __future__ import division
 
+import logging
 import numpy as np
 
 from scipy.linalg import eigh, lstsq, solve
 
 from sella import _gpu as _gpu_mod
+
+logger = logging.getLogger(__name__)
+
+_LSTSQ_RCOND = 1e-10
 
 
 def symmetrize_Y2(S, Y):
@@ -18,7 +23,7 @@ def symmetrize_Y2(S, Y):
     for i in range(1, nvecs):
         RHS = np.linalg.lstsq(STS[:i, :i],
                               YTS[i, :i].T - YTS[:i, i] - dYTS[:i, i],
-                              rcond=None)[0]
+                              rcond=_LSTSQ_RCOND)[0]
         dY[:, i] = -S[:, :i] @ RHS
         dYTS[i, :] = -STS[:, :i] @ RHS
     return dY
@@ -120,7 +125,13 @@ def _MS_TS_BFGS(B, S, Y, lams, vecs):
     X1 = S.T @ Y @ Y.T
     absBS = vecs @ (np.abs(lams[:, np.newaxis]) * (vecs.T @ S))
     X2 = S.T @ absBS @ absBS.T
-    U = lstsq((X1 + X2) @ S, X1 + X2)[0].T
+    XS = (X1 + X2) @ S
+    cond_XS = np.linalg.cond(XS)
+    if cond_XS > 1e12:
+        logger.debug("TS-BFGS ill-conditioned (cond=%.2e), falling back to PSB",
+                     cond_XS)
+        return _MS_PSB(B, S, Y)
+    U = lstsq(XS, X1 + X2)[0].T
     UJT = U @ J.T
     return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
 
@@ -185,7 +196,9 @@ def _gpu_update_TS_BFGS(B_gpu, S, Y, evals_gpu, evecs_gpu):
         # Solve (XS @ S) U.T = XS  →  U = ((XS @ S)^{-1} @ XS).T
         # XS_S is (k, k) and tiny; use solve.
         XS_S_t = XS_t @ S_t  # (k, k)
-        # Use lstsq for parity with numpy path (handles k=1 trivially).
+        # Check conditioning on CPU (tiny matrix, negligible cost)
+        if torch.linalg.cond(XS_S_t).item() > 1e12:
+            return None  # fall back to CPU PSB path
         U_t = torch.linalg.lstsq(XS_S_t, XS_t).solution.T
 
         UJT_t = U_t @ J_t.T

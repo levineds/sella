@@ -6,6 +6,8 @@ import inspect
 from sella.peswrapper import PES, InternalPES
 from .stepper import get_stepper, BaseStepper, NaiveStepper
 
+_LSTSQ_RCOND = 1e-10
+
 
 # Classes for restricted step (e.g. trust radius, max atom displacement, etc)
 class BaseRestrictedStep:
@@ -53,7 +55,7 @@ class BaseRestrictedStep:
                 self.P = self.pes.get_Ufree().T @ W
             d1 = self.d1
             if d1 is not None:
-                d1 = np.linalg.lstsq(self.P.T, d1, rcond=None)[0]
+                d1 = np.linalg.lstsq(self.P.T, d1, rcond=_LSTSQ_RCOND)[0]
             self.stepper = stepper(
                 self.P @ g,
                 self.pes.get_HL_projected(self.P.T),

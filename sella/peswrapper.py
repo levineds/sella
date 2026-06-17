@@ -20,6 +20,8 @@ from sella._gpu import gpu_qr as _gpu_qr, gpu_project
 
 logger = logging.getLogger(__name__)
 
+_LSTSQ_RCOND = 1e-10
+
 
 class _LRU2:
     """2-entry LRU cache keyed by state hash (bytes).
@@ -420,7 +422,7 @@ class PES:
         scons = -Ucons @ np.linalg.lstsq(
             self.get_drdx() @ Ucons,
             self.get_res(),
-            rcond=None,
+            rcond=_LSTSQ_RCOND,
         )[0]
         return scons
 
@@ -463,7 +465,7 @@ class PES:
         if self.curr['g'] is None:
             L = None
         else:
-            L = np.linalg.lstsq(drdx.T, self.curr['g'], rcond=None)[0]
+            L = np.linalg.lstsq(drdx.T, self.curr['g'], rcond=_LSTSQ_RCOND)[0]
 
         self.curr['L'] = L
 
@@ -573,10 +575,16 @@ class PES:
         df_pred = self.get_df_pred(dx_initial, g0, B0)
         dg_actual = self.get_g() - g_par
         df_actual = self.get_f() - f0
-        if df_pred is None or abs(df_pred) < 1e-14:
-            ratio = None
-        else:
+        df_threshold = 1e-14 * max(abs(f0), 1.0)
+        if df_pred is not None and abs(df_pred) >= df_threshold:
             ratio = df_actual / df_pred
+        else:
+            if df_pred is not None:
+                logger.debug(
+                    "Trust ratio skipped: |df_pred|=%.2e < threshold=%.2e",
+                    abs(df_pred), df_threshold,
+                )
+            ratio = None
 
         self._update_H(dx_final, dg_actual)
 
@@ -683,7 +691,7 @@ class InternalPES(PES):
         if len(rdiag) > 0 and rdiag.min() < 1e-6 * rdiag.max():
             # Rank-deficient: fall back to SVD for safe truncation
             Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
-            nnred = np.sum(Si > 1e-6)
+            nnred = np.sum(Si > 1e-6 * Si[0])
             Q = Ui[:, :nnred]
             R = np.diag(Si[:nnred]) @ VTi[:nnred]
 
@@ -792,7 +800,7 @@ class InternalPES(PES):
             dx = np.linalg.lstsq(
                 self.int.jacobian(),
                 residual,
-                rcond=None,
+                rcond=_LSTSQ_RCOND,
             )[0].reshape((-1, 3))
 
             # Update positions
@@ -968,7 +976,7 @@ class InternalPES(PES):
             if Ucons.shape[1] == 0:
                 return moved  # no constraint subspace — nothing to project
 
-            s, *_ = np.linalg.lstsq(drdx @ Ucons, -r, rcond=None)
+            s, *_ = np.linalg.lstsq(drdx @ Ucons, -r, rcond=_LSTSQ_RCOND)
             dq_int = Ucons @ s                       # IC-space step (n_int,)
             dx = self._get_Binv() @ dq_int            # Cartesian (n_cart,)
 
@@ -1079,7 +1087,7 @@ class InternalPES(PES):
                 cons = self.cons
             B = internal.jacobian()
             Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
-            nnred = np.sum(Si > 1e-6)
+            nnred = np.sum(Si > 1e-6 * Si[0])
             Unred = Ui[:, :nnred]
             Vnred = VTi[:nnred].T
             Siinv = np.diag(1 / Si[:nnred])
@@ -1145,7 +1153,7 @@ class InternalPES(PES):
             internal=new_int,
             cons=new_cons,
         )
-        L = np.linalg.lstsq(drdx.T, g, rcond=None)[0]
+        L = np.linalg.lstsq(drdx.T, g, rcond=_LSTSQ_RCOND)[0]
 
         # Update H using old data where possible. For new (dummy) atoms,
         # use the guess hessian info.
@@ -2421,7 +2429,7 @@ class CellCartesianPES(_CellPESMixin, PES):
 
         drdx_cart = self.cons.jacobian()  # Constraint Jacobian for Cartesian coords
         U, S, VT = np.linalg.svd(drdx_cart)
-        ncons = np.sum(S > 1e-6)
+        ncons = np.sum(S > 1e-6 * S[0]) if len(S) > 0 else 0
         Ucons_cart = VT[:ncons].T
         Ufree_cart = VT[ncons:].T
         Unred_cart = np.eye(self.n_cart)
