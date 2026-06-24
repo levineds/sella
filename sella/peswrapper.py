@@ -71,6 +71,19 @@ def _split_cons_subspace(drdxnred, tol_factor=1e-6):
     return Q[:, :ncons], Q[:, ncons:]
 
 
+def _range_space_projector(B):
+    """Orthogonal projector onto range(B) with rank truncation via pivoting QR."""
+    Q, R, _ = qr(B, mode='full', pivoting=True, check_finite=False)
+    rdiag = np.abs(np.diag(R))
+    rcond = max(B.shape) * np.finfo(B.dtype).eps
+    if rdiag.size and rdiag[0] > 0:
+        nkeep = int(np.sum(rdiag > rcond * rdiag[0]))
+    else:
+        nkeep = 0
+    Q_r = Q[:, :nkeep]
+    return Q_r @ Q_r.T
+
+
 def _logm_3x3(F):
     """Closed-form 3x3 matrix logarithm via eigendecomposition.
 
@@ -640,8 +653,7 @@ class InternalPES(PES):
             # Construct guess hessian and zero out components in
             # infeasible subspace
             B = self.int.jacobian()
-            Q, _ = qr(B, mode='economic')
-            P = Q @ Q.T
+            P = _range_space_projector(B)
             H0 = P @ self.int.guess_hessian() @ P
             self.set_H(H0, initialized=False)
         else:
@@ -1719,9 +1731,14 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         H_old = self.H.B if self.H is not None and self.H.B is not None else None
         if H_old is None:
             B = self.int.jacobian()
-            Q, _ = qr(B, mode='economic')
-            P = Q @ Q.T
+            P = _range_space_projector(B)
             H_coords_default = P @ self.int.guess_hessian() @ P
+
+        # Convert bool to int for refinement level
+        if refine_initial_hessian is True:
+            refine_level = 1
+        elif refine_initial_hessian is False:
+            refine_level = 0
         else:
             H_coords_default = None
 
