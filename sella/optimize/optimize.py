@@ -168,7 +168,7 @@ class Sella(Optimizer):
             allow_fragments=allow_fragments,
             refine_initial_hessian=refine_initial_hessian,
             save_hessian=save_hessian,
-            exact_geodesic=exact_geodesic,
+            exact_geodesic=self.exact_geodesic,
             **kwargs
         )
 

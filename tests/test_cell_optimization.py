@@ -1453,5 +1453,39 @@ class TestNiggliReduction:
             opt.step()
 
 
+class TestExactGeodesicDefault:
+    """Regression tests for exact_geodesic flag consistency.
+
+    The resolved default (True) must be applied to the *initial* PES, not just
+    to the PES rebuilt after a bad-internals reset. Before the fix, omitting the
+    flag left the initial PES with exact_geodesic=None (falsy -> approximate ODE
+    geodesic), which then silently flipped to True on the first reset.
+    """
+
+    def test_default_is_exact_on_initial_pes(self):
+        """Omitting the flag -> initial PES uses exact geodesic (True)."""
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    logfile=None)
+        assert opt.pes.exact_geodesic is True
+
+    def test_explicit_false_is_honored(self):
+        """exact_geodesic=False must reach the initial PES unchanged."""
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    exact_geodesic=False, logfile=None)
+        assert opt.pes.exact_geodesic is False
+
+    def test_explicit_true_is_honored(self):
+        """exact_geodesic=True must reach the initial PES unchanged."""
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    exact_geodesic=True, logfile=None)
+        assert opt.pes.exact_geodesic is True
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
