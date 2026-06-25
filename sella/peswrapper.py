@@ -1733,12 +1733,6 @@ class CellInternalPES(_CellPESMixin, InternalPES):
             B = self.int.jacobian()
             P = _range_space_projector(B)
             H_coords_default = P @ self.int.guess_hessian() @ P
-
-        # Convert bool to int for refinement level
-        if refine_initial_hessian is True:
-            refine_level = 1
-        elif refine_initial_hessian is False:
-            refine_level = 0
         else:
             H_coords_default = None
 

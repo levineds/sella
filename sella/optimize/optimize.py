@@ -123,13 +123,11 @@ class Sella(Optimizer):
         else:
             default = _default_kwargs['saddle']
 
-        self.exact_geodesic = exact_geodesic if exact_geodesic is not None else True
-
         # Validate cell optimization parameters
         self.optimize_cell = optimize_cell
         self.allow_fragments = allow_fragments
         self.niggli = niggli
-        self.exact_geodesic = exact_geodesic if exact_geodesic is not None else (order > 0)
+        self.exact_geodesic = exact_geodesic if exact_geodesic is not None else True
         self.smax = smax
         if optimize_cell:
             if order != 0:
