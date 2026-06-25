@@ -1581,23 +1581,14 @@ class _CellPESMixin:
         else:
             refine_level = int(refine_initial_hessian)
 
-        if refine_level >= 1:
-            H_cell_cols = self._compute_cell_hessian_columns(hessian_delta)
-            H0_full[:n, n:] = H_cell_cols[:n, :]
-            H0_full[n:, :n] = H_cell_cols[:n, :].T
-            H_cell_cell = H_cell_cols[n:, :]
-            H0_full[n:, n:] = (H_cell_cell + H_cell_cell.T) / 2
-        elif refine_level == -1:
-            H_cell_cols = self._compute_cell_hessian_columns(
-                hessian_delta, forward=True,
-            )
-            H0_full[:n, n:] = H_cell_cols[:n, :]
-            H0_full[n:, :n] = H_cell_cols[:n, :].T
-            H_cell_cell = H_cell_cols[n:, :]
-            H0_full[n:, n:] = (H_cell_cell + H_cell_cell.T) / 2
-
         if refine_level == 0:
             H0_full[n:, n:] = np.eye(self.n_cell_dof)
+        else:
+            H_cell_cols = self._compute_cell_hessian_columns(hessian_delta, forward=refine_level < 0)
+            H0_full[:n, n:] = H_cell_cols[:n, :]
+            H0_full[n:, :n] = H_cell_cols[:n, :].T
+            H_cell_cell = H_cell_cols[n:, :]
+            H0_full[n:, n:] = (H_cell_cell + H_cell_cell.T) / 2
 
         if save_hessian is not None:
             np.save(save_hessian, H0_full)
