@@ -1420,16 +1420,17 @@ class _CellPESMixin:
         n = self.n_coords
         indices = list(range(n, n + self.n_cell_dof))
         delta_u = delta * self.exp_cell_factor
-        if forward:
-            return self._fd_hessian_columns_forward(
-                delta_u, indices, self.dim, "cell"
-            )
         return self._fd_hessian_columns(
-            delta_u, indices, self.dim, "cell"
+            delta_u, indices, self.dim, "cell", forward=forward
         )
 
-    def _fd_hessian_columns(self, delta, indices, n_rows, label=""):
-        """Central-difference Hessian columns for arbitrary coordinate indices.
+    def _fd_hessian_columns(self, delta, indices, n_rows, label="",
+                            forward=False):
+        """Finite-difference Hessian columns for arbitrary coordinate indices.
+
+        Central differences (2 * n_cols evals) by default; forward differences
+        (n_cols + 1 evals, using the current gradient as the baseline) when
+        ``forward=True``.
 
         Parameters
         ----------
@@ -1441,47 +1442,8 @@ class _CellPESMixin:
             Number of gradient components to store per column.
         label : str
             Label for log messages.
-        """
-        n_cols = len(indices)
-        H_cols = np.zeros((n_rows, n_cols))
-        x0 = self.get_x()
-        cell0 = self.atoms.get_cell().array.copy()
-        pos0 = self.atoms.positions.copy()
-        n_evals = 2 * n_cols
-        logger.info("Refining %s Hessian: 0/%d force calls", label, n_evals)
-
-        for col, idx in enumerate(indices):
-            self.atoms.positions = pos0.copy()
-            self.atoms.set_cell(cell0, scale_atoms=False)
-            x_plus = x0.copy()
-            x_plus[idx] += delta
-            self.set_x(x_plus)
-            _, g_plus = self.eval()
-
-            self.atoms.positions = pos0.copy()
-            self.atoms.set_cell(cell0, scale_atoms=False)
-            x_minus = x0.copy()
-            x_minus[idx] -= delta
-            self.set_x(x_minus)
-            _, g_minus = self.eval()
-
-            H_cols[:, col] = (g_plus[:n_rows] - g_minus[:n_rows]) / (2 * delta)
-
-            if (col + 1) % max(n_cols // 10, 1) == 0 or col == n_cols - 1:
-                logger.info("Refining %s Hessian: %d/%d force calls",
-                            label, 2*(col+1), n_evals)
-
-        self.atoms.positions = pos0
-        self.atoms.set_cell(cell0, scale_atoms=False)
-        self.curr['x'] = None
-        self.curr['f'] = None
-        self.curr['g'] = None
-        return H_cols
-
-    def _fd_hessian_columns_forward(self, delta, indices, n_rows, label=""):
-        """Forward-difference Hessian columns using the current gradient as baseline.
-
-        Costs n_cols + 1 evals (one baseline + one per column).
+        forward : bool
+            Use forward instead of central differences.
         """
         n_cols = len(indices)
         H_cols = np.zeros((n_rows, n_cols))
@@ -1489,25 +1451,40 @@ class _CellPESMixin:
         cell0 = self.atoms.get_cell().array.copy()
         pos0 = self.atoms.positions.copy()
 
-        _, g0 = self.eval()
-        n_evals = n_cols + 1
+        suffix = " (forward)" if forward else ""
+        if forward:
+            _, g0 = self.eval()
+            n_evals = n_cols + 1
+            logger.info("Refining %s Hessian (forward): 1/%d force calls",
+                        label, n_evals)
+        else:
+            n_evals = 2 * n_cols
+            logger.info("Refining %s Hessian: 0/%d force calls",
+                        label, n_evals)
 
-        logger.info("Refining %s Hessian (forward): 1/%d force calls",
-                     label, n_evals)
-
-        for col, idx in enumerate(indices):
+        def _probe(idx, sign):
+            # Restore state before each probe: cell scaling is path-dependent.
             self.atoms.positions = pos0.copy()
             self.atoms.set_cell(cell0, scale_atoms=False)
-            x_plus = x0.copy()
-            x_plus[idx] += delta
-            self.set_x(x_plus)
-            _, g_plus = self.eval()
+            x_probe = x0.copy()
+            x_probe[idx] += sign * delta
+            self.set_x(x_probe)
+            return self.eval()[1]
 
-            H_cols[:, col] = (g_plus[:n_rows] - g0[:n_rows]) / delta
+        for col, idx in enumerate(indices):
+            g_plus = _probe(idx, +1)
+            if forward:
+                H_cols[:, col] = (g_plus[:n_rows] - g0[:n_rows]) / delta
+            else:
+                g_minus = _probe(idx, -1)
+                H_cols[:, col] = (
+                    (g_plus[:n_rows] - g_minus[:n_rows]) / (2 * delta)
+                )
 
             if (col + 1) % max(n_cols // 10, 1) == 0 or col == n_cols - 1:
-                logger.info("Refining %s Hessian (forward): %d/%d force calls",
-                            label, col + 2, n_evals)
+                count = (col + 2) if forward else 2 * (col + 1)
+                logger.info("Refining %s Hessian%s: %d/%d force calls",
+                            label, suffix, count, n_evals)
 
         self.atoms.positions = pos0
         self.atoms.set_cell(cell0, scale_atoms=False)
