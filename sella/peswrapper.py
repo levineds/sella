@@ -655,7 +655,6 @@ class InternalPES(PES):
         exact_geodesic: bool = False,
         **kwargs
     ):
-        self.int_orig = internals
         new_int = internals.copy()
         if auto_find_internals:
             new_int.find_all_bonds()
@@ -1105,61 +1104,25 @@ class InternalPES(PES):
         this to obtain the internal block, then add their own cell extension
         and cache the combined result themselves.
         """
-        cons = self.cons
         Q, R = self._get_jacobian_qr()
-        Unred = Q
-
         n_int = Q.shape[0]
-        cons_jac = cons.jacobian()
+        cons_jac = self.cons.jacobian()
         if cons_jac.shape[0] == 0:
-            # No constraints: all non-redundant DOF are free
-            drdx = np.zeros((0, n_int))
-            Ucons = np.zeros((n_int, 0))
-            Ufree = Unred
+            # No constraints: every non-redundant DOF is free.
+            return np.zeros((0, n_int)), np.zeros((n_int, 0)), Q, Q
+        if R.shape[0] == R.shape[1]:
+            # Full rank: cons_jac @ R^{-1} via triangular solve.
+            drdxnred = solve_triangular(
+                R.T, cons_jac.T, lower=True, check_finite=False
+            ).T
         else:
-            if R.shape[0] == R.shape[1]:
-                # Full rank: cons_jac @ R^{-1} via triangular solve
-                drdxnred = solve_triangular(
-                    R.T, cons_jac.T, lower=True, check_finite=False
-                ).T
-            else:
-                # Rank-deficient (SVD-of-R fallback in _get_jacobian_qr)
-                Binv = self._get_Binv()
-                drdxnred = cons_jac @ (Binv @ Q)
-            drdx = drdxnred @ Q.T
-            Vcons, Vfree = _split_cons_subspace(drdxnred)
-            Ucons = Unred @ Vcons
-            Ufree = Unred @ Vfree
-        return drdx, Ucons, Unred, Ufree
+            # Rank-deficient (SVD-of-R fallback in _get_jacobian_qr).
+            drdxnred = cons_jac @ (self._get_Binv() @ Q)
+        drdx = drdxnred @ Q.T
+        Vcons, Vfree = _split_cons_subspace(drdxnred)
+        return drdx, Q @ Vcons, Q, Q @ Vfree
 
-    def _calc_basis(self, internal=None, cons=None):
-        # If custom internal/cons provided, bypass cache (used by refine paths)
-        if internal is not None or cons is not None:
-            if internal is None:
-                internal = self.int
-            if cons is None:
-                cons = self.cons
-            B = internal.jacobian()
-            Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
-            nnred = _svd_rank(Si)
-            Unred = Ui[:, :nnred]
-            Vnred = VTi[:nnred].T
-            Siinv = np.diag(1 / Si[:nnred])
-            cons_jac = cons.jacobian()
-            n_int = B.shape[0]
-            if cons_jac.shape[0] == 0:
-                # No constraints: all non-redundant DOF are free
-                drdx = np.zeros((0, n_int))
-                Ucons = np.zeros((n_int, 0))
-                Ufree = Unred
-            else:
-                drdxnred = cons_jac @ Vnred @ Siinv
-                drdx = drdxnred @ Unred.T
-                Vcons, Vfree = _split_cons_subspace(drdxnred)
-                Ucons = Unred @ Vcons
-                Ufree = Unred @ Vfree
-            return drdx, Ucons, Unred, Ufree
-
+    def _calc_basis(self):
         # Subclasses (CellInternalPES) cache the cell-extended form themselves
         # and call _compute_basis_int directly, so we only cache here when
         # this *is* the runtime class.
@@ -1176,50 +1139,6 @@ class InternalPES(PES):
         f, g_cart = PES.eval(self)
         Binv = self._get_Binv()
         return f, g_cart @ Binv[:len(g_cart)]
-
-    def update_internals(self, dx):
-        self._update(True)
-
-        nold = 3 * (len(self.atoms) + len(self.dummies))
-
-        # Find new internals, constraints, and dummies
-        new_int = self.int_orig.copy()
-        new_int.find_all_bonds()
-        new_int.find_all_angles()
-        new_int.find_all_dihedrals()
-        new_int.validate_basis()
-        new_cons = new_int.cons
-
-        # Calculate B matrix and its inverse for new and old internals
-        Blast = self.int.jacobian()
-        B = new_int.jacobian()
-        Binv = np.linalg.pinv(B)
-        Dlast = self.int.hessian()
-        D = new_int.hessian()
-
-        # Update the info in self.curr
-        x = new_int.calc()
-        g = -self.atoms.get_forces().ravel() @ Binv[:3*len(self.atoms)]
-        drdx, Ucons, Unred, Ufree = self._calc_basis(
-            internal=new_int,
-            cons=new_cons,
-        )
-        L = np.linalg.lstsq(drdx.T, g, rcond=_LSTSQ_RCOND)[0]
-
-        # Update H using old data where possible. For new (dummy) atoms,
-        # use the guess hessian info.
-        H = self.get_H().asarray()
-        Hcart = Blast.T @ H @ Blast
-        Hcart += Dlast.ldot(self.curr['g'])
-        Hnew = Binv.T[:, :nold] @ (Hcart - D.ldot(g)) @ Binv
-        self.dim = len(x)
-        self.set_H(Hnew)
-
-        self.int = new_int
-        self.cons = new_cons
-
-        self.curr.update(x=x, g=g, drdx=drdx, Ufree=Ufree,
-                         Unred=Unred, Ucons=Ucons, L=L, B=B, Binv=Binv)
 
     def get_df_pred(self, dx, g, H):
         if H is None:
@@ -2201,18 +2120,11 @@ class CellInternalPES(_CellPESMixin, InternalPES):
 
         return dEdF
 
-    def _calc_basis(self, internal=None, cons=None):
+    def _calc_basis(self):
         """Calculate basis including cell DOF.
 
         The cell DOF are treated as unconstrained additional coordinates.
         """
-        # Refine paths pass custom internal/cons; fall back to the parent's
-        # full path (bypasses parent's cache too) and return without caching
-        # on this side.
-        if internal is not None or cons is not None:
-            result = InternalPES._calc_basis(self, internal=internal, cons=cons)
-            return self._extend_basis_with_cell(result)
-
         state_hash = self._state_hash()
         cached = self._cell_basis_cache.get(state_hash)
         if cached is not None:
