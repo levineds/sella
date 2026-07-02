@@ -149,7 +149,6 @@ class Sella(Optimizer):
             # Register trajectory for cleanup when close() is called
             self.closelater(trajectory)
 
-        asetraj = None
         self.peskwargs = kwargs.copy()
         self.user_internal = internal
         self.initialize_pes(
@@ -176,7 +175,7 @@ class Sella(Optimizer):
             rs = 'mis' if internal else 'ras'
         self.rs = get_restricted_step(rs)
         Optimizer.__init__(self, atoms, restart=restart,
-                           logfile=logfile, trajectory=asetraj,
+                           logfile=logfile, trajectory=None,
                            master=master)
 
         if delta0 is None:

@@ -11,7 +11,6 @@ from ase.visualize import view
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io.trajectory import Trajectory
 
-from sella.utilities.math import modified_gram_schmidt
 from sella.hessian_update import symmetrize_Y
 from sella.linalg import NumericalHessian, ApproximateHessian
 from sella.eigensolvers import rayleigh_ritz
@@ -777,8 +776,6 @@ class InternalPES(PES):
 
         rms_prev = np.inf
         initial_rms = None
-        pos_first = None
-        dpos_first = None
         stagnation_count = 0
 
         for iteration in range(max_iter):
@@ -825,11 +822,6 @@ class InternalPES(PES):
             # Update positions
             self.atoms.positions += dx[:len(self.atoms)]
             self.dummies.positions += dx[len(self.atoms):]
-
-            # Save first iteration result as fallback
-            if pos_first is None:
-                pos_first = self.atoms.positions.copy()
-                dpos_first = self.dummies.positions.copy()
 
             # Check for bad internals during iteration
             self.bad_int = self.int.check_for_bad_internals()
@@ -1162,9 +1154,6 @@ class InternalPES(PES):
         Dlast = self.int.hessian()
         D = new_int.hessian()
 
-        # # Projection matrices
-        # P2 = B[:, nold:] @ Binv[nold:, :]
-
         # Update the info in self.curr
         x = new_int.calc()
         g = -self.atoms.get_forces().ravel() @ Binv[:3*len(self.atoms)]
@@ -1236,11 +1225,6 @@ class InternalPES(PES):
 
         return dydt.ravel()
 
-    def kick(self, dx, diag=False, **diag_kwargs):
-        ratio = PES.kick(self, dx, diag=diag, **diag_kwargs)
-
-        return ratio
-
     def write_traj(self):
         if self.traj is not None:
             energy = self.atoms.calc.results['energy']
@@ -1289,13 +1273,6 @@ class InternalPES(PES):
 
         # finish reconstructing redundant internal Hessian
         return Unred @ Hnred @ Unred.T + lnred_mean * Ured @ Ured.T
-
-    def _convert_internal_hessian_to_cartesian(
-        self,
-        Hint: np.ndarray,
-    ) -> np.ndarray:
-        B = self.int.jacobian()
-        return B.T @ Hint @ B + self.int.hessian().ldot(self.get_g())
 
     def calculate_hessian(self):
         assert self.hessian_function is not None
@@ -2013,7 +1990,7 @@ class CellInternalPES(_CellPESMixin, InternalPES):
 
         return dx_initial, dx_final, g_final
 
-    def _set_x_ode_internal(self, q_target: np.ndarray, old_g_cart=None):
+    def _set_x_ode_internal(self, q_target: np.ndarray):
         """ODE-based stepper for internal coords only (cell already updated)."""
         x0 = self.int.calc()
         dx = self.wrap_dx(q_target - x0)

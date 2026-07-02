@@ -67,7 +67,6 @@ class QuasiNewton(BaseStepper):
         'qn',
         'quasi-newton',
         'quasi newton',
-        'quasi-newton',
         'newton',
         'mmf',
         'minimum mode following',

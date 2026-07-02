@@ -1,11 +1,7 @@
 from typing import (
     Tuple, Callable, Iterator, Union, TypeVar, Optional, List, Dict, Type
 )
-from itertools import (
-    product,
-    combinations,
-    combinations_with_replacement as cwr
-)
+from itertools import product, combinations
 from functools import partialmethod
 import warnings
 
@@ -688,9 +684,6 @@ def _apply_dF(Prefpos, vec, N):
 
         # result[:, :, d, 1:] = dFtop * v0 + (-dRtr*I + dR + dR.T) @ v3
         for i_ax in range(3):
-            val = -dRtr * v3[:, i_ax, None]  # (B, N) — broadcast
-            val = val.squeeze(-1) if val.ndim > 2 else val
-            # Correction: val shape should be (B, N)
             val = -dRtr * v3[:, i_ax:i_ax+1]  # (B, 1) broadcast with (B, N) -> (B, N)
             if i_ax == d:
                 val = val + Pv3  # (B, N)
@@ -1007,26 +1000,6 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
     return hvp
 
 
-def _rotation_3axis_hvp(pos, refpos, mask, v):
-    """HVP for one fragment, all 3 axes at once.
-
-    Returns shape (3, N, 3) — the directional derivative of the
-    Jacobian (3, N, 3) along v (N, 3).
-    """
-    primals = (pos,)
-    tangents = (v,)
-    _, hvp = jvp(
-        lambda p: jacfwd(_rotation_3axis_masked, argnums=0)(p, refpos, mask),
-        primals, tangents
-    )
-    return hvp
-
-
-_rotation_3axis_hvp_batched_jit = jit(
-    vmap(_rotation_3axis_hvp, in_axes=(0, 0, 0, 0))
-)
-
-
 class Rotation(Coordinate):
     def __init__(
         self,
@@ -1221,7 +1194,6 @@ class BaseInternals:
 
         self._lastpos = None
         self._cache = dict()
-        self._cache_version = 0
 
         if dummies is None:
             if dinds is not None:
@@ -1353,7 +1325,6 @@ class BaseInternals:
         ):
             self._cache = dict()
             self._lastpos = current_pos.copy()
-            self._cache_version += 1
         # Park the freshly-merged positions in the cache so the next
         # all_positions access doesn't redo the vstack.
         if self.ndummies > 0:
@@ -2327,7 +2298,6 @@ class BaseInternals:
 
         # Reshape v for easy indexing
         v_atoms = v.reshape((-1, 3))  # (n_atoms, 3)
-        n_atoms = self.natoms + self.ndummies
         ndof = self.ndof  # Cache to avoid repeated property lookups
 
         # Get active mask and counts
@@ -3539,7 +3509,6 @@ class Internals(BaseInternals):
                     # so constraining both over-constrains real atoms)
                     dangle1 = b1 + dbond
                     self.cons.fix_angle(dangle1, replace_ok=False)
-                    dangle2 = b2 + dbond
                     # Fix the improper dihedral and update relevant internals
                     if b2.indices[1] == j:
                         b2 = b2.reverse()

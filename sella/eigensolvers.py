@@ -47,12 +47,10 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
         P_lams, P_vecs, _ = exact(P, 0)
         nneg = max(1, np.sum(P_lams < 0))
         V = modified_gram_schmidt(P_vecs[:, :nneg])
-        v0 = V[:, 0]
 
     AV = A.dot(V)
 
     symm = 2
-    seeking = 0
     while True:
         Atilde = V.T @ (symmetrize_Y(V, AV, symm=symm))
         lams, vecs = eigh(Atilde, V.T @ B @ V)

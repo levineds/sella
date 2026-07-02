@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 
-from __future__ import division
-
 import logging
 import numpy as np
 
@@ -87,7 +85,7 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None,
         # both positive definite
         method = 'TS-BFGS'
         if lams is not None and np.all(lams > 0):
-            lams_STY, vecs_STY = eigh(S.T @ Ytilde, S.T @ S)
+            lams_STY, _ = eigh(S.T @ Ytilde, S.T @ S)
             if np.all(lams_STY > 0):
                 method = 'BFGS'
 

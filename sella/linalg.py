@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 from typing import List
-from itertools import product
 import numpy as np
 
 from sella.hessian_update import update_H
