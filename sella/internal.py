@@ -1516,6 +1516,14 @@ class BaseInternals:
 
         self._batched_arrays_valid = True
 
+    @staticmethod
+    def _tvec_or_empty(indices, ncvecs, cell, n_tvec):
+        """Translation vectors ``ncvecs @ cell``, or a correctly-shaped
+        ``(0, n_tvec, 3)`` empty when there are no coordinates of this type."""
+        if len(indices) > 0:
+            return ncvecs @ cell
+        return np.empty((0, n_tvec, 3), dtype=np.float64)
+
     def _get_cached_tvecs(self, cell: np.ndarray) -> Dict[str, np.ndarray]:
         """Get cached translation vectors for cell, computing if necessary.
 
@@ -1529,39 +1537,24 @@ class BaseInternals:
             return self._tvecs_cache['tvecs']
 
         self._build_batched_arrays()
-        tvecs = {}
 
-        # Unpadded tvecs (for result indexing)
-        if len(self._bond_indices) > 0:
-            tvecs['bonds'] = self._bond_ncvecs @ cell
-        else:
-            tvecs['bonds'] = np.empty((0, 1, 3), dtype=np.float64)
-
-        if len(self._angle_indices) > 0:
-            tvecs['angles'] = self._angle_ncvecs @ cell
-        else:
-            tvecs['angles'] = np.empty((0, 2, 3), dtype=np.float64)
-
-        if len(self._dihedral_indices) > 0:
-            tvecs['dihedrals'] = self._dihedral_ncvecs @ cell
-        else:
-            tvecs['dihedrals'] = np.empty((0, 3, 3), dtype=np.float64)
-
-        # Padded tvecs (for GPU-efficient batch computation)
-        if len(self._bond_indices_padded) > 0:
-            tvecs['bonds_padded'] = self._bond_ncvecs_padded @ cell
-        else:
-            tvecs['bonds_padded'] = np.empty((0, 1, 3), dtype=np.float64)
-
-        if len(self._angle_indices_padded) > 0:
-            tvecs['angles_padded'] = self._angle_ncvecs_padded @ cell
-        else:
-            tvecs['angles_padded'] = np.empty((0, 2, 3), dtype=np.float64)
-
-        if len(self._dihedral_indices_padded) > 0:
-            tvecs['dihedrals_padded'] = self._dihedral_ncvecs_padded @ cell
-        else:
-            tvecs['dihedrals_padded'] = np.empty((0, 3, 3), dtype=np.float64)
+        # n_tvec = 1/2/3 for bonds/angles/dihedrals. Unpadded entries are used
+        # for result indexing; padded entries for GPU-efficient batch ops.
+        tvecs = {
+            'bonds': self._tvec_or_empty(
+                self._bond_indices, self._bond_ncvecs, cell, 1),
+            'angles': self._tvec_or_empty(
+                self._angle_indices, self._angle_ncvecs, cell, 2),
+            'dihedrals': self._tvec_or_empty(
+                self._dihedral_indices, self._dihedral_ncvecs, cell, 3),
+            'bonds_padded': self._tvec_or_empty(
+                self._bond_indices_padded, self._bond_ncvecs_padded, cell, 1),
+            'angles_padded': self._tvec_or_empty(
+                self._angle_indices_padded, self._angle_ncvecs_padded, cell, 2),
+            'dihedrals_padded': self._tvec_or_empty(
+                self._dihedral_indices_padded, self._dihedral_ncvecs_padded,
+                cell, 3),
+        }
 
         self._tvecs_cache = {'cell_hash': cell_hash, 'tvecs': tvecs}
         return tvecs
