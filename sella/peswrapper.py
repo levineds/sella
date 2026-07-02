@@ -156,6 +156,26 @@ def _expm_frechet_3x3_contracted(U, dEdF):
     return (Vinv.T @ (fij * M) @ V.T).real
 
 
+def _cell_deformation_jacobian(F, orig_cell, exp_cell_factor):
+    """Jacobian ``d(cell_ab)/d(L_ij)`` of the cell parameterization.
+
+    The cell is parameterized as ``cell(L) = expm(L / factor) @ orig_cell``
+    with ``L = logm(F) * factor``. The Frechet derivative of expm is therefore
+    evaluated at the *unscaled* log-deformation ``logm(F)`` (the base point),
+    with perturbation direction ``E_ij / factor`` (the chain-rule dL->dX term).
+    """
+    X = _logm_3x3(F)
+    J = np.zeros((9, 9))
+    for idx in range(9):
+        i, j = divmod(idx, 3)
+        E = np.zeros((3, 3))
+        E[i, j] = 1.0 / exp_cell_factor
+        dF = expm_frechet(X, E, compute_expm=False)
+        dC = dF @ orig_cell  # d(cell)/d(L_ij)
+        J[:, idx] = dC.ravel()
+    return J
+
+
 def _niggli_hessian_transform(atoms, orig_cell, exp_cell_factor, cell_mask):
     """Compute the Hessian transformation matrix for Niggli reduction.
 
@@ -185,19 +205,10 @@ def _niggli_hessian_transform(atoms, orig_cell, exp_cell_factor, cell_mask):
     T_masked : ndarray, shape (n_cell_dof, n_cell_dof)
         Transformation matrix for the masked cell DOF.
     """
-    # Compute old Jacobian: J_old[ab, ij] = d(cell_ab)/d(L_ij)
-    # at the current (pre-reduction) L value
+    # Old Jacobian J_old[ab, ij] = d(cell_ab)/d(L_ij) at the current
+    # (pre-reduction) log-deformation.
     F_old = atoms.get_cell().array @ np.linalg.inv(orig_cell)
-    X_old = _logm_3x3(F_old) / exp_cell_factor  # unscaled log-deformation
-
-    J_old = np.zeros((9, 9))
-    for idx in range(9):
-        i, j = divmod(idx, 3)
-        E = np.zeros((3, 3))
-        E[i, j] = 1.0 / exp_cell_factor
-        dF = expm_frechet(X_old, E, compute_expm=False)
-        dC = dF @ orig_cell  # d(cell)/d(L_ij)
-        J_old[:, idx] = dC.ravel()
+    J_old = _cell_deformation_jacobian(F_old, orig_cell, exp_cell_factor)
 
     # Apply Niggli reduction
     niggli_reduce(atoms)
