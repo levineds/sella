@@ -1576,6 +1576,85 @@ class _CellPESMixin:
         drdx[:, :self.n_coords] = drdx_coords
         return drdx
 
+    def _virial_to_dEdF(self, virial, forces):
+        """Convert the virial V*sigma to dE/dF. Subclass-specific.
+
+        CellInternalPES adds the rigid-fragment corrections; CellCartesianPES
+        uses the fixed-Cartesian form. Must be overridden.
+        """
+        raise NotImplementedError
+
+    def _stress_to_cell_gradient(self, stress_voigt, forces=None):
+        """Convert a stress tensor to the gradient w.r.t. the log-deformation
+        cell parameters.
+
+        Shared prologue/epilogue for both cell PES flavors: build the virial
+        (with external pressure), delegate the virial->dE/dF step to the
+        subclass ``_virial_to_dEdF`` hook, then map dE/dF -> dE/dU = dE/d(logF)
+        via the Frechet derivative of expm and apply the cell mask / scaling.
+        """
+        volume = self.atoms.get_volume()
+        stress_3x3 = voigt_6_to_full_3x3_stress(stress_voigt)
+
+        # Add external pressure contribution
+        if self.scalar_pressure != 0.0:
+            stress_3x3 += self.scalar_pressure * np.eye(3)
+
+        # The virial V*sigma is the base term
+        virial = volume * stress_3x3
+
+        dEdF = self._virial_to_dEdF(virial, forces)
+
+        # Convert dE/dF to dE/dU via Frechet derivative of expm
+        F = self._get_deformation_gradient()
+        U = _logm_3x3(F)
+        g_cell_3x3 = _expm_frechet_3x3_contracted(U, dEdF)
+
+        # Apply cell mask and scale
+        g_cell_3x3 = g_cell_3x3 * self.cell_mask
+        g_cell_3x3 = g_cell_3x3 / self.exp_cell_factor
+
+        return g_cell_3x3[self.cell_mask]
+
+    def _extend_basis_with_cell(self, basis_int):
+        """Pad a coordinate-only basis with cell DOF (identity in Unred/Ufree)."""
+        drdx_int, Ucons_int, Unred_int, Ufree_int = basis_int
+        n_int = drdx_int.shape[1]
+        n_total = n_int + self.n_cell_dof
+
+        # Cell DOF are not constrained, so they're all in Ufree
+        drdx = np.zeros((drdx_int.shape[0], n_total))
+        drdx[:, :n_int] = drdx_int
+
+        Ucons = np.zeros((n_total, Ucons_int.shape[1]))
+        Ucons[:n_int, :] = Ucons_int
+
+        Unred = self._pad_with_cell_identity(Unred_int)
+
+        # When there are no constraints, the internal basis returns
+        # ``Ufree is Unred`` (same object). Share the extended array too —
+        # avoids a second slice copy on every call.
+        if Ufree_int is Unred_int:
+            Ufree = Unred
+        else:
+            Ufree = self._pad_with_cell_identity(Ufree_int)
+
+        return drdx, Ucons, Unred, Ufree
+
+    def _pad_with_cell_identity(self, M_int):
+        """Build (n_int + n_cell, M_int.shape[1] + n_cell) with M_int and an
+        identity block in the cell-DOF corner. Uses np.empty and explicit
+        zero strips to skip the bulk np.zeros memset for the n_int block
+        that's about to be overwritten anyway."""
+        n_int, n_cols = M_int.shape
+        n_cell = self.n_cell_dof
+        out = np.empty((n_int + n_cell, n_cols + n_cell))
+        out[:n_int, :n_cols] = M_int
+        out[:n_int, n_cols:] = 0
+        out[n_int:, :n_cols] = 0
+        out[n_int:, n_cols:] = np.eye(n_cell)
+        return out
+
 
 class CellInternalPES(_CellPESMixin, InternalPES):
     """Internal coordinate PES with unit cell optimization.
@@ -2045,36 +2124,13 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         self.write_traj()
         return f, np.concatenate([g_internal, g_cell])
 
-    def _stress_to_cell_gradient(self, stress_voigt: np.ndarray, forces: np.ndarray = None) -> np.ndarray:
-        """Convert stress tensor to gradient w.r.t. log-deformation cell parameters.
+    def _virial_to_dEdF(self, virial, forces):
+        """Rigid-fragment-aware virial -> dE/dF for internal-coordinate cells.
 
-        Uses the Frechet derivative of the matrix exponential to correctly
-        transform dE/dF into dE/dU = dE/d(log F).
-
-        The virial stress V*σ relates to dE/dC via (ASE row-vector convention):
-            V*σ = dE/dC^T @ C - f^T @ r
-
-        For different atom-motion modes (where Δr = r - r_CoM_expanded):
-            default:            dE/dC = C^{-T} @ V*σ                    @ C₀^T
-            rigid_fragments:    dE/dC = C^{-T} @ (V*σ + Δr^T @ f)       @ C₀^T
-
-        Parameters
-        ----------
-        stress_voigt : ndarray
-            6-component Voigt stress tensor.
-        forces : ndarray, optional
-            Atomic forces, shape (n_atoms, 3). Required when rigid_fragments=True.
+        dE/dC = C^{-T} @ (V*sigma [+ dr^T @ f]), then dE/dF = dE/dC @ C0^T,
+        with an additional polar-rotation (dR/dF) correction in
+        rigid_fragments mode. ``dr`` is positions relative to fragment CoM.
         """
-        volume = self.atoms.get_volume()
-        stress_3x3 = voigt_6_to_full_3x3_stress(stress_voigt)
-
-        # Add external pressure contribution
-        if self.scalar_pressure != 0.0:
-            stress_3x3 += self.scalar_pressure * np.eye(3)
-
-        # The virial V*σ is the base term
-        virial = volume * stress_3x3
-
         if self.rigid_fragments and forces is not None:
             # Rigid fragment mode: use Δr^T @ f correction
             # Δr = positions relative to fragment CoM
@@ -2109,16 +2165,7 @@ class CellInternalPES(_CellPESMixin, InternalPES):
                     rot_correction[m, n] = -np.sum(dR * M)
             dEdF += rot_correction
 
-        # Convert dE/dF to dE/dU via Frechet derivative of expm
-        F = self._get_deformation_gradient()
-        U = _logm_3x3(F)
-        g_cell_3x3 = _expm_frechet_3x3_contracted(U, dEdF)
-
-        # Apply cell mask and scale
-        g_cell_3x3 = g_cell_3x3 * self.cell_mask
-        g_cell_3x3 = g_cell_3x3 / self.exp_cell_factor
-
-        return g_cell_3x3[self.cell_mask]
+        return dEdF
 
     def _calc_basis(self, internal=None, cons=None):
         """Calculate basis including cell DOF.
@@ -2143,45 +2190,6 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         result = self._compute_basis_int()
         out = self._extend_basis_with_cell(result)
         self._cell_basis_cache.put(state_hash, out)
-        return out
-
-    def _extend_basis_with_cell(self, basis_int):
-        """Pad an internal-only basis with cell DOF (identity in Unred/Ufree)."""
-        drdx_int, Ucons_int, Unred_int, Ufree_int = basis_int
-        n_int = drdx_int.shape[1]
-        n_total = n_int + self.n_cell_dof
-
-        # Cell DOF are not constrained, so they're all in Ufree
-        drdx = np.zeros((drdx_int.shape[0], n_total))
-        drdx[:, :n_int] = drdx_int
-
-        Ucons = np.zeros((n_total, Ucons_int.shape[1]))
-        Ucons[:n_int, :] = Ucons_int
-
-        Unred = self._pad_with_cell_identity(Unred_int)
-
-        # When there are no constraints, _compute_basis_int returns
-        # ``Ufree is Unred`` (same object). Share the extended array too —
-        # avoids a second ~3 MB slice copy on every call.
-        if Ufree_int is Unred_int:
-            Ufree = Unred
-        else:
-            Ufree = self._pad_with_cell_identity(Ufree_int)
-
-        return drdx, Ucons, Unred, Ufree
-
-    def _pad_with_cell_identity(self, M_int):
-        """Build (n_int + n_cell, M_int.shape[1] + n_cell) with M_int and an
-        identity block in the cell-DOF corner. Uses np.empty and explicit
-        zero strips to skip the bulk np.zeros memset for the n_int block
-        that's about to be overwritten anyway."""
-        n_int, n_cols = M_int.shape
-        n_cell = self.n_cell_dof
-        out = np.empty((n_int + n_cell, n_cols + n_cell))
-        out[:n_int, :n_cols] = M_int
-        out[:n_int, n_cols:] = 0
-        out[n_int:, :n_cols] = 0
-        out[n_int:, n_cols:] = np.eye(n_cell)
         return out
 
     def converged(self, fmax: float, smax: float = None, cmax: float = 1e-5):
@@ -2423,53 +2431,19 @@ class CellCartesianPES(_CellPESMixin, PES):
         self.write_traj()
         return f, np.concatenate([g_cart, g_cell])
 
-    def _stress_to_cell_gradient(self, stress_voigt: np.ndarray,
-                                 forces: np.ndarray) -> np.ndarray:
-        """Convert stress tensor to gradient w.r.t. log-deformation cell parameters.
+    def _virial_to_dEdF(self, virial, forces):
+        """Fixed-Cartesian virial -> dE/dF for Cartesian cells.
 
-        Uses the Frechet derivative of the matrix exponential to correctly
-        transform dE/dF into dE/dU = dE/d(log F).
-
-        The virial stress V*σ relates to dE/dC via (ASE row-vector convention):
-            V*σ = dE/dC^T @ C - f^T @ r
-
-        So dE/dC = C^{-T} @ (V*σ + r^T @ f)  at fixed Cartesian positions, or
-           dE/dC = C^{-T} @ V*σ              at fixed fractional positions.
-
-        Then dE/dF = dE/dC @ C₀^T via chain rule through cell = F @ C₀.
+        In CellCartesianPES positions are always set independently after cell
+        changes (set_x overrides any position scaling), so the fixed-Cartesian
+        gradient applies: dE/dC = C^{-T} @ (V*sigma + r^T @ f), then chain-rule
+        through cell = F @ C0 gives dE/dF = dE/dC @ C0^T.
         """
-        volume = self.atoms.get_volume()
-        stress_3x3 = voigt_6_to_full_3x3_stress(stress_voigt)
-
-        # Add external pressure contribution
-        if self.scalar_pressure != 0.0:
-            stress_3x3 += self.scalar_pressure * np.eye(3)
-
         C = self.atoms.get_cell().array
         C_inv_T = np.linalg.inv(C.T)
-
-        # V*σ from the virial stress
-        virial = volume * stress_3x3
-
-        # In CellCartesianPES, positions are always set independently after
-        # cell changes (set_x overrides any position scaling), so we always
-        # need the fixed-Cartesian gradient: dE/dC = C^{-T} @ (V*σ + r^T @ f)
         positions = self.atoms.get_positions()
         dEdC = C_inv_T @ (virial + positions.T @ forces)
-
-        # Chain rule: cell = F @ C₀, so dE/dF = dE/dC @ C₀^T
-        dEdF = dEdC @ self.orig_cell.T
-
-        # Convert dE/dF to dE/dU via Frechet derivative of expm
-        F = self._get_deformation_gradient()
-        U = _logm_3x3(F)
-        g_cell_3x3 = _expm_frechet_3x3_contracted(U, dEdF)
-
-        # Apply cell mask and scale
-        g_cell_3x3 = g_cell_3x3 * self.cell_mask
-        g_cell_3x3 = g_cell_3x3 / self.exp_cell_factor
-
-        return g_cell_3x3[self.cell_mask]
+        return dEdC @ self.orig_cell.T
 
     def _calc_basis(self):
         """Calculate basis including cell DOF.
@@ -2490,28 +2464,11 @@ class CellCartesianPES(_CellPESMixin, PES):
         Ufree_cart = VT[ncons:].T
         Unred_cart = np.eye(self.n_cart)
 
-        # Extend to include cell DOF
-        n_total = self.n_cart + self.n_cell_dof
-
-        # drdx extended with zeros for cell columns
-        drdx = np.zeros((drdx_cart.shape[0], n_total))
-        drdx[:, :self.n_cart] = drdx_cart
-
-        # Ucons stays the same (no cell constraints)
-        Ucons = np.zeros((n_total, Ucons_cart.shape[1]))
-        Ucons[:self.n_cart, :] = Ucons_cart
-
-        # Unred extended with identity for cell DOF
-        Unred = np.zeros((n_total, Unred_cart.shape[1] + self.n_cell_dof))
-        Unred[:self.n_cart, :Unred_cart.shape[1]] = Unred_cart
-        Unred[self.n_cart:, Unred_cart.shape[1]:] = np.eye(self.n_cell_dof)
-
-        # Ufree extended with identity for cell DOF
-        Ufree = np.zeros((n_total, Ufree_cart.shape[1] + self.n_cell_dof))
-        Ufree[:self.n_cart, :Ufree_cart.shape[1]] = Ufree_cart
-        Ufree[self.n_cart:, Ufree_cart.shape[1]:] = np.eye(self.n_cell_dof)
-
-        result = drdx, Ucons, Unred, Ufree
+        # Extend to include cell DOF (cell DOF are unconstrained -> identity
+        # block in Unred/Ufree). Shared with CellInternalPES via the mixin.
+        result = self._extend_basis_with_cell(
+            (drdx_cart, Ucons_cart, Unred_cart, Ufree_cart)
+        )
 
         # Cache the result
         self._basis_cache.put(state_hash, result)
