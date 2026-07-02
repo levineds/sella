@@ -3067,7 +3067,7 @@ class Internals(BaseInternals):
         if isinstance(index, Translation):
             if dim is not None:
                 raise ValueError(
-                    '"dim" keyword cannot be used with explicit Cart'
+                    '"dim" keyword cannot be used with explicit Translation'
                 )
             new = index
         else:
@@ -3140,7 +3140,7 @@ class Internals(BaseInternals):
         if isinstance(index, Translation):
             if dim is not None:
                 raise ValueError(
-                    '"dim" keyword cannot be used with explicit Cart'
+                    '"dim" keyword cannot be used with explicit Translation'
                 )
             new = index
         else:
