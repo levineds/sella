@@ -3799,8 +3799,15 @@ class Internals(BaseInternals):
         return h0 * units.Hartree
 
     def guess_hessian(self, h0cart=70.) -> np.ndarray:
+        # Bond count per atom (molecular topology) feeds the dihedral
+        # curvature heuristic; count over all bonds, independent of which
+        # coordinates are currently active.
         nbonds = np.zeros(len(self.all_atoms), dtype=np.int32)
-        h0 = np.zeros(self.nint, dtype=np.float64)
+        for bond in self.internals['bonds']:
+            i, j = bond.indices
+            nbonds[i] += 1
+            nbonds[j] += 1
+
         h0_tr = 0.05 * units.Hartree
         periodic = np.any(self.atoms.pbc)
         if periodic and self.allow_fragments:
@@ -3809,28 +3816,33 @@ class Internals(BaseInternals):
         else:
             h0_trans = h0_tr
             h0_rot = h0_tr
-        idx = 0
-        for trans in self.internals['translations']:
-            h0[idx] = h0_trans if self.allow_fragments else h0cart
-            idx += 1
-        for bond in self.internals['bonds']:
-            h0[idx] = self._h0_bond(bond)
-            idx += 1
-            # count number of bonds per atom for dihedral later
-            i, j = bond.indices
-            nbonds[i] += 1
-            nbonds[j] += 1
-        for angle in self.internals['angles']:
-            h0[idx] = self._h0_angle(angle)
-            idx += 1
         dummy_set = set(range(self.natoms, self.natoms + self.ndummies))
-        for dihedral in self.internals['dihedrals']:
-            if any(j in dummy_set for j in dihedral.indices):
-                h0[idx] = 0.5 * units.Hartree
-            else:
-                h0[idx] = self._h0_dihedral(dihedral, nbonds)
-            idx += 1
-        for rot in self.internals['rotations']:
-            h0[idx] = h0_rot if self.allow_fragments else h0cart
-            idx += 1
+
+        def _h0_value(name, coord):
+            if name == 'translations':
+                return h0_trans if self.allow_fragments else h0cart
+            if name == 'bonds':
+                return self._h0_bond(coord)
+            if name == 'angles':
+                return self._h0_angle(coord)
+            if name == 'dihedrals':
+                if any(k in dummy_set for k in coord.indices):
+                    return 0.5 * units.Hartree
+                return self._h0_dihedral(coord, nbonds)
+            if name == 'rotations':
+                return h0_rot if self.allow_fragments else h0cart
+            # 'other': generic coordinate, use the default Cartesian curvature.
+            return h0cart
+
+        # Walk the coordinate families in canonical order, active coords only,
+        # so the diagonal stays aligned with jacobian()/hessian() row ordering.
+        h0 = np.zeros(self.nint, dtype=np.float64)
+        idx = 0
+        for name in self._names:
+            for coord, active in zip(self.internals[name],
+                                     self._active[name]):
+                if not active:
+                    continue
+                h0[idx] = _h0_value(name, coord)
+                idx += 1
         return np.diag(np.abs(h0))
