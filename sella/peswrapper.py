@@ -737,8 +737,8 @@ class InternalPES(PES):
             # range(B) = Q @ range(R) and pinv(B) = pinv(R) @ Q.T, so the
             # rank-revealing work shrinks to the small (k x n) R factor.
             # This is ~1.5x faster than SVD-of-B on large systems and matches
-            # it to machine precision. This branch is rare in general but
-            # common for free molecules (redundant internals + rigid-body
+            # it to machine precision. This branch is rare for cell optimization
+            # but common for free molecules (redundant internals + rigid-body
             # null space), where it fires essentially every step.
             Ur, Sr, VTr = np.linalg.svd(R, full_matrices=False)
             nnred = _svd_rank(Sr)
