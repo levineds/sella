@@ -188,19 +188,15 @@ class RestrictedAtomicStep(BaseRestrictedStep):
 class MaxInternalStep(BaseRestrictedStep):
     synonyms = ['mis', 'max internal step']
 
-    def __init__(
-        self, pes, *args, wx=1., wb=1., wa=1., wd=1., wo=1., wc=1., **kwargs
-    ):
+    def __init__(self, pes, *args, wc=1., **kwargs):
         if pes.int is None:
             raise ValueError(
                 f"Internal coordinates are required for the "
                 f"{self.__class__.__name__} trust region method"
             )
-        self.wx = wx
-        self.wb = wb
-        self.wa = wa
-        self.wd = wd
-        self.wo = wo
+        # The per-family weights (translations/bonds/angles/dihedrals/other/
+        # rotations) were all fixed at 1.0 and never set by any caller, so only
+        # the cell-DOF weight remains configurable.
         self.wc = wc  # Weight for cell DOF
         self._weights_cache = None
         BaseRestrictedStep.__init__(self, pes, *args, **kwargs)
@@ -231,14 +227,12 @@ class MaxInternalStep(BaseRestrictedStep):
         )
         if cached is not None and cached[0] == key:
             return cached[1]
-        w = np.array(
-            [self.wx] * self.pes.int.ntrans
-            + [self.wb] * self.pes.int.nbonds
-            + [self.wa] * self.pes.int.nangles
-            + [self.wd] * self.pes.int.ndihedrals
-            + [self.wo] * self.pes.int.nother
-            + [self.wx] * self.pes.int.nrotations
+        n_coord = (
+            self.pes.int.ntrans + self.pes.int.nbonds
+            + self.pes.int.nangles + self.pes.int.ndihedrals
+            + self.pes.int.nother + self.pes.int.nrotations
         )
+        w = np.ones(n_coord)
         if n_cell_dof > 0:
             w = np.concatenate([w, [self.wc] * n_cell_dof])
         self._weights_cache = (key, w)
