@@ -1170,12 +1170,18 @@ def make_internal(
         jac = jit(jac)
         hess = jit(hess)
 
+    def __init__(self, indices):
+        # Coordinate.__init__ resets self.kwargs to {}, so install the fixed
+        # eval kwargs afterwards. Copy per-instance to avoid a shared dict.
+        Coordinate.__init__(self, indices)
+        self.kwargs = dict(kwargs)
+
     return type(name, (Coordinate,), dict(
         nindices=nindices,
-        kwargs=kwargs,
+        __init__=__init__,
         _eval0=staticmethod(fun),
         _eval1=staticmethod(jac),
-        _eval2=staticmethod(hess)
+        _eval2=staticmethod(hess),
     ))
 
 
