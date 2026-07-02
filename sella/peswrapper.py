@@ -70,6 +70,18 @@ def _split_cons_subspace(drdxnred, tol_factor=1e-6):
     return Q[:, :ncons], Q[:, ncons:]
 
 
+def _svd_rank(s, rtol=1e-6):
+    """Numerical rank from a singular-value spectrum, relative to the largest.
+
+    Counts singular values above ``rtol * s[0]``; returns 0 for an empty
+    spectrum. Using a relative (rather than absolute) cutoff keeps the rank
+    scale-invariant, which matters for poorly-scaled Jacobians.
+    """
+    if len(s) == 0:
+        return 0
+    return int(np.sum(s > rtol * s[0]))
+
+
 def _range_space_projector(B):
     """Orthogonal projector onto range(B) with rank truncation via pivoting QR."""
     if B.size == 0:
@@ -1263,7 +1275,9 @@ class InternalPES(PES):
         # Get Jacobian and calculate redundant and non-redundant spaces
         B = self.int.jacobian()[:, :ncart]
         Ui, Si, VTi = np.linalg.svd(B, full_matrices=True)
-        nnred = np.sum(Si > 1e-6)
+        # Relative rank threshold (was an absolute 1e-6 here, inconsistent with
+        # the other SVD sites; matters only for poorly-scaled Jacobians).
+        nnred = _svd_rank(Si)
         Unred = Ui[:, :nnred]
         Ured = Ui[:, nnred:]
 
