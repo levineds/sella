@@ -12,12 +12,12 @@ def test_get_binv_rank_deficient_fallback_matches_primary():
     """The _get_Binv cache-miss fallback must reproduce the SAME truncated
     pseudoinverse as the primary QR path.
 
-    In the rank-deficient branch _get_jacobian_qr caches Binv = pinv(R) @ Q.T
-    (rank-truncated at 1e-6*sigma_max). If the 2-entry LRU evicts it, _get_Binv
-    recomputes. It must rebuild the same truncated pseudoinverse from the
-    truncated (Q, R) rather than np.linalg.pinv(B), whose default (machine-eps)
-    rcond would keep the near-null directions the rank cut discarded and yield
-    an inconsistent, potentially blown-up Binv.
+    In the rank-deficient branch _get_jacobian_qr caches a pseudoinverse
+    rank-truncated at 1e-6*sigma_max. If the 2-entry LRU evicts it, _get_Binv
+    rebuilds it as pinv(R) @ Q.T from the cached truncated (Q, R) -- matching
+    the primary path -- rather than a plain np.linalg.pinv(B), whose default
+    (machine-eps) rcond would keep the near-null directions the rank cut
+    discarded and yield an inconsistent, potentially blown-up Binv.
     """
     warnings.simplefilter("ignore")
     atoms = molecule("CH3CH2OH")  # redundant internals -> rank-deficient B

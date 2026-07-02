@@ -765,21 +765,28 @@ class InternalPES(PES):
             return cached
 
         Q, R = self._get_jacobian_qr()
+        # For a rank-deficient Jacobian, _get_jacobian_qr computes and caches
+        # Binv itself. Re-check here (our first check ran before that populate)
+        # so we don't recompute it, and so the else below is a true
+        # eviction-only path.
+        cached = self._pinv_cache.get(state_hash)
+        if cached is not None:
+            return cached
+
         if R.size == 0:
             ncart = 3 * len(self.atoms) + (3 * len(self.dummies) if self.dummies else 0)
             Binv = np.empty((ncart, 0))
         elif R.shape[0] == R.shape[1]:
+            # Full rank: R is the upper-triangular QR factor, so R^{-1} Q^T via
+            # a triangular solve is cheaper than any SVD-based pseudoinverse.
             Binv = solve_triangular(R, Q.T, check_finite=False)
         else:
-            # Non-square R from the rank-deficient fallback — Binv should
-            # already have been cached by _get_jacobian_qr, but recompute as a
-            # safety net (e.g., if the 2-entry cache evicted it). Rebuild the
-            # SAME truncated pseudoinverse the QR path uses: pinv(B) =
-            # pinv(R) @ Q.T for orthonormal Q, where (Q, R) are already rank-
-            # truncated. Using np.linalg.pinv(B) here instead would apply
-            # numpy's default (machine-eps) rcond and keep the near-null
-            # directions the 1e-6 rank cut discarded — a blown-up, inconsistent
-            # Binv relative to the cached one.
+            # Non-square R => rank-deficient. We only get here on eviction:
+            # _qr_cache still holds the truncated (Q, R) but the 2-entry
+            # _pinv_cache dropped Binv. Rebuild pinv(B) = pinv(R) @ Q.T from
+            # those cached factors (Q orthonormal, R the rank-truncated
+            # factor) -- cheaper than re-SVDing the full Jacobian, and
+            # consistent with the QR path's 1e-6 rank truncation.
             Binv = np.linalg.pinv(R) @ Q.T
 
         self._pinv_cache.put(state_hash, Binv)
