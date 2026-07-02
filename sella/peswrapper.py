@@ -2260,7 +2260,11 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         g = self.get_g()
         g_internal = g[:self.n_internal]
         Ufree = self.get_Ufree()
-        Ufree_int = Ufree[:self.n_internal, :]
+        # Drop the trailing cell-DOF columns (as converged() does) so the
+        # projection is over atomic DOF only. These columns are zero in the
+        # internal-coordinate rows, so this does not change the result; it just
+        # keeps the two methods consistent.
+        Ufree_int = Ufree[:self.n_internal, :Ufree.shape[1] - self.n_cell_dof]
         B = self.int.jacobian()
         return -(Ufree_int @ (Ufree_int.T @ g_internal) @ B).reshape((-1, 3))
 
@@ -2538,7 +2542,11 @@ class CellCartesianPES(_CellPESMixin, PES):
         g = self.get_g()
         g_cart = g[:self.n_cart]
         Ufree = self.get_Ufree()
-        Ufree_cart = Ufree[:self.n_cart, :]
+        # Drop the trailing cell-DOF columns (as converged() does) so the
+        # projection is over atomic DOF only. These columns are zero in the
+        # Cartesian rows, so this does not change the result; it just keeps the
+        # two methods consistent.
+        Ufree_cart = Ufree[:self.n_cart, :Ufree.shape[1] - self.n_cell_dof]
         return -(Ufree_cart @ (Ufree_cart.T @ g_cart)).reshape((-1, 3))
 
     def get_Hc(self):
