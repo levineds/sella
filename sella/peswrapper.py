@@ -717,7 +717,8 @@ class InternalPES(PES):
 
         Shared between _get_Binv and _calc_basis so the Jacobian is
         decomposed at most once per geometry.  ~2x faster than SVD.
-        Falls back to SVD if the Jacobian is rank-deficient.
+        On rank deficiency, SVD-truncates the small R factor (reusing this
+        QR) rather than re-factorizing B.
         """
         state_hash = self._state_hash()
         cached = self._qr_cache.get(state_hash)
@@ -730,17 +731,24 @@ class InternalPES(PES):
         # Check for rank deficiency via R diagonal
         rdiag = np.abs(np.diag(R))
         if len(rdiag) > 0 and rdiag.min() < 1e-6 * rdiag.max():
-            # Rank-deficient: fall back to SVD for safe truncation
-            Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
-            nnred = _svd_rank(Si)
-            Q = Ui[:, :nnred]
-            R = np.diag(Si[:nnred]) @ VTi[:nnred]
+            # Rank-deficient. Rather than re-factorizing the big (m x n) B
+            # with a fresh SVD, reuse the economy QR already computed above
+            # (on the GPU when available): with B = Q R and Q orthonormal,
+            # range(B) = Q @ range(R) and pinv(B) = pinv(R) @ Q.T, so the
+            # rank-revealing work shrinks to the small (k x n) R factor.
+            # This is ~1.5x faster than SVD-of-B on large systems and matches
+            # it to machine precision. This branch is rare in general but
+            # common for free molecules (redundant internals + rigid-body
+            # null space), where it fires essentially every step.
+            Ur, Sr, VTr = np.linalg.svd(R, full_matrices=False)
+            nnred = _svd_rank(Sr)
 
-            # Pre-compute Binv from SVD factors and cache it, since the
-            # non-square R can't be used with solve_triangular in _get_Binv
-            Siinv = np.diag(1.0 / Si[:nnred])
-            Binv = VTi[:nnred].T @ Siinv @ Ui[:, :nnred].T
+            # Binv = pinv(R) @ Q.T, computed before Q/R are reassigned below.
+            Binv = (VTr[:nnred].T / Sr[:nnred]) @ (Ur[:, :nnred].T @ Q.T)
             self._pinv_cache.put(state_hash, Binv)
+
+            Q = Q @ Ur[:, :nnred]              # orthonormal basis for range(B) = Unred
+            R = np.diag(Sr[:nnred]) @ VTr[:nnred]  # (nnred, n) non-square -> signals deficiency
 
         self._qr_cache.put(state_hash, (Q, R))
         return Q, R
@@ -763,7 +771,7 @@ class InternalPES(PES):
         elif R.shape[0] == R.shape[1]:
             Binv = solve_triangular(R, Q.T, check_finite=False)
         else:
-            # Non-square R from rank-deficient SVD fallback — Binv should
+            # Non-square R from the rank-deficient fallback — Binv should
             # already have been cached by _get_jacobian_qr, but recompute
             # as a safety net (e.g., if the 2-entry cache evicted it).
             B = self.int.jacobian()
@@ -1103,7 +1111,7 @@ class InternalPES(PES):
                     R.T, cons_jac.T, lower=True, check_finite=False
                 ).T
             else:
-                # Rank-deficient (SVD fallback in _get_jacobian_qr)
+                # Rank-deficient (SVD-of-R fallback in _get_jacobian_qr)
                 Binv = self._get_Binv()
                 drdxnred = cons_jac @ (Binv @ Q)
             drdx = drdxnred @ Q.T
