@@ -6,7 +6,7 @@ import inspect
 from sella.peswrapper import PES, InternalPES
 from .stepper import get_stepper, BaseStepper, NaiveStepper
 
-_LSTSQ_RCOND = 1e-10
+from sella._constants import _LSTSQ_RCOND
 
 
 # Classes for restricted step (e.g. trust radius, max atom displacement, etc)

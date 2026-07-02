@@ -9,7 +9,7 @@ from sella import _gpu as _gpu_mod
 
 logger = logging.getLogger(__name__)
 
-_LSTSQ_RCOND = 1e-10
+from sella._constants import _LSTSQ_RCOND
 
 
 def symmetrize_Y2(S, Y):

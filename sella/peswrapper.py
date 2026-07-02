@@ -19,7 +19,7 @@ from sella._gpu import gpu_qr as _gpu_qr, gpu_project
 
 logger = logging.getLogger(__name__)
 
-_LSTSQ_RCOND = 1e-10
+from sella._constants import _LSTSQ_RCOND
 
 
 class _LRU2:

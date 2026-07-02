@@ -1279,6 +1279,23 @@ class BaseInternals:
     def _active_indices(self) -> List[int]:
         return [idx for idx, active in enumerate(self._active_mask) if active]
 
+    def _split_active_mask(self, n_trans, n_bonds, n_angles,
+                           n_dihedrals, n_other, n_rot):
+        """Slice ``_active_mask`` into the six per-family sub-masks.
+
+        Families are returned in canonical ``_names`` order (translations,
+        bonds, angles, dihedrals, other, rotations). Callers pass their own
+        per-family counts so the split stays in lockstep with however they
+        enumerated the coordinates.
+        """
+        active_mask = self._active_mask
+        masks = []
+        start = 0
+        for n in (n_trans, n_bonds, n_angles, n_dihedrals, n_other, n_rot):
+            masks.append(active_mask[start:start + n])
+            start += n
+        return masks
+
     @property
     def nint(self) -> int:
         return len(self._active_indices)
@@ -1795,21 +1812,11 @@ class BaseInternals:
         n_rot = len(rot_data)
 
         # Build active masks per type
-        active_mask = self._active_mask
-        start = 0
-        trans_active = active_mask[start:start+n_trans]
-        start += n_trans
-        bonds_active = active_mask[start:start+n_bonds]
-        start += n_bonds
-        angles_active = active_mask[start:start+n_angles]
-        start += n_angles
-        dihedrals_active = active_mask[start:start+n_dihedrals]
-        start += n_dihedrals
-        other_active = active_mask[start:start+n_other]
-        start += n_other
-        rot_active = active_mask[start:start+n_rot]
+        (trans_active, bonds_active, angles_active, dihedrals_active,
+         other_active, rot_active) = self._split_active_mask(
+            n_trans, n_bonds, n_angles, n_dihedrals, n_other, n_rot)
 
-        n_active = sum(active_mask)
+        n_active = sum(self._active_mask)
         n_atoms = self.natoms + self.ndummies
         B = np.zeros((n_active, n_atoms, 3))
         row = 0
@@ -1916,21 +1923,11 @@ class BaseInternals:
         n_rot = len(self.internals['rotations'])
 
         # Build active masks per type
-        active_mask = self._active_mask
-        start = 0
-        trans_active = active_mask[start:start+n_trans]
-        start += n_trans
-        bonds_active = active_mask[start:start+n_bonds]
-        start += n_bonds
-        angles_active = active_mask[start:start+n_angles]
-        start += n_angles
-        dihedrals_active = active_mask[start:start+n_dihedrals]
-        start += n_dihedrals
-        other_active = active_mask[start:start+n_other]
-        start += n_other
-        rot_active = active_mask[start:start+n_rot]
+        (trans_active, bonds_active, angles_active, dihedrals_active,
+         other_active, rot_active) = self._split_active_mask(
+            n_trans, n_bonds, n_angles, n_dihedrals, n_other, n_rot)
 
-        n_active = sum(active_mask)
+        n_active = sum(self._active_mask)
         B_cell = np.zeros((n_active, 3, 3))
         row = 0
 
@@ -2208,19 +2205,9 @@ class BaseInternals:
         n_rot = len(rot_data)
 
         # Build active masks per type
-        active_mask = self._active_mask
-        start = 0
-        trans_active = active_mask[start:start+n_trans]
-        start += n_trans
-        bonds_active = active_mask[start:start+n_bonds]
-        start += n_bonds
-        angles_active = active_mask[start:start+n_angles]
-        start += n_angles
-        dihedrals_active = active_mask[start:start+n_dihedrals]
-        start += n_dihedrals
-        other_active = active_mask[start:start+n_other]
-        start += n_other
-        rot_active = active_mask[start:start+n_rot]
+        (trans_active, bonds_active, angles_active, dihedrals_active,
+         other_active, rot_active) = self._split_active_mask(
+            n_trans, n_bonds, n_angles, n_dihedrals, n_other, n_rot)
 
         n_atoms = self.natoms + self.ndummies
         hessians = []
@@ -2309,18 +2296,12 @@ class BaseInternals:
         n_other = len(self.internals['other'])
         n_rot = len(self.internals['rotations'])
 
-        start = 0
-        trans_active = active_mask[start:start+n_trans]
-        start += n_trans
-        bonds_active = np.array(active_mask[start:start+n_bonds], dtype=bool)
-        start += n_bonds
-        angles_active = np.array(active_mask[start:start+n_angles], dtype=bool)
-        start += n_angles
-        dihedrals_active = np.array(active_mask[start:start+n_dihedrals], dtype=bool)
-        start += n_dihedrals
-        other_active = active_mask[start:start+n_other]
-        start += n_other
-        rot_active = active_mask[start:start+n_rot]
+        (trans_active, bonds_active, angles_active, dihedrals_active,
+         other_active, rot_active) = self._split_active_mask(
+            n_trans, n_bonds, n_angles, n_dihedrals, n_other, n_rot)
+        bonds_active = np.array(bonds_active, dtype=bool)
+        angles_active = np.array(angles_active, dtype=bool)
+        dihedrals_active = np.array(dihedrals_active, dtype=bool)
 
         n_active = sum(active_mask)
 
