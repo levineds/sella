@@ -46,6 +46,8 @@ class IRC(Optimizer):
         self.dx = dx
         if peskwargs is None:
             self.peskwargs = dict(gamma=gamma)
+        else:
+            self.peskwargs = peskwargs
 
         if 'masses' not in self.atoms.arrays:
             try:
