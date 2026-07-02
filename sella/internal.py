@@ -2262,6 +2262,49 @@ class BaseInternals:
         self._cache['hessian_result'] = result
         return result
 
+    def _scatter_batched_family(self, jax_result, active, n_actual,
+                                all_flat_cols, csr_offset, width,
+                                use_sparse, data, out, row):
+        """Scatter one batched bond/angle/dihedral HVP result into the output.
+
+        Extracted verbatim from the three per-family blocks in hessian_rdot;
+        returns the advanced output row.
+        """
+        if jax_result is None:
+            return row
+        hvp = np.asarray(device_get(jax_result))
+        if active.all():
+            hvp = hvp[:n_actual]
+            n_coords = n_actual
+            flat_cols = all_flat_cols
+        else:
+            n_coords = int(active.sum())
+            flat_cols = all_flat_cols[active]
+        if use_sparse:
+            data[csr_offset:csr_offset + n_coords * width] = hvp.reshape(-1)
+        else:
+            out[row:row + n_coords, :] = 0
+            out[np.arange(row, row + n_coords)[:, None], flat_cols] = \
+                hvp.reshape(n_coords, -1)
+        return row + n_coords
+
+    def _scatter_full_row(self, hvp, idx, use_sparse, data, out, off, row,
+                          ndof):
+        """Scatter one dense HVP row (other/rotation coords) into the output.
+
+        Extracted verbatim from the three full-row blocks in hessian_rdot;
+        returns the advanced (off, row).
+        """
+        if use_sparse:
+            dense_row = np.zeros(ndof)
+            dense_row.reshape((-1, 3))[idx] = hvp
+            data[off:off + ndof] = dense_row
+            off += ndof
+        else:
+            out_row = out[row].reshape((-1, 3))
+            out_row[idx] = hvp
+        return off, row + 1
+
     def hessian_rdot(self, v: np.ndarray):
         """Compute Hessian @ v for all internal coordinates using direct HVP.
 
@@ -2308,6 +2351,8 @@ class BaseInternals:
         # Fast path: when all coords are active, use pre-built CSR structure
         use_sparse = (n_active == self._csr_n_active)
 
+        data = None
+        out = None
         if use_sparse:
             data = self._csr_data
             data[:] = 0
@@ -2419,47 +2464,18 @@ class BaseInternals:
 
         # Now collect results with device_get and scatter into output
 
-        if bond_jax_result is not None:
-            hvp = np.asarray(device_get(bond_jax_result))
-            if bonds_active.all():
-                hvp = hvp[:self._n_bonds_actual]
-            n_coords = self._n_bonds_actual if bonds_active.all() else int(bonds_active.sum())
-            if use_sparse:
-                off = self._csr_bond_offset
-                data[off:off + n_coords * 6] = hvp.reshape(-1)
-            else:
-                flat_cols = self._bond_flat_cols if bonds_active.all() else self._bond_flat_cols[bonds_active]
-                out[row:row+n_coords, :] = 0
-                out[np.arange(row, row+n_coords)[:, None], flat_cols] = hvp.reshape(n_coords, -1)
-            row += n_coords
-
-        if angle_jax_result is not None:
-            hvp = np.asarray(device_get(angle_jax_result))
-            if angles_active.all():
-                hvp = hvp[:self._n_angles_actual]
-            n_coords = self._n_angles_actual if angles_active.all() else int(angles_active.sum())
-            if use_sparse:
-                off = self._csr_angle_offset
-                data[off:off + n_coords * 9] = hvp.reshape(-1)
-            else:
-                flat_cols = self._angle_flat_cols if angles_active.all() else self._angle_flat_cols[angles_active]
-                out[row:row+n_coords, :] = 0
-                out[np.arange(row, row+n_coords)[:, None], flat_cols] = hvp.reshape(n_coords, -1)
-            row += n_coords
-
-        if dih_jax_result is not None:
-            hvp = np.asarray(device_get(dih_jax_result))
-            if dihedrals_active.all():
-                hvp = hvp[:self._n_dihedrals_actual]
-            n_coords = self._n_dihedrals_actual if dihedrals_active.all() else int(dihedrals_active.sum())
-            if use_sparse:
-                off = self._csr_dih_offset
-                data[off:off + n_coords * 12] = hvp.reshape(-1)
-            else:
-                flat_cols = self._dihedral_flat_cols if dihedrals_active.all() else self._dihedral_flat_cols[dihedrals_active]
-                out[row:row+n_coords, :] = 0
-                out[np.arange(row, row+n_coords)[:, None], flat_cols] = hvp.reshape(n_coords, -1)
-            row += n_coords
+        row = self._scatter_batched_family(
+            bond_jax_result, bonds_active, self._n_bonds_actual,
+            self._bond_flat_cols, self._csr_bond_offset, 6,
+            use_sparse, data, out, row)
+        row = self._scatter_batched_family(
+            angle_jax_result, angles_active, self._n_angles_actual,
+            self._angle_flat_cols, self._csr_angle_offset, 9,
+            use_sparse, data, out, row)
+        row = self._scatter_batched_family(
+            dih_jax_result, dihedrals_active, self._n_dihedrals_actual,
+            self._dihedral_flat_cols, self._csr_dih_offset, 12,
+            use_sparse, data, out, row)
 
         # Other - use existing hessian computation (typically few coords, loop is fine)
         atoms = self.light_atoms
@@ -2470,15 +2486,8 @@ class BaseInternals:
                 idx = np.array(coord.indices)
                 v_sub = v_atoms[idx]
                 hvp = np.einsum('aibj,bj->ai', hess, v_sub)
-                if use_sparse:
-                    dense_row = np.zeros(ndof)
-                    dense_row.reshape((-1, 3))[idx] = hvp
-                    data[off:off + ndof] = dense_row
-                    off += ndof
-                else:
-                    out_row = out[row].reshape((-1, 3))
-                    out_row[idx] = hvp
-                row += 1
+                off, row = self._scatter_full_row(
+                    hvp, idx, use_sparse, data, out, off, row, ndof)
 
         # Rotations - collect results from closed-form Hessian (no NaN
         # for degenerate eigenvalues)
@@ -2497,26 +2506,12 @@ class BaseInternals:
                 if not rot_active[i]:
                     continue
                 hvp, idx = ordered[i]
-                if use_sparse:
-                    dense_row = np.zeros(ndof)
-                    dense_row.reshape((-1, 3))[idx] = hvp
-                    data[off:off + ndof] = dense_row
-                    off += ndof
-                else:
-                    out_row = out[row].reshape((-1, 3))
-                    out_row[idx] = hvp
-                row += 1
+                off, row = self._scatter_full_row(
+                    hvp, idx, use_sparse, data, out, off, row, ndof)
         else:
             for hvp, idx in rot_closed_results:
-                if use_sparse:
-                    dense_row = np.zeros(ndof)
-                    dense_row.reshape((-1, 3))[idx] = hvp
-                    data[off:off + ndof] = dense_row
-                    off += ndof
-                else:
-                    out_row = out[row].reshape((-1, 3))
-                    out_row[idx] = hvp
-                row += 1
+                off, row = self._scatter_full_row(
+                    hvp, idx, use_sparse, data, out, off, row, ndof)
 
         if use_sparse:
             return sparse.csr_matrix(
