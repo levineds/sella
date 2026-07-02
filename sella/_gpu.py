@@ -73,6 +73,12 @@ def gpu_eigh(A, A_gpu=None):
     If A_gpu (a torch tensor on CUDA) is supplied, the upload is skipped.
     """
     n = A.shape[0]
+    if n == 0:
+        # scipy.linalg.eigh rejects 0x0 input (LAPACK dsyevr requires il<=n),
+        # whereas np.linalg.eigh returns empties. Match numpy so callers with
+        # a fully-constrained (empty) subspace don't crash.
+        return (np.empty(0, dtype=np.float64),
+                np.empty((0, 0), dtype=np.float64))
     if A_gpu is not None or _gpu_ok(n):
         try:
             At = A_gpu if A_gpu is not None else to_gpu(A)

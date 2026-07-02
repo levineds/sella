@@ -73,6 +73,13 @@ def _split_cons_subspace(drdxnred, tol_factor=1e-6):
 
 def _range_space_projector(B):
     """Orthogonal projector onto range(B) with rank truncation via pivoting QR."""
+    if B.size == 0:
+        # scipy's pivoted QR rejects a zero-sized matrix (LAPACK geqp3), but the
+        # range of an empty B is {0}, so the projector is the (m, m) zero matrix.
+        # This matches the rank-0 result the QR path would produce for a nonzero
+        # but rank-deficient B.
+        m = B.shape[0]
+        return np.zeros((m, m), dtype=B.dtype)
     Q, R, _ = qr(B, mode='full', pivoting=True, check_finite=False)
     rdiag = np.abs(np.diag(R))
     rcond = max(B.shape) * np.finfo(B.dtype).eps
