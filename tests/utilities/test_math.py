@@ -3,7 +3,7 @@ import numpy as np
 
 from sella.utilities.math import pseudo_inverse, modified_gram_schmidt
 
-from tests.test_utils import get_matrix
+from test_utils import get_matrix
 
 # Try to import Cython-based wrappers - skip tests if not available
 try:

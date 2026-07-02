@@ -183,8 +183,16 @@ class TestTRICs:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             ints.validate_basis()
-            # Should not warn if TRIC DOF calculation is correct
-            assert len(w) == 0, f"Unexpected warning: {w[0].message if w else 'none'}"
+            # Should not warn if TRIC DOF calculation is correct. Ignore
+            # ResourceWarnings, which can leak in from garbage collection of
+            # unclosed files opened by unrelated tests (GC timing is not
+            # deterministic across the suite).
+            relevant = [x for x in w
+                        if not issubclass(x.category, ResourceWarning)]
+            assert len(relevant) == 0, (
+                f"Unexpected warning: "
+                f"{relevant[0].message if relevant else 'none'}"
+            )
 
     def test_tric_optimization_convergence(self):
         """Test that optimization with TRICs converges (ODE doesn't fail).
