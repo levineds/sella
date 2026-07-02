@@ -732,7 +732,7 @@ class InternalPES(PES):
         if len(rdiag) > 0 and rdiag.min() < 1e-6 * rdiag.max():
             # Rank-deficient: fall back to SVD for safe truncation
             Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
-            nnred = np.sum(Si > 1e-6 * Si[0])
+            nnred = _svd_rank(Si)
             Q = Ui[:, :nnred]
             R = np.diag(Si[:nnred]) @ VTi[:nnred]
 
@@ -1121,7 +1121,7 @@ class InternalPES(PES):
                 cons = self.cons
             B = internal.jacobian()
             Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
-            nnred = np.sum(Si > 1e-6 * Si[0])
+            nnred = _svd_rank(Si)
             Unred = Ui[:, :nnred]
             Vnred = VTi[:nnred].T
             Siinv = np.diag(1 / Si[:nnred])
@@ -2473,7 +2473,7 @@ class CellCartesianPES(_CellPESMixin, PES):
 
         drdx_cart = self.cons.jacobian()  # Constraint Jacobian for Cartesian coords
         U, S, VT = np.linalg.svd(drdx_cart)
-        ncons = np.sum(S > 1e-6 * S[0]) if len(S) > 0 else 0
+        ncons = _svd_rank(S)
         Ucons_cart = VT[:ncons].T
         Ufree_cart = VT[ncons:].T
         Unred_cart = np.eye(self.n_cart)
