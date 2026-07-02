@@ -772,10 +772,15 @@ class InternalPES(PES):
             Binv = solve_triangular(R, Q.T, check_finite=False)
         else:
             # Non-square R from the rank-deficient fallback — Binv should
-            # already have been cached by _get_jacobian_qr, but recompute
-            # as a safety net (e.g., if the 2-entry cache evicted it).
-            B = self.int.jacobian()
-            Binv = np.linalg.pinv(B)
+            # already have been cached by _get_jacobian_qr, but recompute as a
+            # safety net (e.g., if the 2-entry cache evicted it). Rebuild the
+            # SAME truncated pseudoinverse the QR path uses: pinv(B) =
+            # pinv(R) @ Q.T for orthonormal Q, where (Q, R) are already rank-
+            # truncated. Using np.linalg.pinv(B) here instead would apply
+            # numpy's default (machine-eps) rcond and keep the near-null
+            # directions the 1e-6 rank cut discarded — a blown-up, inconsistent
+            # Binv relative to the cached one.
+            Binv = np.linalg.pinv(R) @ Q.T
 
         self._pinv_cache.put(state_hash, Binv)
         return Binv
