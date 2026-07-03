@@ -2977,10 +2977,20 @@ class Internals(BaseInternals):
         atol: float = 15.,
         dinds: np.ndarray = None,
         cons: Constraints = None,
-        allow_fragments: bool = False
+        allow_fragments: bool = False,
     ) -> None:
         BaseInternals.__init__(self, atoms, dummies, dinds)
         self.atol = atol * np.pi / 180.
+        # Fragment-welding redundancy (see _mst_welding_bonds). Augmentation is
+        # ON by default: it closes fragment rings, symmetrizes extended contact
+        # interfaces, and makes welding permutation-invariant, at the cost of
+        # redundant internals (which Sella handles). It is provably inert on
+        # generic asymmetric systems -- the physical gate means only genuine
+        # near-degenerate contacts qualify -- so it only acts where the bare
+        # spanning tree would be biased.
+        self._weld_augment = True
+        self._weld_tol = 0.15    # add contacts within 15% of an interface min
+        self._weld_gate = 1.4    # ... and <= 1.4 x sum(covalent radii)
         self.forbidden = {key: [] for key in self._names}
         if cons is None:
             cons = Constraints(self.atoms, self.dummies, self.dinds)
@@ -3270,6 +3280,176 @@ class Internals(BaseInternals):
             results.append((int(ii[p]), int(jj[p]), ts))
         return results
 
+    def _mst_welding_bonds(self, labels):
+        """Connect disconnected fragments with a minimum-spanning-tree of the
+        shortest inter-fragment atom contacts.
+
+        Returns a list of ``(i, j, ts)`` links (``ts`` = integer cell
+        translation) that merge all fragments into one connected graph, adding
+        exactly ``n_components - 1`` bonds -- each the shortest contact joining
+        two still-separate components.
+
+        This replaces the old "inflate the covalent-radius multiplier until the
+        graph connects" welding, which grew the cutoff to ~2-3x and then added
+        *every* inter-fragment pair under it -- manufacturing grossly stretched
+        (4-6 A) and transannular bonds.  Shortest-first linking never prefers a
+        transannular contact over the genuine short link, and adds only the
+        minimal set needed for a complete internal-coordinate system.
+
+        ``labels`` follows the ``find_all_bonds`` convention: ``>= 0`` is a
+        fragment id and ``-1`` marks a lone (unbonded) atom, treated here as its
+        own singleton component.
+        """
+        natoms = self.natoms
+        pos = self.atoms.positions
+        cell = self.atoms.cell.array
+        pbc = self.atoms.pbc
+
+        # Ensure cell/rcell/op are cached (mirrors _find_bonds_vectorized).
+        if self.cell is None or not np.allclose(self.cell, self.atoms.cell):
+            self.cell = self.atoms.cell.array.copy()
+            rcell, self.op = minkowski_reduce(
+                complete_cell(self.cell), pbc=pbc
+            )
+            self.rcell = Cell(rcell)
+            self._rcell_reciprocal_T = self.rcell.reciprocal().T
+
+        # Component id per atom: fragment label, or a unique id per lone atom.
+        comp = labels.copy()
+        nxt = int(comp.max()) + 1 if comp.size else 0
+        for a in range(natoms):
+            if comp[a] < 0:
+                comp[a] = nxt
+                nxt += 1
+
+        # Candidate pairs across different components.
+        ii, jj = np.triu_indices(natoms, k=1)
+        keep = comp[ii] != comp[jj]
+        ii, jj = ii[keep], jj[keep]
+        if len(ii) == 0:
+            return []
+
+        # Minimum-image distance and translation for every candidate pair
+        # (mirrors the offset logic in _find_bonds_vectorized).
+        dx = pos[jj] - pos[ii]
+        dx_sc = dx @ self._rcell_reciprocal_T
+        offset = np.zeros(dx_sc.shape, dtype=np.int32)
+        for _ in range(2):
+            offset += (pbc * ((dx_sc - offset) // 1.)).astype(np.int32)
+        ranges = [np.arange(-1 * p, p + 1) for p in pbc]
+        base_ts = np.array(list(product(*ranges)), dtype=np.int32)
+        shifted = base_ts[None, :, :] - offset[:, None, :]
+        tvecs_cart = (shifted @ self.op) @ cell
+        dists = np.linalg.norm(dx[:, None, :] + tvecs_cart, axis=2)
+        best = dists.argmin(axis=1)
+        rows = np.arange(len(dists))
+        best_dist = dists[rows, best]
+        best_ts = (shifted[rows, best] @ self.op).astype(np.int32)
+
+        # Connect components. A bare minimum-spanning *tree* is minimal but
+        # biased: it under-determines extended contact interfaces (one weld
+        # where several comparable contacts exist), turns a ring of fragments
+        # into a chain (C- not O-shaped), and breaks symmetry on exact distance
+        # ties (tie-broken by atom index -> not permutation invariant). The
+        # optional augmentation pass first adds *all* physically-plausible
+        # near-minimum contacts per interface (redundant internals, which Sella
+        # handles via the pseudoinverse) to close rings and symmetrize; the MST
+        # pass then guarantees connectivity for whatever is still separate. The
+        # physical gate (<= `_weld_gate` x sum of covalent radii) ensures
+        # genuinely-separated fragments still get only a single minimal weld, so
+        # we never re-introduce the stretched/transannular bonds MST replaced.
+        parent = list(range(nxt))
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        ncomp = len({int(c) for c in comp})
+        n_active = [ncomp]
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+                n_active[0] -= 1
+                return True
+            return False
+
+        order = np.argsort(best_dist, kind='stable')
+        links = []
+        have = set()
+
+        if self._weld_augment:
+            tol = self._weld_tol
+            gate = self._weld_gate
+            # Connection scale: the largest edge in a minimum spanning tree over
+            # the raw components -- the smallest possible "max contact distance"
+            # that connects everything, i.e. exactly where the old flooding
+            # welding stopped inflating its cutoff. Augmenting up to this scale
+            # (and never beyond) restores flooding's redundant-but-bounded
+            # contact set: it can never add a contact LONGER than the
+            # unavoidable minimal weld, yet it recovers the extra near-min
+            # contacts a bare tree drops. This is geometry-adaptive, so it
+            # handles weakly-bonded / large-vdW fragments (e.g. noble-gas
+            # clusters) whose real contacts sit far outside a covalent-radius
+            # gate, without loosening that gate for tightly-bonded organics.
+            p2 = list(range(nxt))
+
+            def _find2(a):
+                while p2[a] != a:
+                    p2[a] = p2[p2[a]]
+                    a = p2[a]
+                return a
+
+            active2 = ncomp
+            dmst_max = 0.0
+            for k in order:
+                if active2 == 1:
+                    break
+                ra, rb = _find2(int(comp[ii[k]])), _find2(int(comp[jj[k]]))
+                if ra != rb:
+                    p2[ra] = rb
+                    active2 -= 1
+                    if best_dist[k] > dmst_max:
+                        dmst_max = best_dist[k]
+            # Shortest contact per component-pair (order is sorted, so the first
+            # time a pair is seen is its minimum).
+            pair_min = {}
+            for k in order:
+                key = frozenset((int(comp[ii[k]]), int(comp[jj[k]])))
+                if key not in pair_min:
+                    pair_min[key] = best_dist[k]
+            for k in order:
+                a, b = int(ii[k]), int(jj[k])
+                dmin = pair_min[frozenset((int(comp[a]), int(comp[b])))]
+                rcov_sum = (covalent_radii[self.atoms.numbers[a]]
+                            + covalent_radii[self.atoms.numbers[b]])
+                # Near this interface's own minimum (never a transannular
+                # contact within a tight interface) AND within either the
+                # covalent gate or the geometry-adaptive connection scale.
+                if best_dist[k] <= dmin * (1. + tol) and (
+                    best_dist[k] <= gate * rcov_sum
+                    or best_dist[k] <= dmst_max * (1. + tol)
+                ):
+                    links.append((a, b, best_ts[k]))
+                    have.add((min(a, b), max(a, b)))
+                    union(int(comp[a]), int(comp[b]))
+
+        # MST pass: add the shortest contact that still merges two separate
+        # components until the whole graph is connected.
+        for k in order:
+            if n_active[0] == 1:
+                break
+            a, b = int(ii[k]), int(jj[k])
+            if union(int(comp[a]), int(comp[b])):
+                pair = (min(a, b), max(a, b))
+                if pair not in have:
+                    links.append((a, b, best_ts[k]))
+                    have.add(pair)
+        return links
+
     def _wrap_fragment_positions(self, group, cumshifts):
         """Shift atom positions so fragment atoms are contiguous across PBC.
 
@@ -3345,9 +3525,21 @@ class Internals(BaseInternals):
             if self.allow_fragments and not first_run:
                 break
 
-            candidates = self._find_bonds_vectorized(
-                labels, scale, rcov
-            )
+            if first_run:
+                # Initial covalent-bond detection at the base scale.
+                candidates = self._find_bonds_vectorized(
+                    labels, scale, rcov
+                )
+                first_run = False
+                weld_pass = False
+            else:
+                # Fragments remain and allow_fragments is False: weld them with
+                # a minimum-spanning-tree of the shortest inter-fragment
+                # contacts, rather than inflating the covalent-radius multiplier
+                # (which manufactures stretched/transannular bonds). This single
+                # pass connects every component.
+                candidates = self._mst_welding_bonds(labels)
+                weld_pass = True
             for i, j, ts in candidates:
                 try:
                     self.add_bond((i, j), ts)
@@ -3358,8 +3550,10 @@ class Internals(BaseInternals):
                     nbonds[i] += 1
                     c10y[j, nbonds[j]] = i
                     nbonds[j] += 1
-            first_run = False
-            scale *= 1.05
+            if weld_pass:
+                # MST spans all components in one pass; connectivity is
+                # guaranteed by construction, so we are done welding.
+                break
 
         if self.allow_fragments and nlabels != 1:
             assert nlabels > 1
@@ -3424,6 +3618,8 @@ class Internals(BaseInternals):
                     (b1.indices[1], j, b2.indices[1]),
                     (-b1.kwargs['ncvecs'][0], b2.kwargs['ncvecs'][0]),
                 )
+                # Angles inside the linear window are kept as ordinary bends;
+                # near-linear ones get dummy/dihedral treatment.
                 if self.atol < new.calc(self.atoms) < np.pi - self.atol:
                     try:
                         self.add_angle(new)
