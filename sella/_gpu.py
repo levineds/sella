@@ -117,6 +117,52 @@ def gpu_qr(A):
     return np.linalg.qr(A, mode='reduced')
 
 
+def gpu_svd(M, full_matrices=True):
+    """Economy/full SVD on GPU when beneficial, else None.
+
+    Returns (U, S, Vh) as numpy arrays (same convention as numpy.linalg.svd),
+    or ``None`` when the GPU path is unavailable/too small/failed so the caller
+    can run its own CPU path (e.g. the gesdd->gesvd robust fallback). Note
+    cuSOLVER can itself raise on non-convergence (torch.linalg.LinAlgError, a
+    RuntimeError subclass) -- that is caught here and reported as None so the
+    caller's robust CPU driver takes over.
+    """
+    n = M.shape[0]
+    if _gpu_ok(n):
+        try:
+            Mt = to_gpu(M)
+            if Mt is not None:
+                U_t, S_t, Vh_t = torch.linalg.svd(Mt, full_matrices=full_matrices)
+                return U_t.cpu().numpy(), S_t.cpu().numpy(), Vh_t.cpu().numpy()
+        except (RuntimeError, MemoryError):
+            _record_oom(n)
+    return None
+
+
+def gpu_pinv(B, rcond=1e-15):
+    """Moore-Penrose pseudoinverse on GPU when beneficial, else None.
+
+    Computed via GPU SVD with the same relative cutoff (rcond * largest sv) as
+    numpy.linalg.pinv, so results match the CPU path to machine precision in
+    fp64. Returns a numpy array, or ``None`` when the GPU path is
+    unavailable/too small/failed (caller falls back to CPU).
+    """
+    n = B.shape[0]
+    if _gpu_ok(n):
+        try:
+            Bt = to_gpu(B)
+            if Bt is not None:
+                U_t, S_t, Vh_t = torch.linalg.svd(Bt, full_matrices=False)
+                cutoff = rcond * S_t[0] if S_t.numel() else S_t.new_zeros(())
+                Sinv = torch.where(S_t > cutoff, 1.0 / S_t,
+                                   torch.zeros_like(S_t))
+                P_t = (Vh_t.transpose(-2, -1) * Sinv) @ U_t.transpose(-2, -1)
+                return P_t.cpu().numpy()
+        except (RuntimeError, MemoryError):
+            _record_oom(n)
+    return None
+
+
 def gpu_project(H, U, H_gpu=None):
     """Compute U.T @ H @ U on GPU when beneficial.
 

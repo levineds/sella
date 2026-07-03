@@ -2,7 +2,7 @@ import logging
 from typing import Union, Callable
 
 import numpy as np
-from scipy.linalg import eigh, expm, expm_frechet, logm, polar, qr, solve_triangular
+from scipy.linalg import eigh, expm, expm_frechet, logm, polar, qr, solve_triangular, svd as _scipy_svd
 from scipy.integrate import LSODA
 from ase import Atoms
 from ase.build import niggli_reduce
@@ -15,11 +15,56 @@ from sella.hessian_update import symmetrize_Y
 from sella.linalg import NumericalHessian, ApproximateHessian
 from sella.eigensolvers import rayleigh_ritz
 from sella.internal import Internals, Constraints, DuplicateInternalError
-from sella._gpu import gpu_qr as _gpu_qr, gpu_project
+from sella._gpu import (gpu_qr as _gpu_qr, gpu_project,
+                        gpu_svd as _gpu_svd, gpu_pinv as _gpu_pinv)
 
 logger = logging.getLogger(__name__)
 
 from sella._constants import _LSTSQ_RCOND
+
+
+def _robust_svd(M, full_matrices=True):
+    """SVD that falls back to the QR-based LAPACK driver on non-convergence.
+
+    numpy's default ``gesdd`` (divide-and-conquer) SVD is fast but fragile on
+    near-singular / clustered-singular-value matrices, where it can raise
+    ``LinAlgError: SVD did not converge``. The internal-coordinate Jacobian is
+    routinely near-singular (redundant internals + rigid-body null space, plus
+    transient near-degenerate coordinates during the geodesic ODE), so this
+    happens in practice -- especially with ``exact_geodesic=True``, which
+    recomputes the pseudoinverse on every ODE RHS evaluation. The older
+    ``gesvd`` (QR iteration) driver is slower but robust and succeeds on the
+    exact matrices where ``gesdd`` fails.
+
+    When a CUDA GPU is present this first routes through cuSOLVER
+    (:func:`sella._gpu.gpu_svd`), which is both faster on the ~1e3-square
+    Jacobians hit under ``exact_geodesic=True`` and uses a different driver
+    that sidesteps the gesdd convergence bug entirely; the CPU gesdd->gesvd
+    path below remains as the fallback.
+    """
+    r = _gpu_svd(M, full_matrices=full_matrices)
+    if r is not None:
+        return r
+    try:
+        return np.linalg.svd(M, full_matrices=full_matrices)
+    except np.linalg.LinAlgError:
+        return _scipy_svd(M, full_matrices=full_matrices, lapack_driver='gesvd')
+
+
+def _robust_pinv(B, rcond=1e-15):
+    """Moore-Penrose pseudoinverse with the same gesdd->gesvd fallback as
+    :func:`_robust_svd` (numpy's ``pinv`` uses ``gesdd`` internally). Routes
+    through the GPU (:func:`sella._gpu.gpu_pinv`) first when available."""
+    r = _gpu_pinv(B, rcond=rcond)
+    if r is not None:
+        return r
+    try:
+        return np.linalg.pinv(B, rcond=rcond)
+    except np.linalg.LinAlgError:
+        U, s, Vt = _scipy_svd(B, full_matrices=False, lapack_driver='gesvd')
+        cutoff = rcond * (s[0] if s.size else 0.0)
+        sinv = np.where(s > cutoff, 1.0 / s, 0.0)
+        return (Vt.T * sinv) @ U.T
 
 
 class _LRU2:
@@ -740,7 +785,7 @@ class InternalPES(PES):
             # it to machine precision. This branch is rare for cell optimization
             # but common for free molecules (redundant internals + rigid-body
             # null space), where it fires essentially every step.
-            Ur, Sr, VTr = np.linalg.svd(R, full_matrices=False)
+            Ur, Sr, VTr = _robust_svd(R, full_matrices=False)
             nnred = _svd_rank(Sr)
 
             # Binv = pinv(R) @ Q.T, computed before Q/R are reassigned below.
@@ -775,7 +820,7 @@ class InternalPES(PES):
             # already have been cached by _get_jacobian_qr, but recompute
             # as a safety net (e.g., if the 2-entry cache evicted it).
             B = self.int.jacobian()
-            Binv = np.linalg.pinv(B)
+            Binv = _robust_pinv(B)
 
         self._pinv_cache.put(state_hash, Binv)
         return Binv
@@ -1128,7 +1173,7 @@ class InternalPES(PES):
             if cons is None:
                 cons = self.cons
             B = internal.jacobian()
-            Ui, Si, VTi = np.linalg.svd(B, full_matrices=False)
+            Ui, Si, VTi = _robust_svd(B, full_matrices=False)
             nnred = _svd_rank(Si)
             Unred = Ui[:, :nnred]
             Vnred = VTi[:nnred].T
@@ -1181,7 +1226,7 @@ class InternalPES(PES):
         # Calculate B matrix and its inverse for new and old internals
         Blast = self.int.jacobian()
         B = new_int.jacobian()
-        Binv = np.linalg.pinv(B)
+        Binv = _robust_pinv(B)
         Dlast = self.int.hessian()
         D = new_int.hessian()
 
@@ -1282,7 +1327,7 @@ class InternalPES(PES):
         ncart = 3 * len(self.atoms)
         # Get Jacobian and calculate redundant and non-redundant spaces
         B = self.int.jacobian()[:, :ncart]
-        Ui, Si, VTi = np.linalg.svd(B, full_matrices=True)
+        Ui, Si, VTi = _robust_svd(B, full_matrices=True)
         # Relative rank threshold (was an absolute 1e-6 here, inconsistent with
         # the other SVD sites; matters only for poorly-scaled Jacobians).
         nnred = _svd_rank(Si)
@@ -2484,7 +2529,7 @@ class CellCartesianPES(_CellPESMixin, PES):
             return cached
 
         drdx_cart = self.cons.jacobian()  # Constraint Jacobian for Cartesian coords
-        U, S, VT = np.linalg.svd(drdx_cart)
+        U, S, VT = _robust_svd(drdx_cart)
         ncons = _svd_rank(S)
         Ucons_cart = VT[:ncons].T
         Ufree_cart = VT[ncons:].T
