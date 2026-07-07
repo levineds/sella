@@ -7,7 +7,6 @@ from scipy.integrate import LSODA
 from ase import Atoms
 from ase.build import niggli_reduce
 from ase.utils import basestring
-from ase.visualize import view
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io.trajectory import Trajectory
 
@@ -944,7 +943,6 @@ class InternalPES(PES):
             if self.bad_int is not None:
                 break
             if ode.nfev > 1000:
-                view(self.atoms + self.dummies)
                 raise RuntimeError("Geometry update ODE is taking too long "
                                    "to converge!")
 
