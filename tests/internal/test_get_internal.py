@@ -4,7 +4,9 @@ import numpy as np
 from ase import Atoms
 from ase.build import molecule
 
-from sella.internal import Bond, Angle, Dihedral, Constraints, Internals
+from sella.internal import (
+    Bond, Angle, Dihedral, Displacement, Constraints, Internals
+)
 
 
 def res(pos: np.ndarray, internal: Internals) -> np.ndarray:
@@ -343,3 +345,73 @@ class TestInternalEquality:
         cons.fix_bond((0, 1), target=1.0)
         cons.fix_bond((1, 0), target=2.0)
         assert len(cons.internals['bonds']) == 1
+
+
+class TestForbid:
+    """Regression tests for forbid_* keeping parallel lists in sync.
+
+    forbid_translation removed from internals['translations'] but left
+    _active['translations'] untouched, desyncing the parallel lists (calc
+    and jacobian then disagreed on shape). _forbid_internal removed from
+    forbidden[name] (a no-op) instead of internals[name], so forbidding an
+    already-added bond left it active while also marking it forbidden.
+    """
+
+    def test_forbid_translation_syncs_active(self):
+        atoms = Atoms('H2', positions=[[0, 0, 0], [1, 0, 0]])
+        ic = Internals(atoms)
+        ic.add_translation(0)
+        ic.forbid_translation(0)
+        assert len(ic.internals['translations']) == 0
+        assert ic._active['translations'] == []
+        assert ic.nint == 0
+        # calc and jacobian must agree on the active-coordinate count.
+        assert ic.calc().shape[0] == ic.jacobian().shape[0]
+
+    def test_forbid_bond_removes_active_internal(self):
+        atoms = Atoms('H3', positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+        ic = Internals(atoms)
+        ic.add_bond((0, 1))
+        ic.add_bond((1, 2))
+        ic.forbid_bond((0, 1))
+        assert len(ic.internals['bonds']) == 1
+        assert ic._active['bonds'] == [True]
+        assert ic.internals['bonds'][0] == Bond((1, 2))
+        # Forbidding should also purge the dedup key and register the ban.
+        assert Bond((0, 1)) in ic.forbidden['bonds']
+        assert ic.calc().shape[0] == ic.jacobian().shape[0]
+
+    def test_forbid_bond_reversed_index_order(self):
+        # forbid is direction-agnostic: (1,0) must remove an added (0,1).
+        atoms = Atoms('H2', positions=[[0, 0, 0], [1, 0, 0]])
+        ic = Internals(atoms)
+        ic.add_bond((0, 1))
+        ic.forbid_bond((1, 0))
+        assert len(ic.internals['bonds']) == 0
+        assert ic._active['bonds'] == []
+
+    def test_forbid_then_add_raises(self):
+        # A forbidden coordinate cannot subsequently be added.
+        atoms = Atoms('H2', positions=[[0, 0, 0], [1, 0, 0]])
+        ic = Internals(atoms)
+        ic.forbid_bond((0, 1))
+        with pytest.raises(Exception):
+            ic.add_bond((0, 1))
+
+
+class TestDisplacementEquality:
+    """Displacement.__eq__ raised KeyError('refpos') against other classes.
+
+    Coordinate.__eq__ returns NotImplemented (truthy) for a different class,
+    so the guard fell through to other.kwargs['refpos'], which doesn't exist
+    on non-Displacement coordinates.
+    """
+
+    def test_displacement_vs_other_class(self):
+        d = Displacement(np.array([0, 1]), np.zeros((2, 3)), np.eye(6))
+        assert (d == Bond((0, 1))) is False
+
+    def test_displacement_identity(self):
+        d0 = Displacement(np.array([0, 1]), np.zeros((2, 3)), np.eye(6))
+        d1 = Displacement(np.array([0, 1]), np.zeros((2, 3)), np.eye(6))
+        assert d0 == d1
