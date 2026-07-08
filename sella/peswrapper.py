@@ -1453,6 +1453,8 @@ class _CellPESMixin:
         x0 = self.get_x()
         cell0 = self.atoms.get_cell().array.copy()
         pos0 = self.atoms.positions.copy()
+        # CellCartesianPES has no dummy atoms (self.dummies is None).
+        dpos0 = None if self.dummies is None else self.dummies.positions.copy()
 
         suffix = " (forward)" if forward else ""
         if forward:
@@ -1468,6 +1470,8 @@ class _CellPESMixin:
         def _probe(idx, sign):
             # Restore state before each probe: cell scaling is path-dependent.
             self.atoms.positions = pos0.copy()
+            if dpos0 is not None:
+                self.dummies.positions = dpos0.copy()
             self.atoms.set_cell(cell0, scale_atoms=False)
             x_probe = x0.copy()
             x_probe[idx] += sign * delta
@@ -1490,6 +1494,8 @@ class _CellPESMixin:
                             label, suffix, count, n_evals)
 
         self.atoms.positions = pos0
+        if dpos0 is not None:
+            self.dummies.positions = dpos0
         self.atoms.set_cell(cell0, scale_atoms=False)
         self.curr['x'] = None
         self.curr['f'] = None
@@ -1980,18 +1986,19 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         # Get initial cell params
         cell_params0 = self._masked_cell_params()
 
-        # Save state before cell change for rigid fragment mode
+        # Save cell before the change so we can transform atoms/dummies that
+        # ASE's set_cell does not touch.
+        cell_before = self.atoms.get_cell().array.copy()
         if self.rigid_fragments:
             pos_before = self.atoms.get_positions().copy()
-            cell_before = self.atoms.get_cell().array.copy()
 
         # Update cell (scales atoms if rigid_fragments=False)
         self._set_masked_cell_params(cell_target)
 
-        # Rigid fragment mode: translate fragment CoMs to maintain
-        # fractional positions, and rotate fragments by R from polar
-        # decomposition of the incremental deformation gradient.
         if self.rigid_fragments:
+            # Rigid fragment mode: translate fragment CoMs to maintain
+            # fractional positions, and rotate fragments by R from polar
+            # decomposition of the incremental deformation gradient.
             cell_after = self.atoms.get_cell().array
             cell_before_inv = np.linalg.inv(cell_before)
             F_inc = cell_after @ cell_before_inv
@@ -2010,6 +2017,14 @@ class CellInternalPES(_CellPESMixin, InternalPES):
                     didx = dgroup - self.int.natoms  # Convert to dummies index
                     delta_d = self.dummies.positions[didx] - com_old
                     self.dummies.positions[didx] = com_new + delta_d @ R_inc.T
+        elif len(self.dummies) > 0:
+            # Non-rigid mode: ASE's set_cell(scale_atoms=True) scaled the real
+            # atoms by the deformation gradient F = inv(cell_before) @ cell_after
+            # (fractional coords preserved), but it does not know about dummy
+            # atoms. Apply the same fractional-preserving transform so dummies
+            # track the cell shear/scale instead of being left behind.
+            F = np.linalg.inv(cell_before) @ self.atoms.get_cell().array
+            self.dummies.positions = self.dummies.positions @ F
 
         # Read back internal coords AFTER the cell change moved atoms.
         # The solver targets q_after_cell + dq, not the raw q_target.
