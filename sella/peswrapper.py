@@ -191,10 +191,8 @@ def _expm_frechet_3x3_contracted(U, dEdF):
     Unorm = np.linalg.norm(U)
     if Unorm < 1e-10:
         return dEdF.copy()
-    lam, V = np.linalg.eig(U)
-    if np.linalg.cond(V) > 1e10:
-        # Fall back when the eigenvector basis is too ill-conditioned
-        # for the closed form to be numerically reliable.
+
+    def _scipy_contract():
         g = np.zeros((3, 3))
         for mu in range(3):
             for nu in range(3):
@@ -202,6 +200,32 @@ def _expm_frechet_3x3_contracted(U, dEdF):
                 ed = expm_frechet(U, E, compute_expm=False)
                 g[mu, nu] = np.sum(ed * dEdF)
         return g
+
+    # For small ||U|| the identity-map shortcut is only first-order accurate
+    # (error ~ O(||U||)), and eig on a small nonsymmetric matrix yields
+    # ill-conditioned eigenvectors whose closed-form divided difference loses
+    # precision well before the cond(V) test below trips (empirically the
+    # closed form carries ~1e-7 error up to ||U|| ~ 1e-5). Use the accurate
+    # (Pade-based) scipy Frechet loop in this regime; it only triggers near
+    # convergence where deformations are tiny, so the extra cost is negligible.
+    if Unorm < 1e-4:
+        return _scipy_contract()
+
+    lam, V = np.linalg.eig(U)
+    if np.linalg.cond(V) > 1e10:
+        # Fall back when the eigenvector basis is too ill-conditioned
+        # for the closed form to be numerically reliable.
+        return _scipy_contract()
+    # Near-degenerate eigenvalues make the divided-difference
+    # (e^a - e^b)/(a - b) lose precision even when V is well-conditioned
+    # (e.g. symmetric U). Detect small relative gaps directly and use the
+    # accurate scipy path. Fill the diagonal with +inf via fill_diagonal to
+    # avoid the 0*inf = nan trap of ``np.eye(3) * np.inf``.
+    lam_scale = max(np.abs(lam).max(), 1.0)
+    gaps = np.abs(lam[:, None] - lam[None, :])
+    np.fill_diagonal(gaps, np.inf)
+    if gaps.min() < 1e-6 * lam_scale:
+        return _scipy_contract()
     Vinv = np.linalg.inv(V)
     expl = np.exp(lam)
     diff = lam[:, None] - lam[None, :]
@@ -1819,6 +1843,32 @@ class CellInternalPES(_CellPESMixin, InternalPES):
     @property
     def _scale_atoms_on_cell_change(self) -> bool:
         return not self.rigid_fragments
+
+    def maybe_niggli_reduce(self, angle_threshold=30.0):
+        """Niggli reduction is unsafe with internal coordinates; skip it.
+
+        Niggli reduction recombines the lattice vectors and wraps atoms
+        between periodic images. That invalidates internal-coordinate state
+        that Cartesian PES does not carry:
+
+        - Stored bond/angle/dihedral ``ncvecs`` are integer image offsets
+          interpreted against the cell (``ncvecs @ cell``). Recombining the
+          lattice changes which physical image each offset points to, so the
+          coordinates silently jump (e.g. a 0.5 A periodic bond becomes
+          5.5 A) unless the offsets are remapped by the integer lattice
+          transform -- which ASE's ``niggli_reduce`` does not expose.
+        - Dummy atoms (added for linear angles) are not part of the ASE atoms
+          object, so they are neither wrapped nor basis-transformed and are
+          left at stale Cartesian positions.
+
+        Reconstructing this correctly amounts to re-detecting the internals,
+        so we instead decline the reduction. Cell optimization still proceeds
+        via the log-deformation parameterization; it just does not get the
+        compactness benefit of Niggli. ``CellCartesianPES`` keeps the
+        reduction, where atom positions are the coordinates and Niggli is
+        self-consistent.
+        """
+        return False
 
     def refine_hessian(self, refine_level: int = 1, delta: float = 1e-4):
         """Re-refine Hessian blocks (extends base with levels 2-3)."""
