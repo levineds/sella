@@ -352,13 +352,14 @@ class ApproximateHessian(LinearOperator):
         )
 
 
-# =============================================================================
-# Performance optimization: Replace nested Python loops with vectorized
-# numpy operations using np.add.at for scatter and np.sum for reduction.
-# This provides significant speedup for Jacobian assembly operations.
-# =============================================================================
-
 class SparseInternalJacobian(LinearOperator):
+    """Sparse internal-coordinate Jacobian as a LinearOperator.
+
+    Assembles/applies the ``(nints, 3*natoms)`` Jacobian from per-coordinate
+    atom ``indices`` and ``vals`` using vectorized numpy scatter/reduce
+    (``np.add.at`` / ``np.sum``) rather than Python loops.
+    """
+
     dtype = np.float64
 
     def __init__(
@@ -400,13 +401,14 @@ class SparseInternalJacobian(LinearOperator):
         return w.ravel()
 
 
-# =============================================================================
-# Performance optimization: Use np.einsum for batched matrix-vector products
-# instead of nested Python loops with explicit indexing. This provides
-# ~7% speedup on Hessian computations.
-# =============================================================================
-
 class SparseInternalHessian(LinearOperator):
+    """Sparse ``(3*natoms, 3*natoms)`` Hessian of a single internal coordinate.
+
+    Stored as per-coordinate atom ``indices`` plus a dense ``vals`` block and
+    applied via ``np.einsum`` batched matrix-vector products rather than Python
+    loops over atom pairs.
+    """
+
     dtype = np.float64
 
     def __init__(
@@ -458,13 +460,6 @@ class SparseInternalHessian(LinearOperator):
     def _rmatvec(self, v: np.ndarray) -> np.ndarray:
         return self._matvec(v)
 
-
-# =============================================================================
-# Performance optimization: Pre-compute batched index arrays and use
-# vectorized numpy operations for ldot (~14x faster) and rdot (~7.5x faster).
-# Hessians are grouped by size (number of atoms involved) to enable batching.
-# Uses np.einsum for batched matrix-vector products and np.add.at for scatter.
-# =============================================================================
 
 class SparseInternalHessiansSkeleton:
     """Index-only data for SparseInternalHessians.

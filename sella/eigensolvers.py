@@ -7,6 +7,14 @@ from .hessian_update import symmetrize_Y
 
 
 def exact(A, gamma=None, P=None):
+    """Exact (dense) eigendecomposition of a symmetric operator.
+
+    For an ndarray ``A`` this is a direct ``eigh``. For a LinearOperator, ``A``
+    is first materialized as a symmetric dense matrix in the eigenbasis of the
+    preconditioner ``P`` (identity when ``P`` is None). Returns
+    ``(eigenvalues, eigenvectors, A @ eigenvectors)``. ``gamma`` is accepted
+    only for a common signature with ``rayleigh_ritz`` and is unused here.
+    """
     if isinstance(A, np.ndarray):
         lams, vecs = eigh(A)
     else:
@@ -30,6 +38,17 @@ def exact(A, gamma=None, P=None):
 
 def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
                   method='jd0', maxiter=None):
+    """Iterative (generalized) eigensolver for the lowest eigenpairs of ``A``.
+
+    A Davidson / Jacobi-Davidson scheme: build an orthonormal subspace ``V``
+    (seeded from ``v0``, else from the negative-eigenvalue directions of the
+    preconditioner ``P``), solve the projected generalized problem against ``B``
+    (identity when None), and expand ``V`` toward the least-converged Ritz
+    vector (via ``expand`` with the given ``method``) until a residual falls
+    below ``gamma * |theta|`` or the subspace reaches ``min(n, maxiter)``. Falls
+    back to ``exact`` when ``gamma <= 0``. Returns ``(lams, V, AV)``.
+    ``vref``/``vreftol`` are an early-exit hook against a reference eigenvector.
+    """
     n, _ = A.shape
 
     if B is None:
@@ -111,6 +130,15 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
 
 
 def expand(V, Y, P, B, lams, vecs, shift, method='jd0', seeking=0):
+    """Compute the subspace-expansion (correction) vector for one Ritz pair.
+
+    Given the current subspace ``V`` (with ``Y = A @ V``), the Ritz values
+    ``lams`` and rotation ``vecs``, returns the search direction that extends
+    ``V`` toward the ``seeking``-th Ritz pair, using the ``shift`` and
+    preconditioner ``P`` (with metric ``B``). ``method`` selects the correction:
+    'lanczos' (bare residual), 'gd' (generalized Davidson), 'jd0'/'mjd0'
+    (single/multi-vector Jacobi-Davidson), plus their '_alt' variants.
+    """
     d, n = V.shape
     R = Y @ vecs - B @ V @ vecs * lams[np.newaxis, :]
     Pshift = P - shift * B

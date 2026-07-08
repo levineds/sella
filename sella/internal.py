@@ -285,6 +285,12 @@ class Coordinate:
     def _check_derivative(
         self, atoms: Atoms, delta: float, atol: float, order: int
     ) -> bool:
+        """Compare an analytic derivative against central finite differences.
+
+        ``order=1`` checks the gradient against differences of the value;
+        ``order=2`` checks the Hessian against differences of the gradient.
+        Warns and returns False if the max abs mismatch exceeds ``atol``.
+        """
         if order == 1:
             derivative = 'Gradient'
             f0 = self.calc
@@ -316,11 +322,13 @@ class Coordinate:
     def check_gradient(
         self, atoms: Atoms, delta: float = 1e-4, atol: float = 1e-6
     ) -> bool:
+        """Finite-difference check of this coordinate's analytic gradient."""
         return self._check_derivative(atoms, delta, atol, order=1)
 
     def check_hessian(
         self, atoms: Atoms, delta: float = 1e-4, atol: float = 1e-6
     ) -> bool:
+        """Finite-difference check of this coordinate's analytic Hessian."""
         return self._check_derivative(atoms, delta, atol, order=2)
 
 
@@ -500,6 +508,18 @@ class Translation(Coordinate):
 # possibility of there being other degenerate eigenvalues).
 
 
+# Numerical tolerances for the quaternion / F-matrix rotation coordinates.
+# Eigenvalue-gap floor: when an F-matrix eigenvalue is within this of the top
+# eigenvalue (a degenerate top eigenspace, e.g. 2-atom / linear fragments), the
+# gap is treated as zero so the 1/gap term in the eigenvector-derivative
+# pseudoinverse is dropped rather than blowing up.
+_ROT_EIG_GAP_TOL = 1e-14
+# |q0 - 1| below which the rotation is treated as ~identity: asinc =
+# arccos(x)/sqrt(1-x^2) and its derivatives switch to their Taylor expansion
+# instead of the (removable) singularity at x = 1.
+_ROT_NEAR_IDENTITY_TOL = 1e-8
+
+
 def _rotation_hessian_np(pos, axis, refpos, q_stable=None):
     """Closed-form Hessian of the rotation coordinate w.r.t. positions.
 
@@ -614,8 +634,8 @@ def _rotation_3axis_jacobian_np(pos, refpos, q):
 
     c = q
     gaps = ws - ws[-1]
-    safe_inv = np.where(np.abs(gaps) > 1e-14,
-                        1.0 / np.where(np.abs(gaps) > 1e-14, gaps, 1.0),
+    safe_inv = np.where(np.abs(gaps) > _ROT_EIG_GAP_TOL,
+                        1.0 / np.where(np.abs(gaps) > _ROT_EIG_GAP_TOL, gaps, 1.0),
                         0.0)
 
     Prefpos = refpos  # refpos is already centered at construction
@@ -625,7 +645,7 @@ def _rotation_3axis_jacobian_np(pos, refpos, q):
 
     q0 = c[0]
     asinc_val = _asinc_np(q0)
-    if abs(q0 - 1.0) < 1e-8:
+    if abs(q0 - 1.0) < _ROT_NEAR_IDENTITY_TOL:
         y = q0 - 1.0
         dasinc = -1.0 / 3 + 4 * y / 15
     elif abs(q0) < 1.0 - 1e-12:
@@ -722,7 +742,7 @@ def _rotation_hessian_single(pos, axis, refpos, q_stable=None):
         if c[0] < 0:
             c = -c
     gaps = ws - ws[-1]
-    safe_inv = np.where(np.abs(gaps) > 1e-14, 1.0 / np.where(np.abs(gaps) > 1e-14, gaps, 1.0), 0.0)
+    safe_inv = np.where(np.abs(gaps) > _ROT_EIG_GAP_TOL, 1.0 / np.where(np.abs(gaps) > _ROT_EIG_GAP_TOL, gaps, 1.0), 0.0)
 
     def M_inv_mat(mat):
         return vecs @ (safe_inv[:, None] * (vecs.T @ mat))
@@ -739,7 +759,7 @@ def _rotation_hessian_single(pos, axis, refpos, q_stable=None):
     # asinc derivatives
     q0 = c[0]
     qa = c[a]
-    if abs(q0 - 1.0) < 1e-8:
+    if abs(q0 - 1.0) < _ROT_NEAR_IDENTITY_TOL:
         y = q0 - 1.0
         asinc_val = 1 - y / 3 + 2 * y**2 / 15
         dasinc = -1.0 / 3 + 4 * y / 15
@@ -916,8 +936,8 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
 
         gaps = ws - ws[:, -1:]
         safe_inv = np.where(
-            np.abs(gaps) > 1e-14,
-            1.0 / np.where(np.abs(gaps) > 1e-14, gaps, 1.0),
+            np.abs(gaps) > _ROT_EIG_GAP_TOL,
+            1.0 / np.where(np.abs(gaps) > _ROT_EIG_GAP_TOL, gaps, 1.0),
             0.0,
         )
 
@@ -944,7 +964,7 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
         s2 = np.maximum(1 - q0**2, 1e-30)
         s = np.sqrt(s2)
         ac = np.arccos(np.clip(q0, -1+1e-15, 1-1e-15))
-        near_one = np.abs(q0 - 1.0) < 1e-8
+        near_one = np.abs(q0 - 1.0) < _ROT_NEAR_IDENTITY_TOL
         y = q0 - 1.0
         asinc_val = np.where(near_one, 1 - y/3 + 2*y**2/15, ac/s)
         dasinc = np.where(near_one, -1.0/3 + 4*y/15, -1.0/s2 + q0*ac/(s*s2))
@@ -1170,12 +1190,18 @@ def make_internal(
         jac = jit(jac)
         hess = jit(hess)
 
+    def __init__(self, indices):
+        # Coordinate.__init__ resets self.kwargs to {}, so install the fixed
+        # eval kwargs afterwards. Copy per-instance to avoid a shared dict.
+        Coordinate.__init__(self, indices)
+        self.kwargs = dict(kwargs)
+
     return type(name, (Coordinate,), dict(
         nindices=nindices,
-        kwargs=kwargs,
+        __init__=__init__,
         _eval0=staticmethod(fun),
         _eval1=staticmethod(jac),
-        _eval2=staticmethod(hess)
+        _eval2=staticmethod(hess),
     ))
 
 
@@ -2670,6 +2696,7 @@ class BaseInternals:
     def check_all_gradients(
         self, delta: float = 1e-4, atol: float = 1e-6
     ) -> bool:
+        """Run check_gradient on every internal coordinate; True iff all pass."""
         success = True
         for coord in self:
             success &= coord.check_gradient(self.all_atoms, delta, atol)
@@ -2678,6 +2705,7 @@ class BaseInternals:
     def check_all_hessians(
         self, delta: float = 1e-4, atol: float = 1e-6,
     ) -> bool:
+        """Run check_hessian on every internal coordinate; True iff all pass."""
         success = True
         for coord in self:
             success &= coord.check_hessian(self.all_atoms, delta, atol)
@@ -3071,7 +3099,7 @@ class Internals(BaseInternals):
         if isinstance(index, Translation):
             if dim is not None:
                 raise ValueError(
-                    '"dim" keyword cannot be used with explicit Cart'
+                    '"dim" keyword cannot be used with explicit Translation'
                 )
             new = index
         else:
@@ -3144,7 +3172,7 @@ class Internals(BaseInternals):
         if isinstance(index, Translation):
             if dim is not None:
                 raise ValueError(
-                    '"dim" keyword cannot be used with explicit Cart'
+                    '"dim" keyword cannot be used with explicit Translation'
                 )
             new = index
         else:
