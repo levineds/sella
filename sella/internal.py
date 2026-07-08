@@ -361,14 +361,23 @@ class Internal(Coordinate):
         return self.__class__(self.indices[::-1], -self.kwargs['ncvecs'][::-1])
 
     def __eq__(self, other: object) -> bool:
-        if not Coordinate.__eq__(self, other):
-            return False
-        srev = self.reverse()
-        if not Coordinate.__eq__(srev, other):
-            return False
-        if np.all(self.kwargs['ncvecs'] == other.kwargs['ncvecs']):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        # Coordinates are direction-agnostic: equal when indices+ncvecs match
+        # in the given order, OR when the reversed coordinate matches. Each
+        # branch must pair an index match with the corresponding ncvecs match
+        # (a forward index match with forward ncvecs, reverse with reverse) --
+        # mixing them across branches lets distinct coordinates compare equal.
+        if (
+            Coordinate.__eq__(self, other)
+            and np.all(self.kwargs['ncvecs'] == other.kwargs['ncvecs'])
+        ):
             return True
-        if np.all(srev.kwargs['ncvecs'] == other.kwargs['ncvecs']):
+        srev = self.reverse()
+        if (
+            Coordinate.__eq__(srev, other)
+            and np.all(srev.kwargs['ncvecs'] == other.kwargs['ncvecs'])
+        ):
             return True
         return False
 
