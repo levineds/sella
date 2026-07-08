@@ -1655,5 +1655,74 @@ class TestDummyAtomCellHandling:
         assert_allclose(pes.dummies.positions, dpos0, atol=1e-12)
 
 
+class TestRestrictedAtomicStepCellDOF:
+    """Cartesian cell optimization must not crash under the default limiter.
+
+    internal=False, optimize_cell=True defaults to RestrictedAtomicStep,
+    whose cons() reshaped the full [atomic | cell] step vector into (-1, 3).
+    When n_cell_dof is not a multiple of 3 (e.g. a one-DOF cell_mask) that
+    reshape raised ValueError. cons() now splits the atomic and cell blocks.
+    """
+
+    @staticmethod
+    def _atoms():
+        atoms = Atoms('H4',
+                      positions=[[0, 0, 0], [2, 0, 0], [0, 2, 0], [0, 0, 2]],
+                      cell=np.eye(3) * 6.0, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    @pytest.mark.parametrize("n_free", [1, 2, 4, 9])
+    def test_cartesian_cell_opt_steps_with_mask(self, n_free):
+        # Build a mask that frees exactly n_free of the 9 cell elements, so
+        # n_cell_dof spans multiples and non-multiples of 3.
+        mask = np.zeros((3, 3), dtype=bool)
+        mask.ravel()[:n_free] = True
+        atoms = self._atoms()
+        opt = Sella(atoms, order=0, internal=False, optimize_cell=True,
+                    cell_mask=mask, logfile=None)
+        from sella.optimize.restricted_step import RestrictedAtomicStep
+        assert opt.rs is RestrictedAtomicStep
+        assert opt.pes.n_cell_dof == n_free
+        # Previously raised "cannot reshape array of size N into shape (3)".
+        for _ in range(3):
+            opt.step()
+
+    def test_plain_cartesian_still_works(self):
+        # No cell optimization: RestrictedAtomicStep behavior is unchanged.
+        atoms = Atoms('H4',
+                      positions=[[0, 0, 0], [2, 0, 0], [0, 2, 0], [0, 0, 2]])
+        atoms.calc = LennardJones()
+        opt = Sella(atoms, order=0, internal=False, logfile=None)
+        from sella.optimize.restricted_step import RestrictedAtomicStep
+        assert opt.rs is RestrictedAtomicStep
+        for _ in range(3):
+            opt.step()
+
+    def test_cons_gradient_matches_fd(self):
+        # cons() value/gradient must be consistent for atomic- and
+        # cell-dominant steps, including the wc cell weighting.
+        from sella.optimize.restricted_step import RestrictedAtomicStep
+        mask = np.zeros((3, 3), dtype=bool); mask[0, 0] = True
+        atoms = self._atoms()
+        opt = Sella(atoms, order=0, internal=False, optimize_cell=True,
+                    cell_mask=mask, logfile=None)
+        opt.pes.get_g()
+        rs = RestrictedAtomicStep(opt.pes, opt.ord, opt.delta, wc=2.0)
+        n = opt.pes.dim
+        rng = np.random.RandomState(0)
+        eps = 1e-7
+        for desc, s in [
+            ("atomic", np.r_[0.5, rng.randn(n - 1) * 0.01]),
+            ("cell", np.r_[rng.randn(n - 1) * 0.001, 0.5]),
+        ]:
+            dsda = rng.randn(n)
+            _, dval = rs.cons(s, dsda)
+            vp = rs.cons(s + eps * dsda)
+            vm = rs.cons(s - eps * dsda)
+            dval_fd = (vp - vm) / (2 * eps)
+            assert np.isclose(dval, dval_fd, atol=1e-5), desc
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

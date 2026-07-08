@@ -163,25 +163,55 @@ class IRCTrustRegion(TrustRegion):
 class RestrictedAtomicStep(BaseRestrictedStep):
     synonyms = ['ras', 'restricted atomic step']
 
-    def __init__(self, pes, *args, **kwargs):
+    def __init__(self, pes, *args, wc=1., **kwargs):
         if pes.int is not None:
             raise ValueError(
                 "Internal coordinates are not compatible with "
                 f"the {self.__class__.__name__} trust region method."
             )
+        self.wc = wc  # weight for cell DOF (only used when optimizing the cell)
         BaseRestrictedStep.__init__(self, pes, *args, **kwargs)
 
     def cons(self, s, dsda=None):
-        s_mat = s.reshape((-1, 3))
+        # With cell optimization the step vector is [atomic (3*natoms) | cell
+        # (n_cell_dof)]. Only the atomic block is a stack of 3-vectors; the
+        # cell DOF are scalars (and n_cell_dof need not be a multiple of 3, so
+        # reshaping the whole vector into (-1, 3) would crash). Split the two
+        # blocks and take the max over atomic 3-vector norms and weighted cell
+        # DOF. When n_cell_dof == 0 this reduces to the original behavior.
+        n_cell = getattr(self.pes, 'n_cell_dof', 0)
+        if n_cell:
+            s_atomic = s[:-n_cell]
+            s_cell = s[-n_cell:]
+        else:
+            s_atomic = s
+            s_cell = None
+
+        s_mat = s_atomic.reshape((-1, 3))
         s_norms = np.linalg.norm(s_mat, axis=1)
-        index = np.argmax(s_norms)
-        val = s_norms[index]
+        atomic_index = int(np.argmax(s_norms))
+        val = s_norms[atomic_index]
+        cell_index = -1
+        if s_cell is not None and n_cell:
+            cell_mags = np.abs(s_cell) * self.wc
+            c_idx = int(np.argmax(cell_mags))
+            if cell_mags[c_idx] > val:
+                val = cell_mags[c_idx]
+                cell_index = c_idx
 
         if dsda is None:
             return val
 
-        dsda_mat = dsda.reshape((-1, 3))
-        dval = dsda_mat[index] @ s_mat[index] / max(val, 1e-12)
+        if cell_index >= 0:
+            # The active DOF is a cell parameter: its magnitude is
+            # wc * |s_cell[c]|, so d(val)/da = wc * sign(s_cell[c]) * dsda_cell.
+            flat = s_cell[cell_index]
+            dsda_cell = dsda[-n_cell:][cell_index]
+            dval = self.wc * np.sign(flat) * dsda_cell
+            return val, dval
+
+        dsda_mat = dsda[:len(s_atomic)].reshape((-1, 3))
+        dval = dsda_mat[atomic_index] @ s_mat[atomic_index] / max(val, 1e-12)
         return val, dval
 
 

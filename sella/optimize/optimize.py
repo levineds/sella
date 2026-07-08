@@ -11,7 +11,8 @@ from ase.optimize.optimize import Optimizer
 from ase.utils import basestring
 from ase.io.trajectory import Trajectory
 
-from .restricted_step import get_restricted_step, MaxInternalStep
+from .restricted_step import get_restricted_step, MaxInternalStep, \
+    RestrictedAtomicStep
 from sella.peswrapper import PES, InternalPES, CellInternalPES, CellCartesianPES
 from sella.internal import Internals, Constraints
 
@@ -334,7 +335,7 @@ class Sella(Optimizer):
 
         rs_kwargs = {}
         if self.optimize_cell and isinstance(self.rs, type) and issubclass(
-            self.rs, MaxInternalStep
+            self.rs, (MaxInternalStep, RestrictedAtomicStep)
         ):
             rs_kwargs['wc'] = self.delta / self.delta_cell
 
