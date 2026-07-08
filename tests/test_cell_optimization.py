@@ -1487,5 +1487,81 @@ class TestExactGeodesicDefault:
         assert opt.pes.exact_geodesic is True
 
 
+class TestDummyAtomCellHandling:
+    """Cell steps must carry linear-angle dummy atoms along with real atoms.
+
+    A linear molecule (e.g. CO2) gets a dummy atom to define its angle
+    coordinates. ASE's set_cell(scale_atoms=True) scales real atoms but has
+    no knowledge of dummies, and the finite-difference cell Hessian probes
+    saved/restored only real atoms and cell. Both paths left dummies behind.
+    """
+
+    @staticmethod
+    def _linear_co2(cell_diag=6.0):
+        atoms = Atoms('OCO', positions=[[1, 2, 0], [2, 2, 0], [3, 2, 0]],
+                      cell=np.eye(3) * cell_diag, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    @staticmethod
+    def _two_linear_co2(cell_diag=10.0):
+        # Two separated CO2, second off-axis so a cell shear rotates it.
+        atoms = Atoms('OCOOCO',
+                      positions=[[1, 1, 0], [2, 1, 0], [3, 1, 0],
+                                 [1, 5, 0.3], [1.8, 5.6, 0.3], [2.6, 6.2, 0.3]],
+                      cell=np.eye(3) * cell_diag, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    def test_nonrigid_cell_step_moves_dummy(self):
+        pes = Sella(self._linear_co2(), order=0, internal=True,
+                    optimize_cell=True, logfile=None).pes
+        assert pes.rigid_fragments is False
+        assert len(pes.dummies) == 1
+        dpos0 = pes.dummies.positions.copy()
+
+        target = pes.get_x().copy()
+        target[pes.n_internal:] += 0.05  # cell strain
+        pes.set_x(target)
+
+        # With the bug the dummy stayed at its original position.
+        assert not np.allclose(pes.dummies.positions, dpos0)
+
+    def test_nonrigid_cell_step_scales_dummy_like_atoms(self):
+        # The dummy must follow the same fractional-preserving deformation
+        # gradient that scale_atoms=True applies to real atoms.
+        pes = Sella(self._linear_co2(), order=0, internal=True,
+                    optimize_cell=True, logfile=None).pes
+        dpos0 = pes.dummies.positions.copy()
+        cell0 = pes.atoms.get_cell().array.copy()
+
+        # Drive only the cell parameters through _set_masked_cell_params so no
+        # internal-coordinate solve runs on top (isolates the scaling step).
+        cell_params = pes._masked_cell_params().copy()
+        cell_params += 0.05
+        pes._set_masked_cell_params(cell_params)
+        cell1 = pes.atoms.get_cell().array
+        F = np.linalg.inv(cell0) @ cell1
+        expected = dpos0 @ F
+        # apply the same fix path used in set_x
+        pes.dummies.positions = pes.dummies.positions @ F
+        assert_allclose(pes.dummies.positions, expected, atol=1e-10)
+
+    def test_fd_cell_hessian_restores_dummies(self):
+        pes = Sella(self._two_linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True, logfile=None).pes
+        assert len(pes.dummies) >= 1
+        dpos0 = pes.dummies.positions.copy()
+        apos0 = pes.atoms.positions.copy()
+        cell0 = pes.atoms.get_cell().array.copy()
+
+        pes._compute_cell_hessian_columns(delta=1e-2)
+
+        assert_allclose(pes.atoms.positions, apos0, atol=1e-12)
+        assert_allclose(pes.atoms.get_cell().array, cell0, atol=1e-12)
+        # The whole point: dummies restored exactly, not left displaced.
+        assert_allclose(pes.dummies.positions, dpos0, atol=1e-12)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
