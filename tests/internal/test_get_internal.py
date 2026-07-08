@@ -415,3 +415,68 @@ class TestDisplacementEquality:
         d0 = Displacement(np.array([0, 1]), np.zeros((2, 3)), np.eye(6))
         d1 = Displacement(np.array([0, 1]), np.zeros((2, 3)), np.eye(6))
         assert d0 == d1
+
+    def test_displacement_distinct_W(self):
+        # W changes the coordinate value, so it must factor into equality.
+        idx, rp = np.array([0, 1]), np.zeros((2, 3))
+        d0 = Displacement(idx, rp, np.eye(6))
+        d1 = Displacement(idx, rp, 2 * np.eye(6))
+        assert d0 != d1
+
+    def test_displacement_distinct_refpos(self):
+        idx = np.array([0, 1])
+        d0 = Displacement(idx, np.zeros((2, 3)), np.eye(6))
+        d1 = Displacement(idx, np.ones((2, 3)), np.eye(6))
+        assert d0 != d1
+
+
+class TestReversedAddDedup:
+    """add_* must reject a reversed duplicate of an existing coordinate.
+
+    Internal.__eq__ treats reversed coordinates as equal, but _add_internal
+    keyed _internals_set on the raw (orientation-sensitive) indices, so
+    add_bond((1,0)) after add_bond((0,1)) slipped through as a second bond.
+    The dedup key is now canonical across orientation.
+    """
+
+    def test_reversed_bond_rejected(self):
+        atoms = Atoms('H2', positions=[[0, 0, 0], [1, 0, 0]])
+        ic = Internals(atoms)
+        ic.add_bond((0, 1))
+        with pytest.raises(Exception):
+            ic.add_bond((1, 0))
+        assert len(ic.internals['bonds']) == 1
+
+    def test_reversed_angle_rejected(self):
+        atoms = Atoms('H3', positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+        ic = Internals(atoms)
+        ic.add_angle((0, 1, 2))
+        with pytest.raises(Exception):
+            ic.add_angle((2, 1, 0))
+        assert len(ic.internals['angles']) == 1
+
+    def test_reversed_dihedral_rejected(self):
+        atoms = Atoms('H4',
+                      positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]])
+        ic = Internals(atoms)
+        ic.add_dihedral((0, 1, 2, 3))
+        with pytest.raises(Exception):
+            ic.add_dihedral((3, 2, 1, 0))
+        assert len(ic.internals['dihedrals']) == 1
+
+    def test_distinct_bond_still_allowed(self):
+        # The canonical key must not over-merge genuinely different bonds.
+        atoms = Atoms('H3', positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+        ic = Internals(atoms)
+        ic.add_bond((0, 1))
+        ic.add_bond((1, 2))
+        assert len(ic.internals['bonds']) == 2
+
+    def test_reversed_forbid_purges_dedup_key(self):
+        # forbid via reversed order must clear the canonical key so the
+        # coordinate can be re-added later without a stale-dedup false hit.
+        atoms = Atoms('H2', positions=[[0, 0, 0], [1, 0, 0]])
+        ic = Internals(atoms)
+        ic.add_bond((0, 1))
+        ic.forbid_bond((1, 0))
+        assert ic._internals_set['bonds'] == set()
