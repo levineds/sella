@@ -375,6 +375,11 @@ class PES:
         cell = self.atoms.cell
         if cell is not None and cell.any():
             h += cell.array.tobytes()
+        # Inequality toggles (disable_satisfied_inequalities / validate_
+        # inequalities) flip the constraint active mask without moving atoms,
+        # which changes drdx / residual and thus the constraint basis. Fold the
+        # mask into the hash so geometry-keyed caches invalidate on a toggle.
+        h += np.asarray(self.cons._active_mask, dtype=bool).tobytes()
         return h
 
     def save(self):
@@ -1747,7 +1752,14 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         self.n_internal = self.dim
 
         if self._rigid_fragments_request is None:
-            self.rigid_fragments = bool(self.int.internals.get('translations', []))
+            # Only genuine fragments (from find_all_bonds with
+            # allow_fragments=True) set fragment_atom_groups. Constraint-derived
+            # translations (e.g. FixAtoms/FixCartesian copied into internals)
+            # also produce Translation coordinates, but those are not rigid
+            # fragments and must not trigger the rigid-fragment cell path.
+            self.rigid_fragments = bool(
+                getattr(self.int, 'fragment_atom_groups', None)
+            )
         else:
             self.rigid_fragments = self._rigid_fragments_request
 

@@ -135,3 +135,84 @@ def test_range_space_projector_periodic_rank_deficient():
     Q, _ = np.linalg.qr(B, mode='reduced')
     P_old = Q @ Q.T
     assert np.linalg.norm(P_old - P_true) > 1e-3
+
+
+def test_fixatoms_does_not_enable_rigid_fragments():
+    """A FixAtoms constraint must not trigger rigid-fragment cell mode.
+
+    FixAtoms becomes Translation coordinates, but those are constraints, not
+    rigid fragments. rigid_fragments auto-detection must key on genuine
+    fragment_atom_groups (set only by find_all_bonds with allow_fragments),
+    not on the mere presence of any translation coordinate.
+    """
+    from ase import Atoms
+    from ase.constraints import FixAtoms
+    from ase.calculators.lj import LennardJones
+    from sella import Sella
+
+    atoms = Atoms('H2O', positions=[[0, 0, 0], [0.96, 0, 0], [0, 0.96, 0]],
+                  cell=np.eye(3) * 8.0, pbc=True)
+    atoms.calc = LennardJones()
+    atoms.set_constraint(FixAtoms(indices=[0]))
+    pes = Sella(atoms, order=0, internal=True, optimize_cell=True).pes
+    assert pes.rigid_fragments is False
+
+
+def test_genuine_fragments_enable_rigid_fragments():
+    from ase import Atoms
+    from ase.calculators.lj import LennardJones
+    from sella import Sella
+
+    atoms = Atoms('OH2OH2',
+                  positions=[[0, 0, 0], [0.96, 0, 0], [0, 0.96, 0],
+                             [6, 0, 0], [6.96, 0, 0], [6, 0.96, 0]],
+                  cell=np.eye(3) * 12.0, pbc=True)
+    atoms.calc = LennardJones()
+    pes = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                allow_fragments=True).pes
+    assert pes.rigid_fragments is True
+
+
+def test_copy_preserves_fragment_atom_groups():
+    from ase import Atoms
+    atoms = Atoms('OH2OH2',
+                  positions=[[0, 0, 0], [0.96, 0, 0], [0, 0.96, 0],
+                             [6, 0, 0], [6.96, 0, 0], [6, 0.96, 0]],
+                  cell=np.eye(3) * 12.0, pbc=True)
+    ic = Internals(atoms, allow_fragments=True)
+    ic.find_all_bonds()
+    cp = ic.copy()
+    assert cp.fragment_atom_groups is not None
+    assert len(cp.fragment_atom_groups) == len(ic.fragment_atom_groups)
+
+
+def test_inequality_toggle_invalidates_basis_cache():
+    """Disabling a satisfied inequality must refresh the cached basis.
+
+    _calc_basis / QR / Binv are cached by _state_hash, which keyed on geometry
+    only. disable_satisfied_inequalities flips the constraint active mask
+    without moving atoms, so drdx shrinks but Ucons stayed stale until the
+    geometry changed. The mask is now folded into _state_hash.
+    """
+    from ase import Atoms
+    from ase.calculators.lj import LennardJones
+    from sella import Sella
+    from sella.internal import Constraints
+
+    atoms = Atoms('H3', positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+    atoms.calc = LennardJones()
+    cons = Constraints(atoms)
+    # bond(0,1) currently 1.0, constrained < 2.0 -> satisfied inequality.
+    cons.fix_bond((0, 1), target=2.0, comparator='lt')
+    pes = Sella(atoms, order=0, constraints=cons, internal=False).pes
+
+    ncols_before = pes.get_Ucons().shape[1]
+    nrows_before = pes.get_drdx().shape[0]
+
+    cons.disable_satisfied_inequalities()
+    nrows_after = pes.get_drdx().shape[0]
+    ncols_after = pes.get_Ucons().shape[1]
+
+    # One inequality row dropped; the cached constraint basis must follow.
+    assert nrows_after == nrows_before - 1
+    assert ncols_after == ncols_before - 1

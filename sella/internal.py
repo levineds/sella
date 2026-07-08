@@ -3027,13 +3027,27 @@ class Constraints(BaseInternals):
                     pass
             return
         elif isinstance(ase_cons, FixCartesian):
-            for dim, relaxed in enumerate(ase_cons.mask):
-                if relaxed:
-                    continue
-                try:
-                    self.fix_translation(ase_cons.a, dim=dim)
-                except DuplicateConstraintError:
-                    pass
+            # ASE's FixCartesian API changed around 3.23: older versions store
+            # a scalar atom in .a and invert the mask at construction (stored
+            # mask True = *free*); newer versions (IndexedConstraint) store an
+            # array in .index with a non-inverted mask (stored mask True =
+            # *fixed*). The user-facing convention -- mask True means fixed --
+            # is the same in both, so normalize to (indices, fixed-mask) here.
+            raw_mask = np.asarray(ase_cons.mask, dtype=bool)
+            if hasattr(ase_cons, 'index'):
+                indices = np.atleast_1d(ase_cons.index)
+                fixed_mask = raw_mask
+            else:
+                indices = np.atleast_1d(ase_cons.a)
+                fixed_mask = ~raw_mask
+            for atom in indices:
+                for dim, fixed in enumerate(fixed_mask):
+                    if not fixed:
+                        continue
+                    try:
+                        self.fix_translation(int(atom), dim=dim)
+                    except DuplicateConstraintError:
+                        pass
         elif isinstance(ase_cons, FixInternals):
             for ase_cons_list, adder in zip(
                 (ase_cons.bonds, ase_cons.angles, ase_cons.dihedrals),
@@ -3115,6 +3129,10 @@ class Internals(BaseInternals):
             new._internals_set[name] = self._internals_set[name].copy()
             new.forbidden[name] = self.forbidden[name].copy()
             new._active[name] = self._active[name].copy()
+        if self.fragment_atom_groups is not None:
+            new.fragment_atom_groups = [
+                g.copy() for g in self.fragment_atom_groups
+            ]
         return new
 
     def add_rotation(
