@@ -572,3 +572,50 @@ class TestFindAllBondsIdempotent:
         ic.find_all_dihedrals()
         # Default auto_find_internals=True re-runs find_all_bonds on the copy.
         InternalPES(atoms, ic)
+
+
+class TestFixCartesian:
+    """merge_ase_constraint must read ASE FixCartesian correctly.
+
+    ASE's FixCartesian.mask is True where the coordinate is *fixed*, and the
+    constrained atoms are in .index (an array), not .a. The old code inverted
+    the mask (skipping fixed dims) and referenced a nonexistent .a attribute,
+    so a partial mask raised AttributeError and a full mask added nothing.
+    """
+
+    def test_partial_mask(self):
+        from ase.constraints import FixCartesian
+        atoms = Atoms('H3', positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+        cons = Constraints(atoms)
+        cons.merge_ase_constraint(FixCartesian([0], mask=(True, False, False)))
+        trans = cons.internals['translations']
+        assert len(trans) == 1
+        assert list(trans[0].indices) == [0]
+        assert trans[0].kwargs['dim'] == 0
+
+    def test_full_mask_multiple_atoms(self):
+        from ase.constraints import FixCartesian
+        atoms = Atoms('H3', positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+        cons = Constraints(atoms)
+        cons.merge_ase_constraint(
+            FixCartesian([0, 2], mask=(True, True, True))
+        )
+        # Each atom fixed independently in all 3 dims -> 6 translations.
+        assert len(cons.internals['translations']) == 6
+
+    def test_all_relaxed_mask_adds_nothing(self):
+        from ase.constraints import FixCartesian
+        atoms = Atoms('H2', positions=[[0, 0, 0], [1, 0, 0]])
+        cons = Constraints(atoms)
+        cons.merge_ase_constraint(FixCartesian([0], mask=(False, False, False)))
+        assert len(cons.internals['translations']) == 0
+
+    def test_fixatoms_via_atoms_constraint(self):
+        # FixAtoms fixes all 3 cartesian dims of each listed atom.
+        from ase.constraints import FixCartesian
+        atoms = Atoms('H2', positions=[[0, 0, 0], [1, 0, 0]])
+        cons = Constraints(atoms)
+        cons.merge_ase_constraint(FixCartesian([1], mask=(True, True, True)))
+        assert len(cons.internals['translations']) == 3
+        assert all(list(t.indices) == [1]
+                   for t in cons.internals['translations'])

@@ -3027,13 +3027,16 @@ class Constraints(BaseInternals):
                     pass
             return
         elif isinstance(ase_cons, FixCartesian):
-            for dim, relaxed in enumerate(ase_cons.mask):
-                if relaxed:
-                    continue
-                try:
-                    self.fix_translation(ase_cons.a, dim=dim)
-                except DuplicateConstraintError:
-                    pass
+            # ASE's FixCartesian.mask is True where the coordinate is *fixed*,
+            # and .index lists the constrained atoms (each fixed independently).
+            for atom in np.atleast_1d(ase_cons.index):
+                for dim, fixed in enumerate(ase_cons.mask):
+                    if not fixed:
+                        continue
+                    try:
+                        self.fix_translation(int(atom), dim=dim)
+                    except DuplicateConstraintError:
+                        pass
         elif isinstance(ase_cons, FixInternals):
             for ase_cons_list, adder in zip(
                 (ase_cons.bonds, ase_cons.angles, ase_cons.dihedrals),
@@ -3115,6 +3118,10 @@ class Internals(BaseInternals):
             new._internals_set[name] = self._internals_set[name].copy()
             new.forbidden[name] = self.forbidden[name].copy()
             new._active[name] = self._active[name].copy()
+        if self.fragment_atom_groups is not None:
+            new.fragment_atom_groups = [
+                g.copy() for g in self.fragment_atom_groups
+            ]
         return new
 
     def add_rotation(
