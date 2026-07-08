@@ -3027,10 +3027,21 @@ class Constraints(BaseInternals):
                     pass
             return
         elif isinstance(ase_cons, FixCartesian):
-            # ASE's FixCartesian.mask is True where the coordinate is *fixed*,
-            # and .index lists the constrained atoms (each fixed independently).
-            for atom in np.atleast_1d(ase_cons.index):
-                for dim, fixed in enumerate(ase_cons.mask):
+            # ASE's FixCartesian API changed around 3.23: older versions store
+            # a scalar atom in .a and invert the mask at construction (stored
+            # mask True = *free*); newer versions (IndexedConstraint) store an
+            # array in .index with a non-inverted mask (stored mask True =
+            # *fixed*). The user-facing convention -- mask True means fixed --
+            # is the same in both, so normalize to (indices, fixed-mask) here.
+            raw_mask = np.asarray(ase_cons.mask, dtype=bool)
+            if hasattr(ase_cons, 'index'):
+                indices = np.atleast_1d(ase_cons.index)
+                fixed_mask = raw_mask
+            else:
+                indices = np.atleast_1d(ase_cons.a)
+                fixed_mask = ~raw_mask
+            for atom in indices:
+                for dim, fixed in enumerate(fixed_mask):
                     if not fixed:
                         continue
                     try:

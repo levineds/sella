@@ -575,13 +575,25 @@ class TestFindAllBondsIdempotent:
 
 
 class TestFixCartesian:
-    """merge_ase_constraint must read ASE FixCartesian correctly.
+    """merge_ase_constraint must read ASE FixCartesian across API versions.
 
-    ASE's FixCartesian.mask is True where the coordinate is *fixed*, and the
-    constrained atoms are in .index (an array), not .a. The old code inverted
-    the mask (skipping fixed dims) and referenced a nonexistent .a attribute,
-    so a partial mask raised AttributeError and a full mask added nothing.
+    ASE changed FixCartesian around 3.23. Newer versions store constrained
+    atoms in .index (an array) with a non-inverted mask (True = fixed); older
+    versions (<=3.22) stored a scalar in .a and inverted the mask at
+    construction (stored True = free). The user-facing convention -- mask True
+    means fixed -- is identical, so both must normalize to the same result.
+    The pre-fix code assumed the old .a/inverted-mask shape but then ran on
+    new ASE, so a partial mask raised AttributeError and a full mask added
+    nothing.
     """
+
+    @staticmethod
+    def _as_old_api(fc, a, user_mask):
+        """Rewrite a real FixCartesian to the pre-3.23 attribute shape."""
+        del fc.index                       # drop new-API array attr
+        fc.a = a                           # scalar atom index
+        fc.mask = ~np.asarray(user_mask, bool)  # stored True = free
+        return fc
 
     def test_partial_mask(self):
         from ase.constraints import FixCartesian
@@ -619,3 +631,48 @@ class TestFixCartesian:
         assert len(cons.internals['translations']) == 3
         assert all(list(t.indices) == [1]
                    for t in cons.internals['translations'])
+
+    def test_old_api_partial_mask(self):
+        # Simulate ASE <=3.22: scalar .a, no .index, inverted stored mask.
+        from ase.constraints import FixCartesian
+        atoms = Atoms('H3', positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+        old = self._as_old_api(FixCartesian([1], mask=(True, False, False)),
+                               1, (True, False, False))
+        assert not hasattr(old, 'index')
+        cons = Constraints(atoms)
+        cons.merge_ase_constraint(old)
+        trans = cons.internals['translations']
+        assert len(trans) == 1
+        assert list(trans[0].indices) == [1]
+        assert trans[0].kwargs['dim'] == 0
+
+    def test_old_api_full_mask(self):
+        from ase.constraints import FixCartesian
+        atoms = Atoms('H3', positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+        old = self._as_old_api(FixCartesian([2], mask=(True, True, True)),
+                               2, (True, True, True))
+        cons = Constraints(atoms)
+        cons.merge_ase_constraint(old)
+        assert len(cons.internals['translations']) == 3
+
+    def test_old_api_all_relaxed(self):
+        from ase.constraints import FixCartesian
+        atoms = Atoms('H2', positions=[[0, 0, 0], [1, 0, 0]])
+        old = self._as_old_api(FixCartesian([0], mask=(False, False, False)),
+                               0, (False, False, False))
+        cons = Constraints(atoms)
+        cons.merge_ase_constraint(old)
+        assert len(cons.internals['translations']) == 0
+
+
+class TestFixInternalsMerge:
+    """merge_ase_constraint(FixInternals) parses the ASE data format."""
+
+    def test_fixinternals_bond(self):
+        from ase.constraints import FixInternals
+        atoms = Atoms('H4',
+                      positions=[[0, 0, 0], [1, 0, 0], [1, 1, 0], [2, 1, 0]])
+        cons = Constraints(atoms)
+        fi = FixInternals(bonds=[[1.0, [0, 1]]])
+        cons.merge_ase_constraint(fi)
+        assert len(cons.internals['bonds']) == 1
