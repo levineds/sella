@@ -4,7 +4,7 @@ import numpy as np
 from ase import Atoms
 from ase.build import molecule
 
-from sella.internal import Internals
+from sella.internal import Bond, Angle, Dihedral, Constraints, Internals
 
 
 def res(pos: np.ndarray, internal: Internals) -> np.ndarray:
@@ -289,3 +289,57 @@ class TestTRICs:
                     f"Degenerate angle {angle.indices} with identical "
                     f"ncvecs {angle.kwargs['ncvecs']}"
                 )
+
+
+class TestInternalEquality:
+    """Regression tests for Internal.__eq__.
+
+    A refactor once restructured the equality logic into
+    ``forward_indices AND reverse_indices AND (ncvecs...)``, which only ever
+    matched palindromic index sequences -- so ``Bond((0,1)) == Bond((0,1))``
+    returned False. That leaked into constraint dedup (duplicate constraints
+    instead of replaced targets) and degenerate constructed coordinates.
+    """
+
+    def test_identity_equality(self):
+        assert Bond((0, 1)) == Bond((0, 1))
+        assert Angle((0, 1, 2)) == Angle((0, 1, 2))
+        assert Dihedral((0, 1, 2, 3)) == Dihedral((0, 1, 2, 3))
+
+    def test_reversed_equality(self):
+        # Internals are direction-agnostic: a coordinate equals its reverse.
+        assert Bond((0, 1)) == Bond((1, 0))
+        assert Angle((0, 1, 2)) == Angle((2, 1, 0))
+        assert Dihedral((0, 1, 2, 3)) == Dihedral((3, 2, 1, 0))
+
+    def test_distinct_coordinates_not_equal(self):
+        assert Bond((0, 1)) != Bond((0, 2))
+        assert Angle((0, 1, 2)) != Angle((0, 2, 1))
+        assert Bond((0, 1)) != Angle((0, 1, 2))
+
+    def test_ncvecs_distinguish_periodic_images(self):
+        # Same atom pair through different periodic images must not compare
+        # equal, or __eq__ would over-merge distinct periodic coordinates.
+        b0 = Bond((0, 1), ncvecs=[[0, 0, 0]])
+        b1 = Bond((0, 1), ncvecs=[[1, 0, 0]])
+        assert b0 != b1
+        # Reversing an image bond negates its ncvecs, so the reverse is equal.
+        assert b1 == b1.reverse()
+
+    def test_fix_bond_replaces_target(self):
+        # Constraint dedup relies on __eq__: refixing the same bond must
+        # replace the target, not append a second constraint.
+        atoms = Atoms('H3', positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+        cons = Constraints(atoms)
+        cons.fix_bond((0, 1), target=1.0)
+        cons.fix_bond((0, 1), target=2.0)
+        assert len(cons.internals['bonds']) == 1
+        assert cons._targets['bonds'] == [2.0]
+
+    def test_fix_bond_replaces_target_reversed(self):
+        # Refixing via the reversed index order must also dedup.
+        atoms = Atoms('H3', positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+        cons = Constraints(atoms)
+        cons.fix_bond((0, 1), target=1.0)
+        cons.fix_bond((1, 0), target=2.0)
+        assert len(cons.internals['bonds']) == 1
