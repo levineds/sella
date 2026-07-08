@@ -1219,6 +1219,8 @@ class BaseInternals:
         self.atoms = atoms
 
         self._lastpos = None
+        self._lastcell = None
+        self._lastactive = None
         self._cache = dict()
 
         if dummies is None:
@@ -1362,12 +1364,29 @@ class BaseInternals:
             current_pos = self.atoms.positions
         else:
             current_pos = np.vstack([self.atoms.positions, self.dummies.positions])
+        current_cell = self.atoms.cell.array
+        # Cached calc()/jacobian()/cell_jacobian()/hessian() outputs depend on
+        # the cell (bonds/angles/dihedrals fold in ncvecs @ cell), so a cell
+        # change with fixed positions must invalidate them too.
+        cell_changed = (
+            self._lastcell is None
+            or np.any(current_cell != self._lastcell)
+        )
+        # jacobian_B and hessian_result are cached *after* active-mask
+        # filtering, so toggling an inequality constraint (which flips
+        # self._active) must invalidate them as well.
+        current_active = tuple(self._active_mask)
+        active_changed = current_active != self._lastactive
         if (
             self._lastpos is None
             or np.any(current_pos != self._lastpos)
+            or cell_changed
+            or active_changed
         ):
             self._cache = dict()
             self._lastpos = current_pos.copy()
+            self._lastcell = current_cell.copy()
+            self._lastactive = current_active
         # Park the freshly-merged positions in the cache so the next
         # all_positions access doesn't redo the vstack.
         if self.ndummies > 0:
