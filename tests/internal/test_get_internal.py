@@ -480,3 +480,95 @@ class TestReversedAddDedup:
         ic.add_bond((0, 1))
         ic.forbid_bond((1, 0))
         assert ic._internals_set['bonds'] == set()
+
+
+class TestStructuralCacheInvalidation:
+    """Topology changes must invalidate the vectorized caches.
+
+    add_*/forbid_* mutate the coordinate lists, but the batched arrays and
+    tvecs cache were reused, so calc() returned a stale-length vector and
+    jacobian() crashed on the size mismatch. _invalidate_structure() now
+    clears them (plus the position-keyed _cache, which a topology change can
+    otherwise leave untouched when the active mask/positions are unchanged).
+    """
+
+    def test_add_bond_after_calc(self):
+        atoms = Atoms('H3', positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+        ic = Internals(atoms)
+        ic.add_bond((0, 1))
+        assert ic.calc().shape == (1,)
+        ic.add_bond((1, 2))
+        assert ic.nint == 2
+        assert ic.calc().shape == (2,)
+        # jacobian must not crash on a stale batched-array size mismatch.
+        assert ic.jacobian().shape[0] == 2
+
+    def test_forbid_then_add_refreshes_cache(self):
+        # forbid+add can leave the active mask and positions unchanged, so
+        # only _invalidate_structure (not _cache_check) refreshes the values.
+        atoms = Atoms('H4',
+                      positions=[[0, 0, 0], [1, 0, 0], [2, 0, 0], [4, 0, 0]])
+        ic = Internals(atoms)
+        ic.add_bond((0, 1))
+        assert np.allclose(ic.calc(), [1.0])
+        ic.forbid_bond((0, 1))
+        ic.add_bond((2, 3))
+        # bond (2,3) has length 2.0; a stale cache would still report 1.0.
+        assert np.allclose(ic.calc(), [2.0])
+
+    def test_add_periodic_image_bond_refreshes_tvecs(self):
+        # A new periodic-image bond must not evaluate with stale (zero) tvecs.
+        atoms = Atoms('H2', positions=[[0, 0, 0], [0.5, 0, 0]],
+                      cell=np.eye(3) * 3.0, pbc=True)
+        ic = Internals(atoms)
+        ic.add_bond((0, 1), ncvecs=[[0, 0, 0]])
+        assert np.allclose(ic.calc(), [0.5])
+        ic.add_bond((0, 1), ncvecs=[[1, 0, 0]])
+        # image bond length = |0.5 + 3.0| = 3.5; stale tvecs would give 0.5.
+        vals = ic.calc()
+        assert vals.shape == (2,)
+        assert np.allclose(sorted(vals), [0.5, 3.5])
+        assert ic.jacobian().shape[0] == 2
+
+
+class TestFindAllBondsIdempotent:
+    """find_all_bonds() must be idempotent with allow_fragments=True.
+
+    Fragment translations/rotations were added unguarded, so a second
+    find_all_bonds() (or passing a pre-populated fragment Internals into
+    InternalPES with auto_find_internals=True) raised DuplicateInternalError.
+    """
+
+    def _two_waters(self):
+        return Atoms(
+            symbols=['O', 'H', 'H', 'O', 'H', 'H'],
+            positions=[
+                [0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [0.0, 0.96, 0.0],
+                [10.0, 0.0, 0.0], [10.96, 0.0, 0.0], [10.0, 0.96, 0.0],
+            ],
+        )
+
+    def test_repeated_find_all_bonds(self):
+        ic = Internals(self._two_waters(), allow_fragments=True)
+        ic.find_all_bonds()
+        ic.find_all_angles()
+        ic.find_all_dihedrals()
+        counts1 = {k: len(v) for k, v in ic.internals.items()}
+        # Second pass must not raise and must not duplicate coordinates.
+        ic.find_all_bonds()
+        ic.find_all_angles()
+        ic.find_all_dihedrals()
+        counts2 = {k: len(v) for k, v in ic.internals.items()}
+        assert counts1 == counts2
+
+    def test_internalpes_accepts_prepopulated_fragments(self):
+        from ase.calculators.lj import LennardJones
+        from sella.peswrapper import InternalPES
+        atoms = self._two_waters()
+        atoms.calc = LennardJones()
+        ic = Internals(atoms, allow_fragments=True)
+        ic.find_all_bonds()
+        ic.find_all_angles()
+        ic.find_all_dihedrals()
+        # Default auto_find_internals=True re-runs find_all_bonds on the copy.
+        InternalPES(atoms, ic)

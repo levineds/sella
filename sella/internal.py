@@ -1619,9 +1619,29 @@ class BaseInternals:
         self._tvecs_cache = {'cell_hash': cell_hash, 'tvecs': tvecs}
         return tvecs
 
+    def _invalidate_structure(self) -> None:
+        """Invalidate all caches that depend on the set of internals.
+
+        Call from every path that adds/removes a coordinate, dummy atom, or
+        ncvec. Unlike ``_cache_check`` (which keys on positions/cell/active
+        mask), a topology change can leave those keys unchanged -- e.g.
+        forbidding one bond and adding another keeps the active mask and
+        positions identical -- so the position-keyed ``_cache`` must be
+        cleared explicitly alongside the batched arrays and tvecs.
+        """
+        self._batched_arrays_valid = False
+        self._tvecs_cache = None
+        self._hessian_skeleton = None
+        self._hvp_buf = None
+        self._cache = dict()
+        # Force _cache_check to treat the next evaluation as fresh.
+        self._lastpos = None
+        self._lastcell = None
+        self._lastactive = None
+
     def _invalidate_batched_arrays(self) -> None:
         """Invalidate batched arrays (call when internals change)."""
-        self._batched_arrays_valid = False
+        self._invalidate_structure()
 
     def _compute_batched_values(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
         """Compute all internal coordinate values using vectorized operations.
@@ -2854,6 +2874,7 @@ class Constraints(BaseInternals):
             self._targets['rotations'].append(0.)
             self._active['rotations'].append(True)
             self._kind['rotations'].append('eq')
+            self._invalidate_structure()
         else:
             raise DuplicateConstraintError(
                 "This rotation has already been constrained!"
@@ -2895,6 +2916,7 @@ class Constraints(BaseInternals):
             self._targets['translations'].append(target)
             self._active['translations'].append(True)
             self._kind['translations'].append('eq')
+            self._invalidate_structure()
         else:
             if replace_ok:
                 self._targets['translations'][idx] = target
@@ -2937,6 +2959,7 @@ class Constraints(BaseInternals):
             self._targets[name].append(target)
             self._active[name].append(True)
             self._kind[name].append(comparator)
+            self._invalidate_structure()
         else:
             if replace_ok:
                 self._targets[name][idx] = target
@@ -2969,6 +2992,7 @@ class Constraints(BaseInternals):
             self._targets['other'].append(target)
             self._active['other'].append(True)
             self._kind['other'].append(comparator)
+            self._invalidate_structure()
         else:
             if replace_ok:
                 self._targets['other'][idx] = target
@@ -3124,6 +3148,7 @@ class Internals(BaseInternals):
             raise DuplicateInternalError
         self.internals['rotations'].append(new)
         self._active['rotations'].append(True)
+        self._invalidate_structure()
 
     def add_translation(
         self,
@@ -3153,6 +3178,28 @@ class Internals(BaseInternals):
             raise DuplicateInternalError
         self.internals['translations'].append(new)
         self._active['translations'].append(True)
+        self._invalidate_structure()
+
+    def _add_fragment_coords(
+        self, group, with_rotation: bool = True
+    ) -> None:
+        """Add fragment translation (and optionally rotation) coordinates.
+
+        Idempotent: ``find_all_bonds()`` may run more than once on the same
+        Internals (e.g. a pre-populated fragment Internals passed to
+        InternalPES with auto_find_internals=True), so silently skip fragment
+        TRICs that already exist instead of raising DuplicateInternalError --
+        mirroring the duplicate handling on fragment-welding bonds.
+        """
+        try:
+            self.add_translation(group)
+        except DuplicateInternalError:
+            pass
+        if with_rotation and len(group) >= 2:
+            try:
+                self.add_rotation(group)
+            except DuplicateInternalError:
+                pass
 
     @staticmethod
     def _internal_key(coord: 'Internal') -> tuple:
@@ -3195,6 +3242,7 @@ class Internals(BaseInternals):
         self.internals[name].append(new)
         self._internals_set[name].add(key)
         self._active[name].append(True)
+        self._invalidate_structure()
 
     add_bond = partialmethod(_add_internal, Bond, 'bonds')
     add_angle = partialmethod(_add_internal, Angle, 'angles')
@@ -3209,6 +3257,7 @@ class Internals(BaseInternals):
         except ValueError:
             self.internals['other'].append(coord)
             self._active['other'].append(True)
+            self._invalidate_structure()
         else:
             raise DuplicateInternalError()
 
@@ -3240,6 +3289,7 @@ class Internals(BaseInternals):
         else:
             self.internals['translations'].pop(idx)
             self._active['translations'].pop(idx)
+            self._invalidate_structure()
         if new not in self.forbidden['translations']:
             self.forbidden['translations'].append(new)
 
@@ -3269,6 +3319,7 @@ class Internals(BaseInternals):
             removed = self.internals[name].pop(idx)
             self._active[name].pop(idx)
             self._internals_set[name].discard(self._internal_key(removed))
+            self._invalidate_structure()
         if new not in self.forbidden[name]:
             self.forbidden[name].append(new)
 
@@ -3644,7 +3695,7 @@ class Internals(BaseInternals):
             for i, label in enumerate(labels):
                 if label == -1:
                     # A lone atom not bonded to anything else
-                    self.add_translation(i)
+                    self._add_fragment_coords([i], with_rotation=False)
                 else:
                     groups[label].append(i)
             cumshifts = {}
@@ -3654,9 +3705,7 @@ class Internals(BaseInternals):
                     continue
                 self._wrap_fragment_positions(group, cumshifts)
                 self.fragment_atom_groups.append(np.array(group, dtype=np.int32))
-                self.add_translation(group)
-                if len(group) >= 2:
-                    self.add_rotation(group)
+                self._add_fragment_coords(group)
         elif (self.allow_fragments and nlabels == 1
               and np.any(self.atoms.pbc)
               and len(self.internals['bonds']) > 0):
@@ -3664,9 +3713,7 @@ class Internals(BaseInternals):
             cumshifts = {}
             self._wrap_fragment_positions(group, cumshifts)
             self.fragment_atom_groups = [np.array(group, dtype=np.int32)]
-            self.add_translation(group)
-            if len(group) >= 2:
-                self.add_rotation(group)
+            self._add_fragment_coords(group)
         else:
             cumshifts = {}
 
@@ -3746,8 +3793,7 @@ class Internals(BaseInternals):
                         # Add the dummy atom
                         dpos += self.atoms.positions[j]
                         self.dummies += Atom('X', dpos)
-                        self._batched_arrays_valid = False
-                        self._cache.pop('all_positions', None)
+                        self._invalidate_structure()
                     # Create and fix dummy bond
                     dbond = Bond((j, self.dinds[j]))
                     self.cons.fix_bond(dbond, replace_ok=False)
