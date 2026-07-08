@@ -1105,7 +1105,11 @@ class Displacement(Coordinate):
             return NotImplemented
         if not Coordinate.__eq__(self, other):
             return False
-        return np.allclose(self.kwargs['refpos'], other.kwargs['refpos'])
+        return (
+            np.allclose(self.kwargs['refpos'], other.kwargs['refpos'])
+            and np.array_equal(self.kwargs['W'].shape, other.kwargs['W'].shape)
+            and np.allclose(self.kwargs['W'], other.kwargs['W'])
+        )
 
     _eval0 = staticmethod(jit(_displacement))
     _eval1 = staticmethod(jit(_gradient(_displacement)))
@@ -3150,6 +3154,20 @@ class Internals(BaseInternals):
         self.internals['translations'].append(new)
         self._active['translations'].append(True)
 
+    @staticmethod
+    def _internal_key(coord: 'Internal') -> tuple:
+        """Orientation-independent dedup key for an Internal coordinate.
+
+        ``Internal.__eq__`` treats a coordinate and its reverse as equal, so
+        the ``_internals_set`` key must be canonical across orientation --
+        otherwise ``add_bond((1, 0))`` slips past a prior ``add_bond((0, 1))``.
+        Take the lexicographically smaller of the forward and reversed keys.
+        """
+        def raw(c: 'Internal') -> tuple:
+            return (tuple(int(i) for i in c.indices),
+                    tuple(map(tuple, c.kwargs['ncvecs'])))
+        return min(raw(coord), raw(coord.reverse()))
+
     def _add_internal(
         self,
         kind: TypeVar('Coordinate', bound=Coordinate),
@@ -3168,7 +3186,7 @@ class Internals(BaseInternals):
         else:
             ncvecs = self._get_ncvecs(indices, ncvecs, mic)
             new = kind(indices, ncvecs=ncvecs)
-        key = (tuple(new.indices), tuple(map(tuple, new.kwargs['ncvecs'])))
+        key = self._internal_key(new)
         if (
             key in self._internals_set[name]
             or new in self.forbidden[name]
@@ -3250,9 +3268,7 @@ class Internals(BaseInternals):
         else:
             removed = self.internals[name].pop(idx)
             self._active[name].pop(idx)
-            key = (tuple(removed.indices),
-                   tuple(map(tuple, removed.kwargs['ncvecs'])))
-            self._internals_set[name].discard(key)
+            self._internals_set[name].discard(self._internal_key(removed))
         if new not in self.forbidden[name]:
             self.forbidden[name].append(new)
 
