@@ -1362,15 +1362,21 @@ class TestNiggliReduction:
         # orig_cell should be updated
         assert_allclose(pes.orig_cell, atoms.get_cell().array)
 
-    def test_niggli_triggers_on_skewed_cell_internal(self):
-        """CellInternalPES.maybe_niggli_reduce fires when angles are extreme."""
+    def test_niggli_disabled_for_internal_pes(self):
+        """CellInternalPES declines Niggli: it would corrupt internal coords.
+
+        Niggli reduction recombines lattice vectors and wraps atoms, which
+        invalidates stored ncvecs and dummy positions. CellInternalPES must
+        therefore decline it (return False) and leave the cell -- and the
+        internal coordinates -- untouched, even on a badly skewed cell.
+        """
         atoms = make_molecular_crystal()
         atoms.calc = EMT()
 
         internals = Internals(atoms, allow_fragments=True)
         pes = CellInternalPES(atoms, internals=internals, eta=1e-4)
 
-        # Shear the cell
+        # Shear the cell into a regime where Niggli would otherwise fire.
         cell = atoms.get_cell().array.copy()
         cell[1, 0] += 6.0
         atoms.set_cell(cell, scale_atoms=False)
@@ -1379,12 +1385,36 @@ class TestNiggliReduction:
         angles = atoms.get_cell().angles()
         assert min(angles) < 60.0 or max(angles) > 120.0
 
-        reduced = pes.maybe_niggli_reduce()
-        assert reduced
+        q_before = pes.int.calc().copy()
+        cell_before = atoms.get_cell().array.copy()
 
-        new_angles = atoms.get_cell().angles()
-        new_max_dev = max(abs(a - 90.0) for a in new_angles)
-        assert new_max_dev < 30.0, f"Angles after reduction: {new_angles}"
+        reduced = pes.maybe_niggli_reduce()
+        assert reduced is False, "Niggli must be declined for internal PES"
+
+        # Cell and internal coordinates must be left exactly as they were.
+        assert_allclose(atoms.get_cell().array, cell_before, atol=1e-12)
+        assert_allclose(pes.int.calc(), q_before, atol=1e-12)
+
+    def test_niggli_would_corrupt_periodic_ncvecs(self):
+        """Documents *why* Niggli is declined for internal PES.
+
+        A raw niggli_reduce on a cell recombines lattice vectors, so a stored
+        integer image offset (ncvec) points at a different physical image
+        afterward and the bond length jumps. This is the corruption the
+        CellInternalPES override avoids by declining reduction.
+        """
+        from ase.build import niggli_reduce
+        cell = np.array([[3.0, 0, 0], [2.9, 3.0, 0], [0, 0, 3.0]])
+        atoms = Atoms('H2', positions=[[0, 0, 0], [0.5, 0, 0]],
+                      cell=cell, pbc=True)
+        internals = Internals(atoms)
+        internals.add_bond((0, 1), ncvecs=[[1, 0, 0]])
+        b_before = internals.calc()[0]
+
+        niggli_reduce(atoms)
+        b_after = internals.calc()[0]
+        # The stored ncvec is now stale: the bond value silently changes.
+        assert not np.isclose(b_before, b_after, atol=1e-3)
 
     def test_niggli_does_not_trigger_on_good_cell(self):
         """No reduction when cell angles are fine."""
