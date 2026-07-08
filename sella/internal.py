@@ -1101,6 +1101,8 @@ class Displacement(Coordinate):
         self.kwargs['W'] = W.copy()
 
     def __eq__(self, other: Coordinate) -> bool:
+        if not isinstance(other, self.__class__):
+            return NotImplemented
         if not Coordinate.__eq__(self, other):
             return False
         return np.allclose(self.kwargs['refpos'], other.kwargs['refpos'])
@@ -3214,9 +3216,12 @@ class Internals(BaseInternals):
                 return
             new = Translation(index, dim)
         try:
-            self.internals['translations'].remove(new)
+            idx = self.internals['translations'].index(new)
         except ValueError:
             pass
+        else:
+            self.internals['translations'].pop(idx)
+            self._active['translations'].pop(idx)
         if new not in self.forbidden['translations']:
             self.forbidden['translations'].append(new)
 
@@ -3239,9 +3244,15 @@ class Internals(BaseInternals):
             ncvecs = self._get_ncvecs(indices, ncvecs, mic)
             new = kind(indices, ncvecs=ncvecs)
         try:
-            self.forbidden[name].remove(new)
+            idx = self.internals[name].index(new)
         except ValueError:
             pass
+        else:
+            removed = self.internals[name].pop(idx)
+            self._active[name].pop(idx)
+            key = (tuple(removed.indices),
+                   tuple(map(tuple, removed.kwargs['ncvecs'])))
+            self._internals_set[name].discard(key)
         if new not in self.forbidden[name]:
             self.forbidden[name].append(new)
 
