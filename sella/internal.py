@@ -3854,6 +3854,30 @@ class Internals(BaseInternals):
                 f'auto-detection was used.'
             )
 
+    def _rotation_fragment_is_linear(self, indices, rel_tol=1e-3):
+        """True if a fragment's atoms are (near-)collinear.
+
+        A collinear rigid fragment has only two well-defined rotational DOF;
+        rotation about the molecular axis is a null mode, so its quaternion
+        F-matrix always has a (near-)degenerate top eigenpair. That degeneracy
+        is expected and already handled continuously by ``_stabilize_quaternion``
+        (value/branch) and by the redundant-coordinate SVD (rank), so it must
+        NOT be treated as a "bad internal" -- doing so triggers a PES rebuild
+        and geodesic abort on every step, freezing the optimizer. Compact
+        fragments keep the degeneracy guard, where a small gap signals a genuine
+        orientational ambiguity. Single-atom fragments never get a rotation
+        (see ``add_rotation`` callers, ``len(group) >= 2``) so are never checked.
+        """
+        idx = np.asarray(indices, dtype=int)
+        if len(idx) < 3:
+            return True  # a 2-atom fragment is always collinear
+        dx = self.all_positions[idx]
+        dx = dx - dx.mean(0)
+        w = np.linalg.eigvalsh(dx.T @ dx)  # ascending: w[0] <= w[1] <= w[2]
+        # Collinear iff the second-largest spatial extent is negligible relative
+        # to the largest (rank-1 gyration tensor).
+        return w[2] <= 0 or w[1] <= rel_tol * w[2]
+
     def check_for_bad_internals(self) -> Optional[Dict[str, List[Coordinate]]]:
         """Check for angles near 0/pi or near-degenerate rotation F-matrices.
 
@@ -3900,6 +3924,10 @@ class Internals(BaseInternals):
                             gap = ws[-1] - ws[-2]
                             spread = ws[-1] - ws[0]
                             if spread > 0 and gap / spread < 0.02:
+                                if self._rotation_fragment_is_linear(
+                                    rotations[slot[0]].indices
+                                ):
+                                    continue  # expected axial null mode
                                 bad['angles'].append(rotations[slot[0]])
                                 break
             else:
@@ -3920,6 +3948,8 @@ class Internals(BaseInternals):
                     gap = ws[-1] - ws[-2]
                     spread = ws[-1] - ws[0]
                     if spread > 0 and gap / spread < 0.02:
+                        if self._rotation_fragment_is_linear(rot.indices):
+                            continue  # expected axial null mode
                         bad['angles'].append(rot)
                         break
 
