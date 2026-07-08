@@ -1517,6 +1517,68 @@ class TestExactGeodesicDefault:
         assert opt.pes.exact_geodesic is True
 
 
+class TestRigidFragmentsSurvivesRebuild:
+    """An explicit rigid_fragments must survive the bad-internals rebuild.
+
+    rigid_fragments is a pass-through PES kwarg captured in self.peskwargs.
+    The bad-internals reset path re-runs initialize_pes with an explicit
+    argument list; before the fix it omitted **self.peskwargs, so a user's
+    explicit rigid_fragments=False was dropped and CellInternalPES silently
+    re-auto-detected it as True.
+    """
+
+    def _force_bad_internals_rebuild(self, opt):
+        """Trigger the real reset path in Sella.step() once.
+
+        The reset fires when pes.int.check_for_bad_internals() is truthy in the
+        guard inside step(). Other call sites (kick, _predict_step) also invoke
+        it during a step, so force a truthy result until the PES object is
+        actually rebuilt (its identity changes), then restore real behavior.
+        This exercises the actual initialize_pes call inside step().
+        """
+        pes_before = opt.pes
+
+        def fake_check():
+            if opt.pes is pes_before:
+                return {"bonds": []}  # truthy -> triggers rebuild
+            return opt.pes.int.check_for_bad_internals()
+
+        opt.pes.int.check_for_bad_internals = fake_check
+        opt.step()
+        assert opt.pes is not pes_before, "reset path did not fire"
+
+    def test_explicit_false_survives_rebuild(self):
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    allow_fragments=True, rigid_fragments=False, logfile=None)
+        # CH4 with allow_fragments would auto-detect True, so False is a real
+        # override -- confirm it holds initially and after a rebuild.
+        assert opt.pes.rigid_fragments is False
+        self._force_bad_internals_rebuild(opt)
+        assert opt.pes.rigid_fragments is False
+
+    def test_explicit_true_survives_rebuild(self):
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    rigid_fragments=True, logfile=None)
+        assert opt.pes.rigid_fragments is True
+        self._force_bad_internals_rebuild(opt)
+        assert opt.pes.rigid_fragments is True
+
+    def test_autodetect_still_works_after_rebuild(self):
+        # No explicit override: auto-detection should apply on both builds.
+        atoms = make_molecular_crystal()
+        atoms.calc = EMT()
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    allow_fragments=True, logfile=None)
+        assert opt.peskwargs == {}
+        detected = opt.pes.rigid_fragments
+        self._force_bad_internals_rebuild(opt)
+        assert opt.pes.rigid_fragments == detected
+
+
 class TestDummyAtomCellHandling:
     """Cell steps must carry linear-angle dummy atoms along with real atoms.
 

@@ -407,6 +407,10 @@ class Sella(Optimizer):
                 scalar_pressure=scalar_pressure,
                 allow_fragments=self.allow_fragments,
                 exact_geodesic=self.exact_geodesic,
+                # Forward the original PES kwargs (e.g. an explicit
+                # rigid_fragments) so a user override is not lost on rebuild
+                # and silently replaced by auto-detection.
+                **self.peskwargs,
             )
             self.initialized = False
             self.rho = 1
