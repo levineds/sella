@@ -2229,13 +2229,16 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         ``g_proj = g_int^T @ dq_proj/du = -Rc_u^T @ y`` with
         ``(Jc @ Uc)^T y = Uc^T g_int``.
 
-        Returns a zero vector unless there are constraints and the cell moves
-        atoms affinely (non-rigid). In rigid-fragment mode a constraint inside
-        a rigid fragment is invariant under the rigid cell move, so there is no
-        projection work.
+        Returns a zero vector unless there are active constraints. In
+        rigid-fragment mode a constraint that lies entirely within one rigid
+        fragment is invariant under the rigid cell move (zero contribution),
+        but a constraint that *spans* fragments does acquire a residual under
+        cell strain -- the interfragment separation follows the full cell
+        deformation -- so it gets the same projection correction, differing
+        only in how the unprojected cell motion (``X_C``) moves the atoms.
         """
         n_cell = self.n_cell_dof
-        if n_cell == 0 or self.rigid_fragments:
+        if n_cell == 0:
             return np.zeros(n_cell)
         drdx, Ucons, _, _ = self._compute_basis_int()
         if Ucons.shape[1] == 0:
@@ -2250,22 +2253,9 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         A = drdx @ Ucons
         y, *_ = np.linalg.lstsq(A.T, Ucons.T @ g_int, rcond=_LSTSQ_RCOND)
 
-        # Residual sensitivity to the raw cell C: the unprojected cell move is
-        # fractional-preserving (scale_atoms=True), so dr/dC[a,b] = frac[:,a]
-        # scattered into cartesian component b. Rc_C = Jc_cart @ dr/dC + dRc/dC.
-        C = self.atoms.get_cell().array
-        if len(self.dummies) > 0:
-            positions = np.vstack([self.atoms.positions,
-                                   self.dummies.positions])
-        else:
-            positions = self.atoms.positions
-        ntot = positions.shape[0]
-        frac = positions @ np.linalg.inv(C)
-        X_C = np.zeros((3 * ntot, 9))
-        for i, s in enumerate(frac):
-            for a in range(3):
-                for b in range(3):
-                    X_C[3 * i + b, 3 * a + b] = s[a]
+        # Residual sensitivity to the raw cell C, via the derivative of the
+        # unprojected cell motion: Rc_C = Jc_cart @ dr/dC + dRc/dC.
+        X_C = self._unprojected_cell_motion_derivative()
         Rc_C = self.cons.jacobian() @ X_C + self.cons.cell_jacobian()
         G_C_proj = -(Rc_C.T @ y).reshape(3, 3)
 
@@ -2274,6 +2264,70 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         U = _logm_3x3(self._get_deformation_gradient())
         g_u = _expm_frechet_3x3_contracted(U, dEdF_proj) / self.exp_cell_factor
         return g_u[self.cell_mask]
+
+    def _unprojected_cell_motion_derivative(self):
+        """d(atom+dummy positions)/d(raw cell C) for the unprojected cell move.
+
+        Shape (3*ntot, 9), column ``3a+b`` = d r / d C[a,b] flattened.
+
+        Non-rigid: ASE's set_cell(scale_atoms=True) is fractional-preserving,
+        so ``r_i = frac_i @ C`` and ``dr_i/dC[a,b] = frac_i[a] * e_b``.
+
+        Rigid fragments: each fragment translates with its CoM (fractional-
+        preserving) and rotates rigidly, ``r_i = frac_com_g @ C + delta_i @ R``
+        with ``R = polar(inv(C) @ C_new)``. To first order at C_new = C,
+        ``dR/dC[a,b] = skew(inv(C) @ E_ab)``, giving
+        ``dr_i/dC[a,b] = frac_com_g[a] * e_b + delta_i @ skew(inv(C) @ E_ab)``.
+        Intrafragment vectors then change only by a rotation (zero residual);
+        interfragment separations follow the full strain.
+        """
+        C = self.atoms.get_cell().array
+        Cinv = np.linalg.inv(C)
+        if len(self.dummies) > 0:
+            positions = np.vstack([self.atoms.positions,
+                                   self.dummies.positions])
+        else:
+            positions = self.atoms.positions
+        ntot = positions.shape[0]
+        X_C = np.zeros((3 * ntot, 9))
+
+        if not self.rigid_fragments:
+            frac = positions @ Cinv
+            for i, s in enumerate(frac):
+                for a in range(3):
+                    for b in range(3):
+                        X_C[3 * i + b, 3 * a + b] = s[a]
+            return X_C
+
+        # Rigid: reference each atom (and dummy) to its fragment CoM.
+        natoms = self.int.natoms
+        frag_of = {}
+        for fid, group in enumerate(self.fragment_groups):
+            for a in group:
+                frag_of[int(a)] = fid
+        for d in range(len(self.dummies)):
+            parent = int(np.where(self.int.dinds == natoms + d)[0][0])
+            frag_of[natoms + d] = frag_of[parent]
+        com = np.zeros((ntot, 3))
+        for fid, group in enumerate(self.fragment_groups):
+            c = self.atoms.positions[list(group)].mean(axis=0)
+            for i in range(ntot):
+                if frag_of.get(i) == fid:
+                    com[i] = c
+        frac_com = com @ Cinv
+        delta = positions - com
+        eye3 = np.eye(3)
+        for a in range(3):
+            for b in range(3):
+                E = np.zeros((3, 3)); E[a, b] = 1.0
+                Amat = Cinv @ E
+                skew = 0.5 * (Amat - Amat.T)
+                # frac_com @ E scatters frac_com[:,a] into cartesian component b
+                # (E has its 1 at [a,b], so r @ E = r[a] * e_b); delta @ skew is
+                # the rigid rotation of the intrafragment offset.
+                dr = np.outer(frac_com[:, a], eye3[b]) + delta @ skew
+                X_C[:, 3 * a + b] = dr.ravel()
+        return X_C
 
     def _virial_to_dEdF(self, virial, forces):
         """Rigid-fragment-aware virial -> dE/dF for internal-coordinate cells.
