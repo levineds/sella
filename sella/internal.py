@@ -574,6 +574,27 @@ def _build_F_matrix_np(dx, refpos):
     return F
 
 
+def _build_F_matrices_np(pos_group, ref_group):
+    """Build batched 4x4 quaternion F-matrices for same-sized fragments."""
+    dx = pos_group - pos_group.mean(axis=1, keepdims=True)
+    R = np.matmul(dx.swapaxes(1, 2), ref_group)
+    Rtr = np.trace(R, axis1=1, axis2=2)
+    Ftop = np.stack([
+        R[:, 1, 2] - R[:, 2, 1],
+        R[:, 2, 0] - R[:, 0, 2],
+        R[:, 0, 1] - R[:, 1, 0],
+    ], axis=1)
+    n_batch = len(pos_group)
+    F = np.zeros((n_batch, 4, 4))
+    F[:, 0, 0] = Rtr
+    F[:, 0, 1:] = Ftop
+    F[:, 1:, 0] = Ftop
+    for axis in range(3):
+        F[:, 1 + axis, 1 + axis] = -Rtr
+    F[:, 1:, 1:] += R + R.transpose(0, 2, 1)
+    return F
+
+
 def _stabilize_quaternion(F, q_prev):
     """Compute branch-stable quaternion from F-matrix eigendecomposition.
 
@@ -623,7 +644,7 @@ def _expmap_np(q):
     return 2.0 * q[1:4] * a
 
 
-def _rotation_3axis_jacobian_np(pos, refpos, q):
+def _rotation_3axis_jacobian_np(pos, refpos, q, ws=None, vecs=None):
     """Jacobian of all 3 rotation values w.r.t. positions, using quaternion q.
 
     Parameters
@@ -631,15 +652,17 @@ def _rotation_3axis_jacobian_np(pos, refpos, q):
     pos    : (N, 3)
     refpos : (N, 3), already centered
     q      : (4,), stabilized quaternion
+    ws/vecs: optional eigendecomposition of the current F matrix
 
     Returns
     -------
     jac : (3, N, 3) — Jacobian[axis, atom, xyz]
     """
     N = len(pos)
-    dx = pos - pos.mean(0)
-    F = _build_F_matrix_np(dx, refpos)
-    ws, vecs = np.linalg.eigh(F)
+    if ws is None or vecs is None:
+        dx = pos - pos.mean(0)
+        F = _build_F_matrix_np(dx, refpos)
+        ws, vecs = np.linalg.eigh(F)
 
     c = q
     gaps = ws - ws[-1]
@@ -725,7 +748,8 @@ def _apply_dF(Prefpos, vec, N):
 
 
 
-def _rotation_hessian_single(pos, axis, refpos, q_stable=None):
+def _rotation_hessian_single(pos, axis, refpos, q_stable=None,
+                             ws=None, vecs=None):
     """Closed-form Hessian for a single rotation on a single fragment.
 
     pos    : (N, 3)
@@ -738,12 +762,12 @@ def _rotation_hessian_single(pos, axis, refpos, q_stable=None):
     N = len(pos)
     a = axis + 1
 
-    # F-matrix
-    dx = pos - pos.mean(0)
-    F = _build_F_matrix_np(dx, refpos)
-
-    # Eigendecomposition + safe pseudoinverse
-    ws, vecs = np.linalg.eigh(F)
+    # Eigendecomposition + safe pseudoinverse.  Batched callers already
+    # compute this while stabilizing the quaternion; reuse it when available.
+    if ws is None or vecs is None:
+        dx = pos - pos.mean(0)
+        F = _build_F_matrix_np(dx, refpos)
+        ws, vecs = np.linalg.eigh(F)
     if q_stable is not None:
         c = q_stable
     else:
@@ -874,6 +898,93 @@ def _build_dF_vec_batched(Pref, vec, n_batch, nr):
     return result.reshape(n_batch, nr * 3, 4)
 
 
+def _rotation_3axis_jacobian_batched_np(pos_pad, ref_pad, mask,
+                                        q_stable_all=None,
+                                        ws_all=None, vecs_all=None):
+    """Batched Jacobian of all 3 rotation values for multiple fragments."""
+    n_frag, n_max, _ = pos_pad.shape
+    n_real = np.sum(mask, axis=1).astype(int)
+    jac = np.zeros((n_frag, 3, n_max, 3))
+
+    size_groups = {}
+    for fi, nr in enumerate(n_real):
+        size_groups.setdefault(int(nr), []).append(fi)
+
+    for nr, frag_indices in size_groups.items():
+        n_batch = len(frag_indices)
+        idx = np.array(frag_indices)
+        pos_group = pos_pad[idx, :nr]
+        ref_group = ref_pad[idx, :nr]
+
+        if ws_all is not None and vecs_all is not None:
+            ws = ws_all[idx]
+            vecs = vecs_all[idx]
+            if q_stable_all is not None:
+                c = q_stable_all[idx]
+            else:
+                c = vecs[:, :, -1]
+                sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
+                c *= sign[:, None]
+        else:
+            ws, vecs = np.linalg.eigh(
+                _build_F_matrices_np(pos_group, ref_group)
+            )
+            if q_stable_all is not None:
+                c = q_stable_all[idx]
+            else:
+                c = vecs[:, :, -1]
+                sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
+                c *= sign[:, None]
+
+        gaps = ws - ws[:, -1:]
+        large_gap = np.abs(gaps) > _ROT_EIG_GAP_TOL
+        safe_inv = np.zeros_like(gaps)
+        safe_inv[large_gap] = 1.0 / gaps[large_gap]
+
+        dFc_flat = _build_dF_vec_batched(ref_group, c, n_batch, nr)
+        proj = np.matmul(dFc_flat, vecs)
+        dc_flat = -np.matmul(proj * safe_inv[:, None, :],
+                             vecs.swapaxes(1, 2))
+
+        q0 = c[:, 0]
+        asinc_val = np.empty_like(q0)
+        regular_asinc = q0 < 0.97
+        s2 = 1.0 - q0 * q0
+        asinc_val[regular_asinc] = (
+            np.arccos(q0[regular_asinc])
+            / np.sqrt(s2[regular_asinc])
+        )
+        y = q0[~regular_asinc] - 1.0
+        asinc_val[~regular_asinc] = (
+            1.0 - y / 3 + 2 * y**2 / 15 - 2 * y**3 / 35
+            + 8 * y**4 / 315 - 8 * y**5 / 693 + 16 * y**6 / 3003
+            - 16 * y**7 / 6435 + 128 * y**8 / 109395
+            - 128 * y**9 / 230945
+        )
+
+        dasinc = np.zeros_like(q0)
+        near_identity = np.abs(q0 - 1.0) < _ROT_NEAR_IDENTITY_TOL
+        ynear = q0[near_identity] - 1.0
+        dasinc[near_identity] = -1.0 / 3 + 4 * ynear / 15
+        regular_deriv = (~near_identity) & (np.abs(q0) < 1.0 - 1e-12)
+        if np.any(regular_deriv):
+            q0r = q0[regular_deriv]
+            s2r = 1.0 - q0r**2
+            sr = np.sqrt(s2r)
+            acr = np.arccos(q0r)
+            dasinc[regular_deriv] = -1.0 / s2r + q0r * acr / (sr * s2r)
+
+        for axis in range(3):
+            a = axis + 1
+            jac_flat = 2 * (
+                dc_flat[:, :, a] * asinc_val[:, None]
+                + c[:, a:a + 1] * dasinc[:, None] * dc_flat[:, :, 0]
+            )
+            jac[idx, axis, :nr, :] = jac_flat.reshape(n_batch, nr, 3)
+
+    return jac
+
+
 def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
                                        q_stable_all=None,
                                        ws_all=None, vecs_all=None):
@@ -920,22 +1031,9 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
                 sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
                 c *= sign[:, None]
         else:
-            dx = pos_group - pos_group.mean(axis=1, keepdims=True)
-            R = np.matmul(dx.swapaxes(1, 2), ref_group)  # (n_batch, 3, 3)
-            Rtr = np.trace(R, axis1=1, axis2=2)
-            Ftop = np.stack([
-                R[:, 1, 2] - R[:, 2, 1],
-                R[:, 2, 0] - R[:, 0, 2],
-                R[:, 0, 1] - R[:, 1, 0],
-            ], axis=1)
-            F = np.zeros((n_batch, 4, 4))
-            F[:, 0, 0] = Rtr
-            F[:, 0, 1:] = Ftop
-            F[:, 1:, 0] = Ftop
-            for i in range(3):
-                F[:, 1+i, 1+i] = -Rtr
-            F[:, 1:, 1:] += R + R.transpose(0, 2, 1)
-            ws, vecs = np.linalg.eigh(F)
+            ws, vecs = np.linalg.eigh(
+                _build_F_matrices_np(pos_group, ref_group)
+            )
             if q_stable_all is not None:
                 c = q_stable_all[idx]
             else:
@@ -1758,33 +1856,48 @@ class BaseInternals:
         Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
         """
         self._build_batched_arrays()
-        cell_jax = jnp.asarray(cell, dtype=np.float64)
+        cell_jax = None
         result = {}
 
         # Bonds - use padded arrays for consistent JAX shapes
         if self._n_bonds_actual > 0:
-            bond_pos = jnp.asarray(positions[self._bond_indices_padded], dtype=np.float64)
-            bond_ncvecs = jnp.asarray(self._bond_ncvecs_padded, dtype=np.float64)
-            grads_padded = np.asarray(device_get(_bond_cell_grad_batched(bond_pos, bond_ncvecs, cell_jax)))
-            result['bonds'] = grads_padded[:self._n_bonds_actual]
+            if np.any(self._bond_ncvecs):
+                if cell_jax is None:
+                    cell_jax = jnp.asarray(cell, dtype=np.float64)
+                bond_pos = jnp.asarray(positions[self._bond_indices_padded], dtype=np.float64)
+                bond_ncvecs = jnp.asarray(self._bond_ncvecs_padded, dtype=np.float64)
+                grads_padded = np.asarray(device_get(_bond_cell_grad_batched(bond_pos, bond_ncvecs, cell_jax)))
+                result['bonds'] = grads_padded[:self._n_bonds_actual]
+            else:
+                result['bonds'] = np.zeros((self._n_bonds_actual, 3, 3))
         else:
             result['bonds'] = np.empty((0, 3, 3))
 
         # Angles
         if self._n_angles_actual > 0:
-            angle_pos = jnp.asarray(positions[self._angle_indices_padded], dtype=np.float64)
-            angle_ncvecs = jnp.asarray(self._angle_ncvecs_padded, dtype=np.float64)
-            grads_padded = np.asarray(device_get(_angle_cell_grad_batched(angle_pos, angle_ncvecs, cell_jax)))
-            result['angles'] = grads_padded[:self._n_angles_actual]
+            if np.any(self._angle_ncvecs):
+                if cell_jax is None:
+                    cell_jax = jnp.asarray(cell, dtype=np.float64)
+                angle_pos = jnp.asarray(positions[self._angle_indices_padded], dtype=np.float64)
+                angle_ncvecs = jnp.asarray(self._angle_ncvecs_padded, dtype=np.float64)
+                grads_padded = np.asarray(device_get(_angle_cell_grad_batched(angle_pos, angle_ncvecs, cell_jax)))
+                result['angles'] = grads_padded[:self._n_angles_actual]
+            else:
+                result['angles'] = np.zeros((self._n_angles_actual, 3, 3))
         else:
             result['angles'] = np.empty((0, 3, 3))
 
         # Dihedrals
         if self._n_dihedrals_actual > 0:
-            dihedral_pos = jnp.asarray(positions[self._dihedral_indices_padded], dtype=np.float64)
-            dihedral_ncvecs = jnp.asarray(self._dihedral_ncvecs_padded, dtype=np.float64)
-            grads_padded = np.asarray(device_get(_dihedral_cell_grad_batched(dihedral_pos, dihedral_ncvecs, cell_jax)))
-            result['dihedrals'] = grads_padded[:self._n_dihedrals_actual]
+            if np.any(self._dihedral_ncvecs):
+                if cell_jax is None:
+                    cell_jax = jnp.asarray(cell, dtype=np.float64)
+                dihedral_pos = jnp.asarray(positions[self._dihedral_indices_padded], dtype=np.float64)
+                dihedral_ncvecs = jnp.asarray(self._dihedral_ncvecs_padded, dtype=np.float64)
+                grads_padded = np.asarray(device_get(_dihedral_cell_grad_batched(dihedral_pos, dihedral_ncvecs, cell_jax)))
+                result['dihedrals'] = grads_padded[:self._n_dihedrals_actual]
+            else:
+                result['dihedrals'] = np.zeros((self._n_dihedrals_actual, 3, 3))
         else:
             result['dihedrals'] = np.empty((0, 3, 3))
 
@@ -1806,10 +1919,12 @@ class BaseInternals:
             # Build full coords list in order
             all_coords = []
 
-            # Translations (not batched - usually few) - use lightweight atoms
-            atoms = self.light_atoms
+            # Translations are simple coordinate means; compute them directly
+            # instead of dispatching one tiny JAX call per TRIC axis.
             for coord in self.internals['translations']:
-                all_coords.append(coord.calc(atoms))
+                idx = coord.indices
+                dim = coord.kwargs['dim']
+                all_coords.append(float(positions[idx, dim].mean()))
 
             # Bonds (batched)
             all_coords.extend(batched_vals['bonds'].tolist())
@@ -1821,6 +1936,7 @@ class BaseInternals:
             all_coords.extend(batched_vals['dihedrals'].tolist())
 
             # Other (not batched - heterogeneous)
+            atoms = self.light_atoms
             for coord in self.internals['other']:
                 all_coords.append(coord.calc(atoms))
 
@@ -1834,9 +1950,11 @@ class BaseInternals:
 
             self._cache['coords'] = np.array(all_coords)
 
-        return np.array([
-            x for x, a in zip(self._cache['coords'], self._active_mask) if a
-        ])
+        coords = self._cache['coords']
+        active_mask = self._active_mask
+        if all(active_mask):
+            return coords.copy()
+        return coords[np.asarray(active_mask, dtype=bool)]
 
     def jacobian(self) -> np.ndarray:
         """Calculates the internal coordinate Jacobian matrix using vectorized operations."""
@@ -1858,8 +1976,12 @@ class BaseInternals:
 
             # Non-batched coords use lightweight atoms
             atoms = self.light_atoms
-            trans_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
-                          for coord in self.internals['translations']]
+            trans_data = []
+            for coord in self.internals['translations']:
+                idx = coord.indices
+                jac = np.zeros((len(idx), 3))
+                jac[:, coord.kwargs['dim']] = 1.0 / len(idx)
+                trans_data.append((idx, jac))
             other_data = [(coord.indices, np.array(coord.calc_gradient(atoms)))
                           for coord in self.internals['other']]
             rot_data = self._batched_rotation_gradients(positions)
@@ -2110,27 +2232,34 @@ class BaseInternals:
             self._cache['stabilized_q_eigh'] = (None, None)
             return None
         n_frags = len(slots)
-        ws_list = []
-        vecs_list = []
+        ws_all = np.empty((n_frags, 4))
+        vecs_all = np.empty((n_frags, 4, 4))
+
+        size_groups = {}
+        for fi, indices in enumerate(frag_indices):
+            size_groups.setdefault(len(indices), []).append(fi)
+
+        for nr, group in size_groups.items():
+            idx = np.array(group)
+            pos_group = pos_pad[idx, :nr]
+            ref_group = ref_pad[idx, :nr]
+            ws, vecs = np.linalg.eigh(
+                _build_F_matrices_np(pos_group, ref_group)
+            )
+            ws_all[idx] = ws
+            vecs_all[idx] = vecs
+
         qs = []
         for fi, slot in enumerate(slots):
-            n = len(frag_indices[fi])
-            pos_frag = pos_pad[fi, :n]
-            ref_frag = ref_pad[fi, :n]
-            dx = pos_frag - pos_frag.mean(0)
-            F = _build_F_matrix_np(dx, ref_frag)
             q_prev = rotations[slot[0]].q_prev
-            ws_i, vecs_i = np.linalg.eigh(F)
-            ws_list.append(ws_i)
-            vecs_list.append(vecs_i)
-            q = _stabilize_quaternion_from_eigh(ws_i, vecs_i, q_prev)
+            q = _stabilize_quaternion_from_eigh(
+                ws_all[fi], vecs_all[fi], q_prev
+            )
             for axis in range(3):
                 rotations[slot[axis]].q_prev = q
             qs.append(q)
         self._cache['stabilized_q'] = qs
-        self._cache['stabilized_q_eigh'] = (
-            np.array(ws_list), np.array(vecs_list)
-        )
+        self._cache['stabilized_q_eigh'] = (ws_all, vecs_all)
         return qs
 
     def _batched_rotation_values(self, positions: np.ndarray):
@@ -2165,17 +2294,19 @@ class BaseInternals:
         qs = self._get_stabilized_quaternions(positions)
         if qs is None:
             return None
-        pos_pad, ref_pad, _, frag_indices, slots, _ = (
+        pos_pad, ref_pad, mask, frag_indices, slots, _ = (
             self._rotation_padded_inputs(positions)
+        )
+        ws_all, vecs_all = self._cache.get('stabilized_q_eigh', (None, None))
+        jac_all = _rotation_3axis_jacobian_batched_np(
+            pos_pad, ref_pad, mask,
+            q_stable_all=np.array(qs), ws_all=ws_all, vecs_all=vecs_all,
         )
         out = [None] * len(rotations)
         for fi, slot in enumerate(slots):
             n = len(frag_indices[fi])
-            pos_frag = pos_pad[fi, :n]
-            ref_frag = ref_pad[fi, :n]
-            jac = _rotation_3axis_jacobian_np(pos_frag, ref_frag, qs[fi])
             for axis, rot_idx in enumerate(slot):
-                out[rot_idx] = (frag_indices[fi], jac[axis])
+                out[rot_idx] = (frag_indices[fi], jac_all[fi, axis, :n])
         return out
 
     def _batched_rotation_hessians(self, positions: np.ndarray):
@@ -2194,14 +2325,21 @@ class BaseInternals:
         pos_pad, ref_pad, _, frag_indices, slots, _ = (
             self._rotation_padded_inputs(positions)
         )
+        ws_all, vecs_all = self._cache.get('stabilized_q_eigh', (None, None))
         out = [None] * len(rotations)
         for fi, slot in enumerate(slots):
             n = len(frag_indices[fi])
             pos_frag = np.asarray(pos_pad[fi, :n], dtype=np.float64)
             ref_frag = np.asarray(ref_pad[fi, :n], dtype=np.float64)
             for axis, rot_idx in enumerate(slot):
-                h = _rotation_hessian_single(pos_frag, axis, ref_frag,
-                                             q_stable=qs[fi])
+                if ws_all is not None and vecs_all is not None:
+                    h = _rotation_hessian_single(
+                        pos_frag, axis, ref_frag, q_stable=qs[fi],
+                        ws=ws_all[fi], vecs=vecs_all[fi],
+                    )
+                else:
+                    h = _rotation_hessian_single(pos_frag, axis, ref_frag,
+                                                 q_stable=qs[fi])
                 out[rot_idx] = (frag_indices[fi], h)
         return out
 
