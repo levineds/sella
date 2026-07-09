@@ -1803,6 +1803,7 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         if self.rigid_fragments:
             self.fragment_groups, self.fragment_dummy_groups = \
                 self._extract_fragment_groups(self.int)
+            self._validate_fragment_groups()
 
         self.dim = self.n_internal + self.n_cell_dof
 
@@ -1982,6 +1983,33 @@ class CellInternalPES(_CellPESMixin, InternalPES):
             dummy_groups.append(np.array(dummies, dtype=np.int32))
 
         return groups, dummy_groups
+
+    def _validate_fragment_groups(self):
+        """Ensure rigid_fragments has usable fragment groups.
+
+        The rigid cell move iterates over ``fragment_groups`` to translate and
+        rotate each fragment. If that list is empty (e.g. rigid_fragments=True
+        requested explicitly on an Internals built without allow_fragments, so
+        no fragment TRICs exist), the loop is a no-op: the cell changes but the
+        atoms stay fixed in Cartesian space -- a silent corruption. The groups
+        must also partition every real atom exactly once, or some atoms would
+        not move with the cell. Fail loudly instead.
+        """
+        natoms = self.int.natoms
+        covered = []
+        for group in self.fragment_groups:
+            covered.extend(int(a) for a in group)
+        if (not self.fragment_groups
+                or sorted(covered) != list(range(natoms))):
+            raise ValueError(
+                "rigid_fragments=True requires fragment groups that partition "
+                "all {} atoms exactly once, but got {}. Fragment groups come "
+                "from find_all_bonds(allow_fragments=True); pass "
+                "allow_fragments=True (or rigid_fragments=False for a "
+                "non-rigid cell).".format(
+                    natoms, [list(g) for g in self.fragment_groups]
+                )
+            )
 
     def _compute_delta_r(self):
         """Compute positions relative to fragment center of mass.
