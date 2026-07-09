@@ -120,6 +120,74 @@ def gpu_qr(A):
     return _cpu_qr(A, mode='economic', pivoting=False, check_finite=False)
 
 
+def gpu_qr_with_pinv(A, rank_rtol=1e-6):
+    """Economy QR plus full-rank pseudoinverse solve on GPU.
+
+    Returns ``(Q, R, Binv_or_None)`` as numpy arrays. ``Binv_or_None`` is
+    populated only when the reduced QR factor is square and passes the same
+    relative diagonal rank check used by ``InternalPES``. Returning Q/R even
+    when the solve is skipped lets callers reuse the GPU QR and run their
+    rank-deficient fallback without refactorizing on CPU.
+    """
+    n = A.shape[0]
+    if not _gpu_ok(n):
+        return None
+
+    try:
+        At = to_gpu(A)
+        if At is None:
+            return None
+        Q_t, R_t = torch.linalg.qr(At, mode='reduced')
+    except (RuntimeError, MemoryError):
+        _record_oom(n)
+        return None
+
+    Binv = None
+    if R_t.numel() and R_t.shape[0] == R_t.shape[1]:
+        try:
+            rdiag = torch.abs(torch.diagonal(R_t))
+            rmax = torch.max(rdiag)
+            full_rank = (
+                bool((rmax > 0).item())
+                and bool((torch.min(rdiag) >= rank_rtol * rmax).item())
+            )
+            if full_rank:
+                Binv = torch.linalg.solve_triangular(
+                    R_t, Q_t.transpose(-2, -1), upper=True
+                ).cpu().numpy()
+        except (RuntimeError, MemoryError):
+            _record_oom(n)
+            Binv = None
+
+    try:
+        return Q_t.cpu().numpy(), R_t.cpu().numpy(), Binv
+    except (RuntimeError, MemoryError):
+        _record_oom(n)
+        return None
+
+
+def gpu_solve_triangular(A, B, upper=True):
+    """Triangular solve on GPU when beneficial, else None.
+
+    Solves ``A @ X = B`` and returns ``X`` as a numpy array. This is used for
+    the full-rank internal-coordinate pseudoinverse after QR, where ``A`` is a
+    square triangular factor and ``B`` has many right-hand sides. The upload
+    and download overhead is still much smaller than the CPU solve for the
+    large Jacobians seen in molecular-crystal runs.
+    """
+    n = A.shape[0]
+    if _gpu_ok(n):
+        try:
+            At = to_gpu(A)
+            Bt = to_gpu(B)
+            if At is not None and Bt is not None:
+                X_t = torch.linalg.solve_triangular(At, Bt, upper=upper)
+                return X_t.cpu().numpy()
+        except (RuntimeError, MemoryError):
+            _record_oom(n)
+    return None
+
+
 def gpu_svd(M, full_matrices=True):
     """Economy/full SVD on GPU when beneficial, else None.
 

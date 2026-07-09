@@ -15,7 +15,9 @@ from sella.linalg import NumericalHessian, ApproximateHessian
 from sella.eigensolvers import rayleigh_ritz
 from sella.internal import Internals, Constraints, DuplicateInternalError
 from sella._gpu import (gpu_qr as _gpu_qr, gpu_project,
-                        gpu_svd as _gpu_svd, gpu_pinv as _gpu_pinv)
+                        gpu_svd as _gpu_svd, gpu_pinv as _gpu_pinv,
+                        gpu_solve_triangular as _gpu_solve_triangular,
+                        gpu_qr_with_pinv as _gpu_qr_with_pinv)
 
 logger = logging.getLogger(__name__)
 
@@ -819,7 +821,14 @@ class InternalPES(PES):
             return cached
 
         B = self.int.jacobian()
-        Q, R = _gpu_qr(B)
+        qr_pinv = _gpu_qr_with_pinv(B)
+        if qr_pinv is None:
+            Q, R = _gpu_qr(B)
+            Binv = None
+        else:
+            Q, R, Binv = qr_pinv
+            if Binv is not None:
+                self._pinv_cache.put(state_hash, Binv)
 
         # Check for rank deficiency via R diagonal
         rdiag = np.abs(np.diag(R))
@@ -872,7 +881,9 @@ class InternalPES(PES):
         elif R.shape[0] == R.shape[1]:
             # Full rank: R is the upper-triangular QR factor, so R^{-1} Q^T via
             # a triangular solve is cheaper than any SVD-based pseudoinverse.
-            Binv = solve_triangular(R, Q.T, check_finite=False)
+            Binv = _gpu_solve_triangular(R, Q.T, upper=True)
+            if Binv is None:
+                Binv = solve_triangular(R, Q.T, check_finite=False)
         else:
             # Non-square R => rank-deficient. We only get here on eviction:
             # _qr_cache still holds the truncated (Q, R) but the 2-entry
