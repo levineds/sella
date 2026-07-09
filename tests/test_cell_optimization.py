@@ -10,7 +10,7 @@ from ase.calculators.emt import EMT
 from ase.calculators.lj import LennardJones
 
 from sella import Sella
-from sella.peswrapper import CellInternalPES, CellCartesianPES
+from sella.peswrapper import CellInternalPES, CellCartesianPES, _logm_3x3
 from sella.internal import Internals, Bond, Angle
 
 
@@ -1324,6 +1324,71 @@ class TestRigidFragments:
         assert not np.allclose(R, np.eye(3), atol=1e-6), (
             "R should differ from identity after shear"
         )
+
+    def test_rigid_rotation_is_objective_on_skewed_cell(self):
+        """A pure global rotation of a skewed rigid-fragment cell must not
+        change the energy.
+
+        The rigid motion uses the row-vector incremental deformation
+        M = inv(C_before) @ C_after (a pure rotation gives M = Q.T, so
+        delta_r @ polar(M) rotates rigidly). The old left-multiplied form
+        (C_after @ inv(C_before), delta_r @ R.T) was not objective on skewed
+        cells: a global rotation changed the energy by ~1e-2 eV.
+        """
+        cell = np.array([[6.0, 0, 0], [2.0, 6.0, 0], [0.5, 1.0, 6.0]])
+        atoms = Atoms('OH2OH2',
+                      positions=[[1, 1, 1], [1.9, 1.2, 1], [0.6, 1.9, 1],
+                                 [3, 4, 2], [3.9, 4.2, 2], [2.6, 4.9, 2]],
+                      cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals, rigid_fragments=True)
+        pes.get_g()
+        E0 = pes.eval()[0]
+
+        # Target cell = pure rotation of the current cell about z.
+        theta = 1e-3
+        c, s = np.cos(theta), np.sin(theta)
+        Qz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        cell_rot = cell @ Qz.T
+        F = cell_rot @ np.linalg.inv(pes.orig_cell)
+        U = _logm_3x3(F) * pes.exp_cell_factor
+        x = pes.get_x().copy()
+        x[pes.n_internal:] = U[pes.cell_mask]
+
+        pes.save()
+        pes.set_x(x)
+        E1 = pes.eval()[0]
+        pes.restore()
+        assert abs(E1 - E0) < 1e-9, f"rotation changed energy by {E1 - E0:.3e}"
+
+    def test_cell_gradient_matches_fd_on_skewed_nonequilibrium(self):
+        """Analytic cell gradient must match FD of set_x on a skewed cell far
+        from equilibrium, where the rotation-correction term is active."""
+        cell = np.array([[4.5, 0, 0], [1.5, 4.5, 0], [0.8, 0.6, 4.5]])
+        atoms = Atoms('OH2OH2',
+                      positions=[[0.5, 0.5, 0.5], [1.4, 0.7, 0.5],
+                                 [0.1, 1.4, 0.5], [2.5, 2.5, 2.0],
+                                 [3.4, 2.7, 2.0], [2.1, 3.4, 2.0]],
+                      cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals, rigid_fragments=True)
+        pes.get_g()
+        n = pes.n_internal
+        g_cell = pes.curr['g'][n:].copy()
+        # This configuration has a genuinely nonzero cell gradient.
+        assert np.abs(g_cell).max() > 1e-2
+        x0 = pes.get_x().copy()
+        eps = 1e-5
+        g_fd = np.zeros(pes.n_cell_dof)
+        for i in range(pes.n_cell_dof):
+            pes.save(); xp = x0.copy(); xp[n + i] += eps
+            pes.set_x(xp); fp = pes.eval()[0]; pes.restore()
+            pes.save(); xm = x0.copy(); xm[n + i] -= eps
+            pes.set_x(xm); fm = pes.eval()[0]; pes.restore()
+            g_fd[i] = (fp - fm) / (2 * eps)
+        assert_allclose(g_cell, g_fd, atol=1e-6)
 
 
 class TestNiggliReduction:
