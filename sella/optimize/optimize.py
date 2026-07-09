@@ -419,10 +419,17 @@ class Sella(Optimizer):
 
         # Update trust radius
         if rho is not None:
-            if self.optimize_cell and isinstance(self.pes, CellInternalPES):
-                n_int = self.pes.n_internal
-                smag_int = np.max(np.abs(s[:n_int])) if n_int > 0 else 0
-                smag_cell = np.max(np.abs(s[n_int:])) if len(s) > n_int else 0
+            if self.optimize_cell and isinstance(
+                self.pes, (CellInternalPES, CellCartesianPES)
+            ):
+                # Split the step into coordinate (internal or Cartesian) and
+                # cell blocks so each trust radius adapts independently. The
+                # boundary is n_coords (n_internal for CellInternalPES, n_cart
+                # for CellCartesianPES).
+                n_coord = self.pes.n_coords
+                smag_int = np.max(np.abs(s[:n_coord])) if n_coord > 0 else 0
+                smag_cell = (np.max(np.abs(s[n_coord:]))
+                             if len(s) > n_coord else 0)
             else:
                 smag_int = smag
                 smag_cell = 0

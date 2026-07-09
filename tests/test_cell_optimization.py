@@ -1724,5 +1724,35 @@ class TestRestrictedAtomicStepCellDOF:
             assert np.isclose(dval, dval_fd, atol=1e-5), desc
 
 
+class TestCartesianCellTrustRadiusAdapts:
+    """The Cartesian cell trust radius (delta_cell) must adapt during opt.
+
+    The trust-radius update only split smag_cell for CellInternalPES, so with
+    internal=False the cell radius stayed frozen at its initial value even as
+    cell steps hit the cap. The split now applies to CellCartesianPES too
+    (via pes.n_coords).
+    """
+
+    def test_delta_cell_adapts_cartesian(self):
+        # Compressed cell -> large stress -> cell steps large enough to move
+        # the (initially capped) delta_cell.
+        atoms = Atoms('H4',
+                      positions=[[0, 0, 0], [1.2, 0, 0], [0, 1.2, 0],
+                                 [0, 0, 1.2]],
+                      cell=np.eye(3) * 2.6, pbc=True)
+        atoms.calc = LennardJones()
+        opt = Sella(atoms, order=0, internal=False, optimize_cell=True,
+                    logfile=None)
+        from sella.peswrapper import CellCartesianPES
+        assert isinstance(opt.pes, CellCartesianPES)
+        delta_cell0 = opt.delta_cell
+        seen = {round(opt.delta_cell, 6)}
+        for _ in range(10):
+            opt.step()
+            seen.add(round(opt.delta_cell, 6))
+        # delta_cell must have changed from its frozen initial value.
+        assert len(seen) > 1, f"delta_cell never adapted (stuck at {delta_cell0})"
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
