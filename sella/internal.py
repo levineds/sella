@@ -2565,6 +2565,191 @@ class BaseInternals:
             out_row[idx] = hvp
         return off, row + 1
 
+    def _contract_batched_hvp_family(self, jax_result, active, n_actual,
+                                     indices, mat_atoms, out, row):
+        """Contract one batched HVP family with dense Cartesian columns."""
+        if jax_result is None:
+            return row
+        hvp = np.asarray(device_get(jax_result))
+        if active.all():
+            hvp = hvp[:n_actual]
+            idx = indices
+            n_coords = n_actual
+        else:
+            idx = indices[active]
+            n_coords = int(active.sum())
+        out[row:row + n_coords] = np.einsum('cij,cijk->ck',
+                                            hvp, mat_atoms[idx])
+        return row + n_coords
+
+    @staticmethod
+    def _contract_full_hvp_row(hvp, idx, mat_atoms):
+        """Contract one dense HVP row with dense Cartesian columns."""
+        return np.einsum('ij,ijk->k', hvp, mat_atoms[idx])
+
+    def hessian_rdot_mat(self, v: np.ndarray, mat: np.ndarray):
+        """Compute ``hessian_rdot(v) @ mat`` without forming hessian_rdot.
+
+        ``_q_ode`` only needs contractions of each coordinate Hessian-vector
+        product with a few Cartesian vectors.  Computing those contractions
+        directly avoids expanding compact per-coordinate HVPs into the sparse
+        ``(n_active, ndof)`` matrix and then multiplying it back down.
+        """
+        self._cache_check()
+        positions = self.all_positions
+        cell = self.atoms.cell.array
+        self._build_batched_arrays()
+        tvecs = self._get_cached_tvecs(cell)
+
+        mat = np.asarray(mat)
+        if mat.ndim == 1:
+            mat = mat[:, None]
+            squeeze = True
+        else:
+            squeeze = False
+
+        v_atoms = v.reshape((-1, 3))
+        mat_atoms = mat.reshape((-1, 3, mat.shape[1]))
+
+        active_mask = self._active_mask
+        n_trans = len(self.internals['translations'])
+        n_bonds = len(self.internals['bonds'])
+        n_angles = len(self.internals['angles'])
+        n_dihedrals = len(self.internals['dihedrals'])
+        n_other = len(self.internals['other'])
+        n_rot = len(self.internals['rotations'])
+
+        (trans_active, bonds_active, angles_active, dihedrals_active,
+         other_active, rot_active) = self._split_active_mask(
+            n_trans, n_bonds, n_angles, n_dihedrals, n_other, n_rot)
+        bonds_active = np.asarray(bonds_active, dtype=bool)
+        angles_active = np.asarray(angles_active, dtype=bool)
+        dihedrals_active = np.asarray(dihedrals_active, dtype=bool)
+
+        out = np.zeros((sum(active_mask), mat.shape[1]), dtype=np.float64)
+        row = sum(trans_active)  # Translation Hessians are zero.
+
+        bond_jax_result = None
+        if bonds_active.any() and self._n_bonds_actual > 0:
+            if bonds_active.all():
+                bond_pos = positions[self._bond_indices_padded]
+                bond_tvecs = tvecs['bonds_padded']
+                v_sub = v_atoms[self._bond_indices_padded]
+                bond_jax_result = _bond_hvp_batched(bond_pos, bond_tvecs, v_sub)
+            else:
+                bond_active_idx = self._bond_indices[bonds_active]
+                bond_pos = positions[bond_active_idx]
+                bond_tvecs = tvecs['bonds'][bonds_active]
+                v_sub = v_atoms[bond_active_idx]
+                bond_jax_result = _bond_hvp_batched(bond_pos, bond_tvecs, v_sub)
+
+        angle_jax_result = None
+        if angles_active.any() and self._n_angles_actual > 0:
+            if angles_active.all():
+                angle_pos = positions[self._angle_indices_padded]
+                angle_tvecs = tvecs['angles_padded']
+                v_sub = v_atoms[self._angle_indices_padded]
+                angle_jax_result = _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
+            else:
+                angle_active_idx = self._angle_indices[angles_active]
+                angle_pos = positions[angle_active_idx]
+                angle_tvecs = tvecs['angles'][angles_active]
+                v_sub = v_atoms[angle_active_idx]
+                angle_jax_result = _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
+
+        dih_jax_result = None
+        if dihedrals_active.any() and self._n_dihedrals_actual > 0:
+            if dihedrals_active.all():
+                dih_pos = positions[self._dihedral_indices_padded]
+                dih_tvecs = tvecs['dihedrals_padded']
+                v_sub = v_atoms[self._dihedral_indices_padded]
+                dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
+            else:
+                dih_active_idx = self._dihedral_indices[dihedrals_active]
+                dih_pos = positions[dih_active_idx]
+                dih_tvecs = tvecs['dihedrals'][dihedrals_active]
+                v_sub = v_atoms[dih_active_idx]
+                dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
+
+        rot_closed_results = []
+        rot_batched_slots = None
+        rot_batched_frag_indices = None
+        rot_batched_hvp = None
+        all_rot_active = bool(np.asarray(rot_active, dtype=bool).all())
+        if all_rot_active and self.internals['rotations']:
+            pos_pad, ref_pad, mask, frag_indices, slots, valid = (
+                self._rotation_padded_inputs(positions)
+            )
+        else:
+            valid = False
+        if valid:
+            qs = self._get_stabilized_quaternions(positions)
+            q_stable_all = np.array(qs) if qs is not None else None
+            cached_eigh = self._cache.get('stabilized_q_eigh', (None, None))
+            ws_cached, vecs_cached = cached_eigh
+            n_max = mask.shape[1]
+            v_pad = np.zeros((len(frag_indices), n_max, 3), dtype=np.float64)
+            for fi, fi_idx in enumerate(frag_indices):
+                v_pad[fi, :len(fi_idx)] = v_atoms[fi_idx]
+            rot_batched_hvp = _rotation_3axis_hvp_batched_closed(
+                pos_pad, ref_pad, mask, v_pad,
+                q_stable_all=q_stable_all,
+                ws_all=ws_cached, vecs_all=vecs_cached,
+            )
+            rot_batched_slots = slots
+            rot_batched_frag_indices = frag_indices
+        else:
+            for i, coord in enumerate(self.internals['rotations']):
+                if rot_active[i]:
+                    idx = np.array(coord.indices)
+                    pos = positions[idx]
+                    v_sub = v_atoms[idx]
+                    axis = coord.kwargs['axis']
+                    refpos = coord.kwargs['refpos']
+                    hvp = _rotation_hvp_closed(pos, axis, refpos, v_sub,
+                                               q_stable=coord.q_prev)
+                    rot_closed_results.append((hvp, idx))
+
+        row = self._contract_batched_hvp_family(
+            bond_jax_result, bonds_active, self._n_bonds_actual,
+            self._bond_indices, mat_atoms, out, row)
+        row = self._contract_batched_hvp_family(
+            angle_jax_result, angles_active, self._n_angles_actual,
+            self._angle_indices, mat_atoms, out, row)
+        row = self._contract_batched_hvp_family(
+            dih_jax_result, dihedrals_active, self._n_dihedrals_actual,
+            self._dihedral_indices, mat_atoms, out, row)
+
+        atoms = self.light_atoms
+        for i, coord in enumerate(self.internals['other']):
+            if other_active[i]:
+                hess = np.array(coord.calc_hessian(atoms))
+                idx = np.array(coord.indices)
+                v_sub = v_atoms[idx]
+                hvp = np.einsum('aibj,bj->ai', hess, v_sub)
+                out[row] = self._contract_full_hvp_row(hvp, idx, mat_atoms)
+                row += 1
+
+        if rot_batched_hvp is not None:
+            for fi, slot in enumerate(rot_batched_slots):
+                n = len(rot_batched_frag_indices[fi])
+                idx = rot_batched_frag_indices[fi]
+                contracted = np.einsum(
+                    'anj,njk->ak', rot_batched_hvp[fi, :, :n, :],
+                    mat_atoms[idx],
+                )
+                for axis, rot_idx in enumerate(slot):
+                    out[row + rot_idx] = contracted[axis]
+            row += len(self.internals['rotations'])
+        else:
+            for hvp, idx in rot_closed_results:
+                out[row] = self._contract_full_hvp_row(hvp, idx, mat_atoms)
+                row += 1
+
+        if squeeze:
+            return out[:, 0]
+        return out
+
     def hessian_rdot(self, v: np.ndarray):
         """Compute Hessian @ v for all internal coordinates using direct HVP.
 

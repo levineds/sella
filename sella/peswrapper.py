@@ -1270,13 +1270,11 @@ class InternalPES(PES):
         self.atoms.positions = x[:nxa].reshape((-1, 3)).copy()
         self.dummies.positions = x[nxa:].reshape((-1, 3)).copy()
 
-        # Use direct HVP computation instead of forming full Hessians.
-        # Batch the two D_rdot @ vector products into one (D_rdot @ matrix)
-        # matmul, then one Binv @ matrix matmul, halving the matmul count.
-        D_rdot = self.int.hessian_rdot(dxdt)
+        # Use direct HVP contractions instead of forming full Hessians or the
+        # sparse D_rdot matrix.  The ODE only needs D_rdot @ [dxdt, g].
         Binv = self._get_Binv() if self.exact_geodesic else self._ode_Binv
         rhs = np.column_stack((dxdt, g))     # (ndof, 2)
-        out = -Binv @ (D_rdot @ rhs)          # (ndof, 2)
+        out = -Binv @ self.int.hessian_rdot_mat(dxdt, rhs)  # (ndof, 2)
         dydt[1] = out[:, 0]
         dydt[2] = out[:, 1]
 
@@ -2287,7 +2285,7 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         only in how the unprojected cell motion (``X_C``) moves the atoms.
         """
         n_cell = self.n_cell_dof
-        if n_cell == 0:
+        if n_cell == 0 or self.cons.nint == 0:
             return np.zeros(n_cell)
         drdx, Ucons, _, _ = self._compute_basis_int()
         if Ucons.shape[1] == 0:

@@ -157,6 +157,37 @@ class TestInternals:
         assert np.all(np.isfinite(q))
         assert np.all(np.isfinite(jac))
 
+    def test_hessian_rdot_mat_matches_matrix_product(self):
+        """Direct HVP contractions should match hessian_rdot(v) @ mat."""
+        water1 = molecule('H2O')
+        water2 = molecule('H2O')
+        water2.positions += [5.0, 0.0, 0.0]
+        atoms = water1 + water2
+
+        internal = Internals(atoms, allow_fragments=True)
+        internal.find_all_bonds()
+        internal.find_all_angles()
+        internal.find_all_dihedrals()
+
+        rng = np.random.RandomState(7)
+        v = rng.normal(size=internal.ndof)
+        mat = rng.normal(size=(internal.ndof, 3))
+
+        expected = np.asarray(internal.hessian_rdot(v) @ mat)
+        actual = internal.hessian_rdot_mat(v, mat)
+        np.testing.assert_allclose(actual, expected, atol=1e-12)
+
+        w = rng.normal(size=internal.ndof)
+        expected_vec = np.asarray(internal.hessian_rdot(v) @ w).ravel()
+        actual_vec = internal.hessian_rdot_mat(v, w)
+        np.testing.assert_allclose(actual_vec, expected_vec, atol=1e-12)
+
+        internal._active['angles'][0] = False
+        expected_inactive = np.asarray(internal.hessian_rdot(v) @ mat)
+        actual_inactive = internal.hessian_rdot_mat(v, mat)
+        np.testing.assert_allclose(actual_inactive, expected_inactive,
+                                   atol=1e-12)
+
 
 class TestPES:
     """Test PES wrapper functionality."""
