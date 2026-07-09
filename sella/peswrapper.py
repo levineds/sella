@@ -17,7 +17,9 @@ from sella.internal import Internals, Constraints, DuplicateInternalError
 from sella._gpu import (gpu_qr as _gpu_qr, gpu_project,
                         gpu_svd as _gpu_svd, gpu_pinv as _gpu_pinv,
                         gpu_solve_triangular as _gpu_solve_triangular,
-                        gpu_qr_with_pinv as _gpu_qr_with_pinv)
+                        gpu_qr_with_pinv as _gpu_qr_with_pinv,
+                        gpu_left_matmul as _gpu_left_matmul,
+                        gpu_left_factor as _gpu_left_factor)
 
 logger = logging.getLogger(__name__)
 
@@ -1004,6 +1006,9 @@ class InternalPES(PES):
         t0 = 0.
         Binv = self._get_Binv()
         self._ode_Binv = Binv
+        self._ode_Binv_gpu = (
+            _gpu_left_factor(Binv) if not self.exact_geodesic else None
+        )
         y0 = np.hstack((self.apos.ravel(), self.dpos.ravel(),
                         Binv @ dx,
                         Binv @ self.curr.get('g', np.zeros_like(dx))))
@@ -1283,9 +1288,20 @@ class InternalPES(PES):
 
         # Use direct HVP contractions instead of forming full Hessians or the
         # sparse D_rdot matrix.  The ODE only needs D_rdot @ [dxdt, g].
-        Binv = self._get_Binv() if self.exact_geodesic else self._ode_Binv
+        if self.exact_geodesic:
+            Binv = self._get_Binv()
+            Binv_gpu = None
+        else:
+            Binv = self._ode_Binv
+            Binv_gpu = getattr(self, '_ode_Binv_gpu', None)
         rhs = np.column_stack((dxdt, g))     # (ndof, 2)
-        out = -Binv @ self.int.hessian_rdot_mat(dxdt, rhs)  # (ndof, 2)
+        hrdot = self.int.hessian_rdot_mat(dxdt, rhs)
+        out = None
+        if Binv_gpu is not None:
+            out = _gpu_left_matmul(None, hrdot, A_gpu=Binv_gpu)
+        if out is None:
+            out = Binv @ hrdot
+        out = -out  # (ndof, 2)
         dydt[1] = out[:, 0]
         dydt[2] = out[:, 1]
 
@@ -2205,6 +2221,9 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         t0 = 0.
         Binv = self._get_Binv()
         self._ode_Binv = Binv
+        self._ode_Binv_gpu = (
+            _gpu_left_factor(Binv) if not self.exact_geodesic else None
+        )
 
         if 'g' in self.curr and self.curr['g'] is not None:
             g_cart_for_ode = Binv @ self.curr['g'][:self.n_internal]

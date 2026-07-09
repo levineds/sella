@@ -30,6 +30,11 @@ try:
 except ValueError:
     _GPU_MIN_DIM = 200
 
+try:
+    _GPU_MATMUL_MIN_DIM = int(os.environ.get("SELLA_GPU_MATMUL_MIN_DIM", "1000"))
+except ValueError:
+    _GPU_MATMUL_MIN_DIM = 1000
+
 # After a CUDA OOM at dimension N, refuse subsequent GPU offload for shapes
 # >= N. Keeps a single failure from cascading and lets the CPU path take over
 # cleanly on small GPUs.
@@ -38,6 +43,12 @@ _oom_floor = None
 
 def _gpu_ok(n):
     return _has_torch and n >= _GPU_MIN_DIM and (
+        _oom_floor is None or n < _oom_floor
+    )
+
+
+def _gpu_matmul_ok(n):
+    return _has_torch and n >= _GPU_MATMUL_MIN_DIM and (
         _oom_floor is None or n < _oom_floor
     )
 
@@ -186,6 +197,37 @@ def gpu_solve_triangular(A, B, upper=True):
         except (RuntimeError, MemoryError):
             _record_oom(n)
     return None
+
+
+def gpu_left_matmul(A, B, A_gpu=None):
+    """Compute ``A @ B`` on GPU when beneficial, returning a numpy array.
+
+    ``A_gpu`` may be a cached CUDA tensor for repeated multiplies by the same
+    left factor. This is used by the frozen-Binv ODE path, where a large
+    pseudoinverse multiplies several tiny RHS matrices.
+    """
+    n = (
+        max(A.shape)
+        if A is not None
+        else (A_gpu.shape[0] if A_gpu is not None else 0)
+    )
+    if A_gpu is not None or _gpu_matmul_ok(n):
+        try:
+            At = A_gpu if A_gpu is not None else to_gpu(A)
+            Bt = to_gpu(B)
+            if At is not None and Bt is not None:
+                return (At @ Bt).cpu().numpy()
+        except (RuntimeError, MemoryError):
+            _record_oom(n)
+    return None
+
+
+def gpu_left_factor(A):
+    """Upload a reusable left matmul factor when it is large enough."""
+    n = max(A.shape)
+    if not _gpu_matmul_ok(n):
+        return None
+    return to_gpu(A)
 
 
 def gpu_svd(M, full_matrices=True):
