@@ -898,6 +898,47 @@ def _build_dF_vec_batched(Pref, vec, n_batch, nr):
     return result.reshape(n_batch, nr * 3, 4)
 
 
+def _build_dF_vec_batched_many(Pref, vec, n_batch, nr):
+    """Compute dF_{k,d} @ vec for several quaternion-space vectors."""
+    n_vec = vec.shape[1]
+    v0 = vec[:, :, 0]
+    v3 = vec[:, :, 1:]
+    Pv3 = (Pref[:, None, :, 0] * v3[:, :, None, 0]
+           + Pref[:, None, :, 1] * v3[:, :, None, 1]
+           + Pref[:, None, :, 2] * v3[:, :, None, 2])
+
+    result = np.empty((n_batch, n_vec, nr, 3, 4))
+    for d in range(3):
+        d1 = (d + 1) % 3
+        d2 = (d + 2) % 3
+        dRtr = Pref[:, :, d]
+
+        dFtop_d1 = -Pref[:, :, d2]
+        dFtop_d2 = Pref[:, :, d1]
+
+        result[:, :, :, d, 0] = (
+            dRtr[:, None, :] * v0[:, :, None]
+            + dFtop_d1[:, None, :] * v3[:, :, d1, None]
+            + dFtop_d2[:, None, :] * v3[:, :, d2, None]
+        )
+
+        vd = v3[:, :, d]
+        for i_ax in range(3):
+            val = -dRtr[:, None, :] * v3[:, :, i_ax, None]
+            if i_ax == d:
+                val = val + Pv3
+            val = val + Pref[:, None, :, i_ax] * vd[:, :, None]
+            if i_ax == d1:
+                dFtop_iax = dFtop_d1[:, None, :]
+            elif i_ax == d2:
+                dFtop_iax = dFtop_d2[:, None, :]
+            else:
+                dFtop_iax = 0.0
+            result[:, :, :, d, 1 + i_ax] = dFtop_iax * v0[:, :, None] + val
+
+    return result.reshape(n_batch, n_vec, nr * 3, 4)
+
+
 def _rotation_3axis_jacobian_batched_np(pos_pad, ref_pad, mask,
                                         q_stable_all=None,
                                         ws_all=None, vecs_all=None):
@@ -1078,6 +1119,8 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
         d2asinc = np.where(near_one, 4.0/15,
                            (3*q0/s2 - (1+2*q0**2)*ac/(s*s2)) * (-1.0/s2))
 
+        axis_terms = []
+        w_all = np.empty((n_batch, 3, 4))
         for axis in range(3):
             a = axis + 1
             qa = c[:, a]
@@ -1103,10 +1146,16 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
             w_dc = np.squeeze(dc_flat @ w[:, :, None], -1)  # (n_batch, M)
             fdq_c = (df_dq * c).sum(axis=1)  # (n_batch,)
 
-            # dFw: dF @ w for all (k,d)
-            dFw_flat = _build_dF_vec_batched(Pref, w, n_batch, nr)  # (n_batch, M, 4)
-
             w_dc_v = (w_dc * v_flat).sum(axis=1)  # (n_batch,)
+
+            w_all[:, axis] = w
+            axis_terms.append((t1_hvp, wc, w_dc, fdq_c, w_dc_v))
+
+        # dFw: dF @ w for all axes and all (k,d)
+        dFw_all = _build_dF_vec_batched_many(Pref, w_all, n_batch, nr)
+
+        for axis, (t1_hvp, wc, w_dc, fdq_c, w_dc_v) in enumerate(axis_terms):
+            dFw_flat = dFw_all[:, axis]  # (n_batch, M, 4)
 
             # wdFdc @ v = dFw_flat @ dc_v
             wdFdc_v = np.squeeze(dFw_flat @ dc_v[:, :, None], -1)

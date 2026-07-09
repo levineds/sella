@@ -13,6 +13,7 @@ attempt for that size; this keeps smaller GPUs from thrashing.
 import os
 import numpy as np
 from scipy.linalg import eigh as _cpu_eigh
+from scipy.linalg import qr as _cpu_qr
 
 try:
     import torch
@@ -114,7 +115,9 @@ def gpu_qr(A):
                 return Q_t.cpu().numpy(), R_t.cpu().numpy()
         except (RuntimeError, MemoryError):
             _record_oom(n)
-    return np.linalg.qr(A, mode='reduced')
+    if n == 0:
+        return np.linalg.qr(A, mode='reduced')
+    return _cpu_qr(A, mode='economic', pivoting=False, check_finite=False)
 
 
 def gpu_svd(M, full_matrices=True):
