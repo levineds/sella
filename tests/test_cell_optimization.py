@@ -1590,6 +1590,21 @@ class TestSingletonFragmentCellMotion:
             g_fd[i] = (fp - fm) / (2 * eps)
         assert_allclose(g_cell, g_fd, atol=1e-6)
 
+    def test_rigid_fragments_without_groups_raises(self):
+        # Explicit rigid_fragments=True on an Internals built WITHOUT
+        # allow_fragments has no fragment groups, so the rigid cell move would
+        # freeze the atoms while the cell changes (silent corruption). Must
+        # raise a clear error instead.
+        atoms = Atoms('OH2', positions=[[1, 1, 1], [1.9, 1.2, 1],
+                                        [0.6, 1.9, 1]],
+                      cell=np.eye(3) * 6.0, pbc=True)
+        atoms.calc = LennardJones()
+        ic = Internals(atoms)  # no allow_fragments -> no fragment groups
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        with pytest.raises(ValueError, match="fragment groups"):
+            CellInternalPES(atoms, internals=ic, eta=1e-4,
+                            auto_find_internals=False, rigid_fragments=True)
+
 
 class TestNiggliReduction:
     """Tests for periodic Niggli reduction during cell optimization."""
@@ -1826,8 +1841,11 @@ class TestRigidFragmentsSurvivesRebuild:
     def test_explicit_true_survives_rebuild(self):
         atoms = make_molecular_crystal()
         atoms.calc = EMT()
+        # allow_fragments so rigid_fragments=True has real fragment groups
+        # (a lone molecule still yields a z=1 fragment); the point of the test
+        # is that the explicit rigid_fragments=True survives the rebuild.
         opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
-                    rigid_fragments=True, logfile=None)
+                    allow_fragments=True, rigid_fragments=True, logfile=None)
         assert opt.pes.rigid_fragments is True
         self._force_bad_internals_rebuild(opt)
         assert opt.pes.rigid_fragments is True
