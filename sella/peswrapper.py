@@ -2204,8 +2204,130 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         stress = self.atoms.get_stress()  # 6-component Voigt, eV/Å³
         g_cell = self._stress_to_cell_gradient(stress, forces=forces)
 
+        # Add the constraint-projection work term (nonzero only when internal
+        # constraints are present in the non-rigid path -- see the method).
+        g_cell = g_cell + self._constraint_projection_cell_gradient()
+
         self.write_traj()
         return f, np.concatenate([g_internal, g_cell])
+
+    def _constraint_projection_cell_gradient(self):
+        """Cell-gradient contribution from constraint re-projection.
+
+        With an *internal* constraint (fixed bond/angle/dihedral) and cell
+        optimization, ``set_x`` changes the cell (moving atoms fractionally),
+        which perturbs the constrained coordinate, then re-projects the atoms
+        back onto the constraint manifold. That projection does virtual work
+        against the forces, contributing to dE/d(cell) -- but the stress/virial
+        term computes the gradient at fixed (projected-out) coordinates and
+        misses it.
+
+        The smooth linearized projection is
+        ``dq_proj/du = -Uc @ pinv(Jc @ Uc) @ Rc_u`` (Jc = constraint Jacobian
+        in the non-redundant internal basis, Uc = constraint subspace, Rc_u =
+        d(residual)/d(cell)), so the correction is
+        ``g_proj = g_int^T @ dq_proj/du = -Rc_u^T @ y`` with
+        ``(Jc @ Uc)^T y = Uc^T g_int``.
+
+        Returns a zero vector unless there are active constraints. In
+        rigid-fragment mode a constraint that lies entirely within one rigid
+        fragment is invariant under the rigid cell move (zero contribution),
+        but a constraint that *spans* fragments does acquire a residual under
+        cell strain -- the interfragment separation follows the full cell
+        deformation -- so it gets the same projection correction, differing
+        only in how the unprojected cell motion (``X_C``) moves the atoms.
+        """
+        n_cell = self.n_cell_dof
+        if n_cell == 0:
+            return np.zeros(n_cell)
+        drdx, Ucons, _, _ = self._compute_basis_int()
+        if Ucons.shape[1] == 0:
+            return np.zeros(n_cell)  # no active constraints
+
+        # Raw internal gradient: use forces WITHOUT the ASE constraint applied.
+        # ASE's constrained forces have already removed the exact component that
+        # does the projection work, which would zero out this term.
+        forces_raw = self.atoms.get_forces(apply_constraint=False)
+        g_int = (-forces_raw.ravel()) @ self._get_Binv()[:forces_raw.size]
+
+        A = drdx @ Ucons
+        y, *_ = np.linalg.lstsq(A.T, Ucons.T @ g_int, rcond=_LSTSQ_RCOND)
+
+        # Residual sensitivity to the raw cell C, via the derivative of the
+        # unprojected cell motion: Rc_C = Jc_cart @ dr/dC + dRc/dC.
+        X_C = self._unprojected_cell_motion_derivative()
+        Rc_C = self.cons.jacobian() @ X_C + self.cons.cell_jacobian()
+        G_C_proj = -(Rc_C.T @ y).reshape(3, 3)
+
+        # Map raw-cell gradient to the scaled log-cell params, same as stress.
+        dEdF_proj = G_C_proj @ self.orig_cell.T
+        U = _logm_3x3(self._get_deformation_gradient())
+        g_u = _expm_frechet_3x3_contracted(U, dEdF_proj) / self.exp_cell_factor
+        return g_u[self.cell_mask]
+
+    def _unprojected_cell_motion_derivative(self):
+        """d(atom+dummy positions)/d(raw cell C) for the unprojected cell move.
+
+        Shape (3*ntot, 9), column ``3a+b`` = d r / d C[a,b] flattened.
+
+        Non-rigid: ASE's set_cell(scale_atoms=True) is fractional-preserving,
+        so ``r_i = frac_i @ C`` and ``dr_i/dC[a,b] = frac_i[a] * e_b``.
+
+        Rigid fragments: each fragment translates with its CoM (fractional-
+        preserving) and rotates rigidly, ``r_i = frac_com_g @ C + delta_i @ R``
+        with ``R = polar(inv(C) @ C_new)``. To first order at C_new = C,
+        ``dR/dC[a,b] = skew(inv(C) @ E_ab)``, giving
+        ``dr_i/dC[a,b] = frac_com_g[a] * e_b + delta_i @ skew(inv(C) @ E_ab)``.
+        Intrafragment vectors then change only by a rotation (zero residual);
+        interfragment separations follow the full strain.
+        """
+        C = self.atoms.get_cell().array
+        Cinv = np.linalg.inv(C)
+        if len(self.dummies) > 0:
+            positions = np.vstack([self.atoms.positions,
+                                   self.dummies.positions])
+        else:
+            positions = self.atoms.positions
+        ntot = positions.shape[0]
+        X_C = np.zeros((3 * ntot, 9))
+
+        if not self.rigid_fragments:
+            frac = positions @ Cinv
+            for i, s in enumerate(frac):
+                for a in range(3):
+                    for b in range(3):
+                        X_C[3 * i + b, 3 * a + b] = s[a]
+            return X_C
+
+        # Rigid: reference each atom (and dummy) to its fragment CoM.
+        natoms = self.int.natoms
+        frag_of = {}
+        for fid, group in enumerate(self.fragment_groups):
+            for a in group:
+                frag_of[int(a)] = fid
+        for d in range(len(self.dummies)):
+            parent = int(np.where(self.int.dinds == natoms + d)[0][0])
+            frag_of[natoms + d] = frag_of[parent]
+        com = np.zeros((ntot, 3))
+        for fid, group in enumerate(self.fragment_groups):
+            c = self.atoms.positions[list(group)].mean(axis=0)
+            for i in range(ntot):
+                if frag_of.get(i) == fid:
+                    com[i] = c
+        frac_com = com @ Cinv
+        delta = positions - com
+        eye3 = np.eye(3)
+        for a in range(3):
+            for b in range(3):
+                E = np.zeros((3, 3)); E[a, b] = 1.0
+                Amat = Cinv @ E
+                skew = 0.5 * (Amat - Amat.T)
+                # frac_com @ E scatters frac_com[:,a] into cartesian component b
+                # (E has its 1 at [a,b], so r @ E = r[a] * e_b); delta @ skew is
+                # the rigid rotation of the intrafragment offset.
+                dr = np.outer(frac_com[:, a], eye3[b]) + delta @ skew
+                X_C[:, 3 * a + b] = dr.ravel()
+        return X_C
 
     def _virial_to_dEdF(self, virial, forces):
         """Rigid-fragment-aware virial -> dE/dF for internal-coordinate cells.

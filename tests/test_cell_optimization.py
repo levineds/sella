@@ -11,7 +11,7 @@ from ase.calculators.lj import LennardJones
 
 from sella import Sella
 from sella.peswrapper import CellInternalPES, CellCartesianPES, _logm_3x3
-from sella.internal import Internals, Bond, Angle
+from sella.internal import Internals, Bond, Angle, Constraints
 
 
 def make_molecular_crystal():
@@ -1389,6 +1389,128 @@ class TestRigidFragments:
             pes.set_x(xm); fm = pes.eval()[0]; pes.restore()
             g_fd[i] = (fp - fm) / (2 * eps)
         assert_allclose(g_cell, g_fd, atol=1e-6)
+
+
+class TestConstrainedCellGradient:
+    """Cell gradient must include constraint-reprojection virtual work.
+
+    With an internal constraint (fixed bond/angle/dihedral) + cell
+    optimization, set_x changes the cell (moving atoms fractionally), which
+    perturbs the constrained coordinate, then reprojects atoms back onto the
+    constraint manifold. That projection does work against the forces, adding
+    a term to dE/d(cell) that the stress/virial alone misses. Before the fix
+    the analytic cell gradient differed from the FD derivative of set_x by
+    ~26 eV on a skewed periodic H2O cell with one fixed OH bond.
+    """
+
+    @staticmethod
+    def _skewed_water():
+        cell = np.array([[6.0, 0, 0], [1.5, 6.0, 0], [0, 0, 6.0]])
+        atoms = Atoms('OH2', positions=[[1, 1, 0], [1.9, 1.2, 0],
+                                        [0.6, 1.9, 0]], cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    def _fd_cell_gradient(self, pes):
+        n = pes.n_internal
+        g_cell = pes.curr['g'][n:].copy()
+        x0 = pes.get_x().copy()
+        eps = 1e-5
+        g_fd = np.zeros(pes.n_cell_dof)
+        for i in range(pes.n_cell_dof):
+            pes.save(); xp = x0.copy(); xp[n + i] += eps
+            pes.set_x(xp); fp = pes.eval()[0]; pes.restore()
+            pes.save(); xm = x0.copy(); xm[n + i] -= eps
+            pes.set_x(xm); fm = pes.eval()[0]; pes.restore()
+            g_fd[i] = (fp - fm) / (2 * eps)
+        return g_cell, g_fd
+
+    def test_fixed_bond_cell_gradient_matches_fd(self):
+        atoms = self._skewed_water()
+        cons = Constraints(atoms)
+        cons.fix_bond((0, 1))
+        ic = Internals(atoms, cons=cons)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              auto_find_internals=False)
+        pes.get_g()
+        g_cell, g_fd = self._fd_cell_gradient(pes)
+        # The projection work term is large here; make sure the test is
+        # exercising a regime where the correction matters.
+        assert np.abs(g_cell).max() > 1.0
+        assert_allclose(g_cell, g_fd, atol=1e-6)
+
+    def test_unconstrained_cell_gradient_unaffected(self):
+        # No constraints: the correction must be identically zero.
+        atoms = self._skewed_water()
+        ic = Internals(atoms)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              auto_find_internals=False)
+        assert_allclose(pes._constraint_projection_cell_gradient(), 0.0,
+                        atol=1e-14)
+        pes.get_g()
+        g_cell, g_fd = self._fd_cell_gradient(pes)
+        assert_allclose(g_cell, g_fd, atol=1e-6)
+
+    def test_interfragment_constraint_rigid_cell_gradient_matches_fd(self):
+        # A constraint spanning two rigid fragments (a fixed angle across two
+        # separate waters -- angles are not connectivity edges, so the
+        # fragments stay separate) acquires a residual under cell strain: the
+        # interfragment separation follows the full deformation. The projection
+        # correction must make the analytic cell gradient match FD. (The FD
+        # harness tightens the projection tolerance to avoid the
+        # _project_to_constraints dead zone that would otherwise mask the term.)
+        import types
+        from sella.peswrapper import CellInternalPES as _CIP
+        cell = np.array([[10.0, 0, 0], [2.0, 10.0, 0], [0.5, 0.8, 10.0]])
+        atoms = Atoms('OH2OH2',
+                      positions=[[1, 1, 1], [1.9, 1.2, 1], [0.6, 1.9, 1],
+                                 [6, 6, 4], [6.9, 6.2, 4], [5.6, 6.9, 4]],
+                      cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        cons = Constraints(atoms)
+        cons.fix_angle((1, 0, 3))  # atoms 0,1 in frag1; atom 3 in frag2
+        ic = Internals(atoms, cons=cons, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              auto_find_internals=False, rigid_fragments=True)
+        assert len(pes.fragment_groups) == 2  # genuinely two fragments
+        pes.get_g()
+        n = pes.n_internal
+        g_cell = pes.curr['g'][n:].copy()
+        assert np.abs(g_cell).max() > 1.0  # the correction is large here
+
+        orig = _CIP._project_to_constraints
+        pes._project_to_constraints = types.MethodType(
+            lambda self, target_tol=1e-11, max_iter=40, **k:
+                orig(self, target_tol=target_tol, max_iter=max_iter, **k), pes)
+        x0 = pes.get_x().copy(); eps = 1e-5
+        g_fd = np.zeros(pes.n_cell_dof)
+        for i in range(pes.n_cell_dof):
+            pes.save(); xp = x0.copy(); xp[n + i] += eps
+            pes.set_x(xp); fp = pes.eval()[0]; pes.restore()
+            pes.save(); xm = x0.copy(); xm[n + i] -= eps
+            pes.set_x(xm); fm = pes.eval()[0]; pes.restore()
+            g_fd[i] = (fp - fm) / (2 * eps)
+        assert_allclose(g_cell, g_fd, atol=1e-6)
+
+    def test_intrafragment_constraint_rigid_ok(self):
+        # A constraint within one rigid fragment is fine (invariant under the
+        # rigid cell move) and must not raise.
+        cell = np.array([[10.0, 0, 0], [2.0, 10.0, 0], [0.5, 0.8, 10.0]])
+        atoms = Atoms('OH2OH2',
+                      positions=[[1, 1, 1], [1.9, 1.2, 1], [0.6, 1.9, 1],
+                                 [6, 6, 4], [6.9, 6.2, 4], [5.6, 6.9, 4]],
+                      cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        cons = Constraints(atoms)
+        cons.fix_angle((1, 0, 2))  # all in frag1
+        ic = Internals(atoms, cons=cons, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              auto_find_internals=False, rigid_fragments=True)
+        pes.get_g()  # must not raise
 
 
 class TestSingletonFragmentCellMotion:
