@@ -1512,6 +1512,8 @@ class TestConstrainedCellGradient:
                               auto_find_internals=False, rigid_fragments=True)
         assert_allclose(pes._constraint_projection_cell_gradient(), 0.0,
                         atol=1e-14)
+        _, Ucons, _, _ = pes._compute_basis_int()
+        assert Ucons.shape[1] == 1
         pes.get_g()  # must not raise
 
 
@@ -1938,6 +1940,29 @@ class TestDummyAtomCellHandling:
         assert_allclose(pes.atoms.get_cell().array, cell0, atol=1e-12)
         # The whole point: dummies restored exactly, not left displaced.
         assert_allclose(pes.dummies.positions, dpos0, atol=1e-12)
+
+    def test_linear_dummy_projection_avoids_full_basis(self, monkeypatch):
+        pes = Sella(self._two_linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True,
+                    rigid_fragments=True, logfile=None).pes
+        assert len(pes.dummies) >= 1
+        assert pes.cons.nint > 0
+        drdx, Ucons, _, _ = pes._compute_basis_int()
+        assert drdx.shape[0] == 0
+        assert Ucons.shape[1] == 0
+
+        apos0 = pes.atoms.positions.copy()
+        pes.dummies.positions += np.array([1e-3, -2e-3, 1.5e-3])
+        assert np.linalg.norm(pes.cons.residual(), ord=np.inf) > 1e-7
+
+        def fail_basis(*args, **kwargs):
+            raise AssertionError("linear dummy projection used full basis")
+
+        monkeypatch.setattr(pes, "_compute_basis_int", fail_basis)
+        assert pes._project_to_constraints()
+
+        assert_allclose(pes.atoms.positions, apos0, atol=1e-12)
+        assert np.linalg.norm(pes.cons.residual(), ord=np.inf) < 1e-7
 
 
 class TestRestrictedAtomicStepCellDOF:

@@ -558,6 +558,8 @@ class PES:
     def get_scons(self):
         """Returns displacement vector for linear constraint correction."""
         Ucons = self.get_Ucons()
+        if Ucons.shape[1] == 0:
+            return np.zeros(self.dim)
 
         scons = -Ucons @ np.linalg.lstsq(
             self.get_drdx() @ Ucons,
@@ -604,6 +606,8 @@ class PES:
 
         if self.curr['g'] is None:
             L = None
+        elif drdx.shape[0] == 0:
+            L = np.zeros(0)
         else:
             L = np.linalg.lstsq(drdx.T, self.curr['g'], rcond=_LSTSQ_RCOND)[0]
 
@@ -1124,6 +1128,17 @@ class InternalPES(PES):
         if self.cons.residual().size == 0:
             return False
 
+        r = self.cons.residual()
+        if np.linalg.norm(r, ord=np.inf) < target_tol:
+            return False
+
+        moved = self._project_linear_bend_dummies(
+            target_tol=target_tol,
+            safety_limit=safety_limit,
+        )
+        if moved is not None:
+            return moved
+
         n_real = 3 * len(self.atoms)
         n_dummy = 3 * len(self.dummies)
         moved = False
@@ -1153,6 +1168,147 @@ class InternalPES(PES):
             moved = True
 
         return moved
+
+    def _linear_bend_dummy_projection_records(self):
+        """Return dummy projection records, or None for the general path."""
+        if self.cons.nint == 0 or len(self.dummies) == 0:
+            return None
+
+        natoms = self.int.natoms
+        parent_of = {
+            int(dummy): int(parent)
+            for parent, dummy in enumerate(self.int.dinds)
+            if dummy >= 0
+        }
+        if len(parent_of) != len(self.dummies):
+            return None
+
+        bond_rec = {}
+        angle_rec = {}
+        for name in self.cons._names:
+            for active, kind in zip(self.cons._active[name],
+                                    self.cons._kind[name]):
+                if not active:
+                    continue
+                if kind != 'eq' or name not in ('bonds', 'angles'):
+                    return None
+
+        for coord, active, target in zip(self.cons.internals['bonds'],
+                                         self.cons._active['bonds'],
+                                         self.cons._targets['bonds']):
+            if not active:
+                continue
+            ids = np.asarray(coord.indices, dtype=int)
+            dummies = ids[ids >= natoms]
+            reals = ids[ids < natoms]
+            if len(dummies) != 1 or len(reals) != 1:
+                return None
+            dummy = int(dummies[0])
+            parent = int(reals[0])
+            if parent_of.get(dummy) != parent or dummy in bond_rec:
+                return None
+            bond_rec[dummy] = (parent, float(target))
+
+        for coord, active, target in zip(self.cons.internals['angles'],
+                                         self.cons._active['angles'],
+                                         self.cons._targets['angles']):
+            if not active:
+                continue
+            ids = np.asarray(coord.indices, dtype=int)
+            dummies = ids[ids >= natoms]
+            if len(dummies) != 1 or ids[1] >= natoms:
+                return None
+            dummy = int(dummies[0])
+            parent = int(ids[1])
+            if parent_of.get(dummy) != parent or dummy in angle_rec:
+                return None
+            other = int(ids[2] if ids[0] == dummy else ids[0])
+            if other >= natoms:
+                return None
+            angle_rec[dummy] = (coord, float(target), ids[0] == dummy)
+
+        if (set(bond_rec) != set(angle_rec)
+                or set(bond_rec) != set(parent_of)):
+            return None
+
+        return [
+            (dummy, bond_rec[dummy][0], bond_rec[dummy][1],
+             angle_rec[dummy][0], angle_rec[dummy][1], angle_rec[dummy][2])
+            for dummy in sorted(bond_rec)
+        ]
+
+    def _project_linear_bend_dummies(self, target_tol=1e-7,
+                                     safety_limit=0.05):
+        """Project linear-bend dummy constraints without a full IC basis.
+
+        A linear-bend dummy contributes exactly two active constraints: the
+        parent-dummy bond length and one parent-neighbor-dummy angle. Holding
+        real atoms fixed, those constraints are satisfied by putting the dummy
+        on a fixed cone around the parent-neighbor direction while preserving
+        the current azimuth. This avoids a full constrained-basis/QR solve for
+        the common dummy-only constraint case and falls back otherwise.
+        """
+        records = self._linear_bend_dummy_projection_records()
+        if records is None:
+            return None
+
+        natoms = self.int.natoms
+        old_dpos = self.dummies.positions.copy()
+        if len(self.dummies) > 0:
+            all_positions = np.vstack([self.atoms.positions,
+                                       self.dummies.positions])
+        else:
+            all_positions = self.atoms.positions
+        cell = self.atoms.cell.array
+
+        for dummy, parent, length, angle_coord, theta, dummy_is_first in records:
+            if length <= 0 or theta <= 1e-8 or abs(np.pi - theta) <= 1e-8:
+                self.dummies.positions[:] = old_dpos
+                return None
+
+            ids = np.asarray(angle_coord.indices, dtype=int)
+            tvecs = angle_coord.kwargs['ncvecs'] @ cell
+            if dummy_is_first:
+                neighbor_vec = all_positions[ids[2]] - all_positions[parent] + tvecs[1]
+                dummy_shift = tvecs[0]
+                current = all_positions[dummy] - all_positions[parent] - dummy_shift
+            else:
+                neighbor_vec = all_positions[ids[0]] - all_positions[parent] - tvecs[0]
+                dummy_shift = -tvecs[1]
+                current = all_positions[dummy] - all_positions[parent] - dummy_shift
+
+            neighbor_norm = np.linalg.norm(neighbor_vec)
+            if neighbor_norm <= 1e-12:
+                self.dummies.positions[:] = old_dpos
+                return None
+            axis = neighbor_vec / neighbor_norm
+            perp = current - (current @ axis) * axis
+            perp_norm = np.linalg.norm(perp)
+            if perp_norm <= 1e-12:
+                fallback = np.zeros(3)
+                fallback[np.argmin(np.abs(axis))] = 1.0
+                perp = fallback - (fallback @ axis) * axis
+                perp_norm = np.linalg.norm(perp)
+            azimuth = perp / perp_norm
+
+            new_vec = length * (
+                np.cos(theta) * axis + np.sin(theta) * azimuth
+            )
+            local_dummy = dummy - natoms
+            old_pos = self.dummies.positions[local_dummy].copy()
+            self.dummies.positions[local_dummy] = (
+                all_positions[parent] + dummy_shift + new_vec
+            )
+            if (np.linalg.norm(self.dummies.positions[local_dummy] - old_pos,
+                               ord=np.inf) > safety_limit):
+                self.dummies.positions[:] = old_dpos
+                return None
+
+        residual = self.cons.residual()
+        if np.linalg.norm(residual, ord=np.inf) >= target_tol:
+            self.dummies.positions[:] = old_dpos
+            return None
+        return True
 
     def get_x(self):
         x = self.int.calc()
@@ -1217,6 +1373,13 @@ class InternalPES(PES):
         """
         Q, R = self._get_jacobian_qr()
         n_int = Q.shape[0]
+        if self._linear_bend_dummy_projection_records() is not None:
+            # Linear-bend dummy constraints are auxiliary: they only keep each
+            # dummy on its parent bond/angle cone and are enforced exactly after
+            # every step by _project_linear_bend_dummies(). Keeping them in the
+            # optimizer basis would build a dense constrained Ufree for no
+            # physical constraint on the real atoms.
+            return np.zeros((0, n_int)), np.zeros((n_int, 0)), Q, Q
         cons_jac = self.cons.jacobian()
         if cons_jac.shape[0] == 0:
             # No constraints: every non-redundant DOF is free.
