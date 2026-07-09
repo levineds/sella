@@ -3710,10 +3710,12 @@ class Internals(BaseInternals):
         if self.allow_fragments and nlabels != 1:
             assert nlabels > 1
             groups = [[] for _ in range(nlabels)]
+            singletons = []
             for i, label in enumerate(labels):
                 if label == -1:
                     # A lone atom not bonded to anything else
                     self._add_fragment_coords([i], with_rotation=False)
+                    singletons.append(i)
                 else:
                     groups[label].append(i)
             cumshifts = {}
@@ -3724,6 +3726,14 @@ class Internals(BaseInternals):
                 self._wrap_fragment_positions(group, cumshifts)
                 self.fragment_atom_groups.append(np.array(group, dtype=np.int32))
                 self._add_fragment_coords(group)
+            # Isolated one-atom fragments are also fragments for rigid-body cell
+            # motion: they get a translation TRIC and must move fractionally
+            # with the cell. Record them so CellInternalPES treats them as
+            # rigid singletons (zero delta_r, CoM follows the cell).
+            for i in singletons:
+                self.fragment_atom_groups.append(
+                    np.array([i], dtype=np.int32)
+                )
         elif (self.allow_fragments and nlabels == 1
               and np.any(self.atoms.pbc)
               and len(self.internals['bonds']) > 0):

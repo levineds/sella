@@ -2047,26 +2047,34 @@ class CellInternalPES(_CellPESMixin, InternalPES):
 
         if self.rigid_fragments:
             # Rigid fragment mode: translate fragment CoMs to maintain
-            # fractional positions, and rotate fragments by R from polar
-            # decomposition of the incremental deformation gradient.
+            # fractional positions, and rotate each fragment rigidly.
+            #
+            # For ASE row-vector cells a global rotation is
+            # ``cell_after = cell_before @ Q.T``, i.e. the incremental
+            # deformation acting on row vectors is the RIGHT factor
+            # ``M = inv(cell_before) @ cell_after`` (so a pure rotation gives
+            # M = Q.T and r_new = r @ Q.T rotates correctly). Using the left
+            # factor ``cell_after @ inv(cell_before)`` with ``@ R.T`` is only
+            # correct for orthogonal cells and breaks objectivity on skewed
+            # cells (a pure rotation would change the energy).
             cell_after = self.atoms.get_cell().array
             cell_before_inv = np.linalg.inv(cell_before)
-            F_inc = cell_after @ cell_before_inv
-            R_inc, _ = polar(F_inc)
+            M_inc = cell_before_inv @ cell_after
+            R_inc, _ = polar(M_inc)
             for group, dgroup in zip(self.fragment_groups,
                                      self.fragment_dummy_groups):
                 com_old = pos_before[group].mean(axis=0)
                 # Convert old CoM to fractional, then to new Cartesian
                 com_frac = com_old @ cell_before_inv
                 com_new = com_frac @ cell_after
-                # Rotate relative positions by R (row-vector: r_new = r @ R^T)
+                # Rotate relative positions by R (row-vector: r_new = r @ R)
                 delta_r = pos_before[group] - com_old
-                self.atoms.positions[group] = com_new + delta_r @ R_inc.T
+                self.atoms.positions[group] = com_new + delta_r @ R_inc
                 # Move dummy atoms with the same transformation
                 if len(dgroup) > 0:
                     didx = dgroup - self.int.natoms  # Convert to dummies index
                     delta_d = self.dummies.positions[didx] - com_old
-                    self.dummies.positions[didx] = com_new + delta_d @ R_inc.T
+                    self.dummies.positions[didx] = com_new + delta_d @ R_inc
         elif len(self.dummies) > 0:
             # Non-rigid mode: ASE's set_cell(scale_atoms=True) scaled the real
             # atoms by the deformation gradient F = inv(cell_before) @ cell_after
@@ -2202,45 +2210,35 @@ class CellInternalPES(_CellPESMixin, InternalPES):
     def _virial_to_dEdF(self, virial, forces):
         """Rigid-fragment-aware virial -> dE/dF for internal-coordinate cells.
 
-        dE/dC = C^{-T} @ (V*sigma [+ dr^T @ f]), then dE/dF = dE/dC @ C0^T,
-        with an additional polar-rotation (dR/dF) correction in
-        rigid_fragments mode. ``dr`` is positions relative to fragment CoM.
+        dE/dC = C^{-T} @ (V*sigma [+ sym(dr^T @ f)]), then dE/dF = dE/dC @ C0^T.
+        ``dr`` is positions relative to fragment CoM.
+
+        For rigid fragments the relative vectors rotate with R = polar(inv(
+        C_before) @ C_after) rather than following the full affine (fractional)
+        motion the ASE virial assumes. The difference between affine motion
+        (delta_i @ A) and rigid rotation (delta_i @ skew(A)), with A = inv(C) @
+        dC, collapses to the *symmetric* part of P = dr^T @ f:
+
+            relative correction = P:A - skew(P):A = sym(P):A
+
+        so the correction is simply ``virial + sym(P)``. This is objective: a
+        pure global rotation lies in the skew(A) direction, which sym(P)
+        annihilates, so it contributes no spurious cell gradient. (The previous
+        ``virial + P`` plus a finite-difference dR/dF term was derived for the
+        non-objective left-multiplied motion and left a spurious rotational
+        derivative on skewed cells.)
         """
         if self.rigid_fragments and forces is not None:
-            # Rigid fragment mode: use Δr^T @ f correction
-            # Δr = positions relative to fragment CoM
             delta_r = self._compute_delta_r()
-            virial_corrected = virial + delta_r.T @ forces
+            P = delta_r.T @ forces
+            virial_corrected = virial + 0.5 * (P + P.T)
         else:
             virial_corrected = virial
 
-        # dE/dC = C^{-T} @ virial_corrected, then dE/dF = dE/dC @ C₀^T
+        # dE/dC = C^{-T} @ virial_corrected, then dE/dF = dE/dC @ C0^T
         C = self.atoms.get_cell().array
         C_inv_T = np.linalg.inv(C.T)
-        dEdF = C_inv_T @ virial_corrected @ self.orig_cell.T
-
-        if self.rigid_fragments and forces is not None:
-            # Rotation correction: fragments rotate by R from polar decomposition
-            # of F, so dE/dF gets an additional term from ∂R/∂F.
-            # rot_correction_mn = -Σ_{kl} (∂R_kl/∂F_mn) * [f^T @ Δr⁰]_kl
-            # where Δr⁰ = Δr @ R (back-rotated to reference frame)
-            F = self._get_deformation_gradient()
-            R_polar, _ = polar(F)
-            delta_r_ref = delta_r @ R_polar
-            M = forces.T @ delta_r_ref
-
-            eps = 1e-7
-            rot_correction = np.zeros((3, 3))
-            for m in range(3):
-                for n in range(3):
-                    F_pert = F.copy()
-                    F_pert[m, n] += eps
-                    R_pert, _ = polar(F_pert)
-                    dR = (R_pert - R_polar) / eps
-                    rot_correction[m, n] = -np.sum(dR * M)
-            dEdF += rot_correction
-
-        return dEdF
+        return C_inv_T @ virial_corrected @ self.orig_cell.T
 
     def _calc_basis(self):
         """Calculate basis including cell DOF.
