@@ -57,7 +57,8 @@ def test_expm_frechet_contracted_stable_for_tiny_logs():
     The closed-form Daleckii-Krein path uses eig(U), which is
     ill-conditioned for tiny nonsymmetric U; the exact-zero shortcut only
     covered ||U|| < 1e-10, leaving a gap around 1e-8 where the result drifted
-    from scipy by ~1e-4. The small-norm scipy fallback closes that gap.
+    from scipy by ~1e-4. The small-norm Taylor path closes that gap without
+    paying the scipy Frechet-loop cost.
     """
     rng = np.random.RandomState(0)
     for scale in [1.0, 1e-2, 1e-4, 1e-6, 1e-8, 1e-10, 1e-12]:

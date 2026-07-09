@@ -166,6 +166,29 @@ def _logm_3x3(F):
     return (V @ np.diag(np.log(lam)) @ np.linalg.inv(V)).real
 
 
+def _expm_frechet_3x3_contracted_taylor(U, dEdF):
+    """Fourth-order small-``U`` series for ``_expm_frechet_3x3_contracted``.
+
+    This evaluates the adjoint of
+    ``L_exp(U, E) = sum_n 1/n! sum_k U^k E U^(n-1-k)`` contracted with
+    ``dEdF``.  For ``||U|| < 1e-4`` the omitted terms are far below double
+    precision for the 3x3 cell updates this path serves, while avoiding the
+    much slower Padé-based SciPy Frechet loop.
+    """
+    UT = U.T
+    U2T = UT @ UT
+    U3T = U2T @ UT
+    return (
+        dEdF
+        + 0.5 * (dEdF @ UT + UT @ dEdF)
+        + (dEdF @ U2T + UT @ dEdF @ UT + U2T @ dEdF) / 6.0
+        + (
+            dEdF @ U3T + UT @ dEdF @ U2T
+            + U2T @ dEdF @ UT + U3T @ dEdF
+        ) / 24.0
+    )
+
+
 def _expm_frechet_3x3_contracted(U, dEdF):
     """Compute g[mu,nu] = sum_{ab} d expm(U)[E_munu] * dEdF[a,b] for all 9 (mu,nu).
 
@@ -182,9 +205,9 @@ def _expm_frechet_3x3_contracted(U, dEdF):
     ``g = real(Vinv.T (f ⊙ (V.T dEdF Vinv.T)) V.T)``. ~25x faster than
     the scipy loop on 3x3 inputs (0.67 → 0.03 ms/call).
 
-    Falls back to scipy when ``U`` is too close to zero (eigenvectors
-    of a noisy zero matrix are catastrophically ill-conditioned) or
-    when ``np.linalg.eig`` produces a near-singular ``V``.
+    Uses a Taylor contraction when ``U`` is small (the eigendecomposition is
+    ill-conditioned near zero), and falls back to scipy when ``np.linalg.eig``
+    produces a near-singular ``V`` or nearly-degenerate finite eigenvalues.
     """
     # When ||U|| ~ 0 the derivative reduces to the identity map E -> E,
     # so the contracted output is dEdF itself. Avoid eig on a noisy zero.
@@ -204,12 +227,10 @@ def _expm_frechet_3x3_contracted(U, dEdF):
     # For small ||U|| the identity-map shortcut is only first-order accurate
     # (error ~ O(||U||)), and eig on a small nonsymmetric matrix yields
     # ill-conditioned eigenvectors whose closed-form divided difference loses
-    # precision well before the cond(V) test below trips (empirically the
-    # closed form carries ~1e-7 error up to ||U|| ~ 1e-5). Use the accurate
-    # (Pade-based) scipy Frechet loop in this regime; it only triggers near
-    # convergence where deformations are tiny, so the extra cost is negligible.
+    # precision well before the cond(V) test below trips.  A direct Frechet
+    # Taylor series is both accurate and much cheaper than the SciPy loop here.
     if Unorm < 1e-4:
-        return _scipy_contract()
+        return _expm_frechet_3x3_contracted_taylor(U, dEdF)
 
     lam, V = np.linalg.eig(U)
     if np.linalg.cond(V) > 1e10:
