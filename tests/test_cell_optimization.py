@@ -1391,6 +1391,84 @@ class TestRigidFragments:
         assert_allclose(g_cell, g_fd, atol=1e-6)
 
 
+class TestSingletonFragmentCellMotion:
+    """Isolated one-atom fragments must move rigidly with the cell.
+
+    allow_fragments adds a translation TRIC for a lone atom but previously did
+    not record it in fragment_atom_groups, so CellInternalPES excluded it from
+    rigid-body cell motion: its CoM stayed fixed in Cartesian space instead of
+    following the cell fractionally, and _compute_delta_r initialized it from
+    absolute position (nonzero) instead of zero, poisoning the cell gradient.
+    """
+
+    @staticmethod
+    def _water_plus_ar(cell):
+        atoms = Atoms('OH2Ar',
+                      positions=[[0.5, 0.5, 0.5], [1.4, 0.7, 0.5],
+                                 [0.1, 1.4, 0.5], [2.6, 2.6, 2.6]],
+                      cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    def test_singleton_recorded_in_fragment_groups(self):
+        atoms = self._water_plus_ar(np.eye(3) * 9.0)
+        ic = Internals(atoms, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        groups = [sorted(int(i) for i in g) for g in ic.fragment_atom_groups]
+        assert [3] in groups, f"Ar singleton missing from {groups}"
+        assert sorted([0, 1, 2]) in [sorted(g) for g in groups]
+
+    def test_singleton_moves_fractionally_with_cell(self):
+        atoms = self._water_plus_ar(np.eye(3) * 9.0)
+        ic = Internals(atoms, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              rigid_fragments=True)
+        pes.get_g()
+        ar0 = atoms.positions[3].copy()
+        cell0 = atoms.get_cell().array.copy()
+        x = pes.get_x().copy(); x[pes.n_internal:] += 0.05
+        pes.save(); pes.set_x(x)
+        ar1 = atoms.positions[3].copy(); cell1 = atoms.get_cell().array.copy()
+        pes.restore()
+        # Fractional coordinate preserved: r1 = (r0 @ inv(C0)) @ C1.
+        expected = (ar0 @ np.linalg.inv(cell0)) @ cell1
+        assert np.linalg.norm(ar1 - ar0) > 0.1  # actually moved
+        assert_allclose(ar1, expected, atol=1e-8)
+
+    def test_singleton_delta_r_is_zero(self):
+        atoms = self._water_plus_ar(np.eye(3) * 9.0)
+        ic = Internals(atoms, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              rigid_fragments=True)
+        delta_r = pes._compute_delta_r()
+        assert_allclose(delta_r[3], 0.0, atol=1e-12)
+
+    def test_cell_gradient_matches_fd_with_singleton(self):
+        # Compressed skewed cell so the Ar singleton actively contributes to
+        # the (nonzero) cell gradient.
+        cell = np.array([[4.2, 0, 0], [1.3, 4.2, 0], [0.7, 0.5, 4.2]])
+        atoms = self._water_plus_ar(cell)
+        ic = Internals(atoms, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              rigid_fragments=True)
+        pes.get_g()
+        n = pes.n_internal
+        g_cell = pes.curr['g'][n:].copy()
+        assert np.abs(g_cell).max() > 1e-2
+        x0 = pes.get_x().copy(); eps = 1e-5
+        g_fd = np.zeros(pes.n_cell_dof)
+        for i in range(pes.n_cell_dof):
+            pes.save(); xp = x0.copy(); xp[n + i] += eps
+            pes.set_x(xp); fp = pes.eval()[0]; pes.restore()
+            pes.save(); xm = x0.copy(); xm[n + i] -= eps
+            pes.set_x(xm); fm = pes.eval()[0]; pes.restore()
+            g_fd[i] = (fp - fm) / (2 * eps)
+        assert_allclose(g_cell, g_fd, atol=1e-6)
+
+
 class TestNiggliReduction:
     """Tests for periodic Niggli reduction during cell optimization."""
 
