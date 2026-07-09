@@ -1510,6 +1510,8 @@ class TestConstrainedCellGradient:
         ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
         pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
                               auto_find_internals=False, rigid_fragments=True)
+        assert_allclose(pes._constraint_projection_cell_gradient(), 0.0,
+                        atol=1e-14)
         pes.get_g()  # must not raise
 
 

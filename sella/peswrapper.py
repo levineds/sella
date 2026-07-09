@@ -2317,6 +2317,8 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         n_cell = self.n_cell_dof
         if n_cell == 0 or self.cons.nint == 0:
             return np.zeros(n_cell)
+        if self._constraints_are_intrafragment_shape_constraints():
+            return np.zeros(n_cell)
         drdx, Ucons, _, _ = self._compute_basis_int()
         if Ucons.shape[1] == 0:
             return np.zeros(n_cell)  # no active constraints
@@ -2341,6 +2343,32 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         U = _logm_3x3(self._get_deformation_gradient())
         g_u = _expm_frechet_3x3_contracted(U, dEdF_proj) / self.exp_cell_factor
         return g_u[self.cell_mask]
+
+    def _constraints_are_intrafragment_shape_constraints(self):
+        """True when rigid-cell motion cannot perturb active constraints."""
+        if not self.rigid_fragments:
+            return False
+
+        shape_constraint_names = {'bonds', 'angles', 'dihedrals'}
+        frag_id = np.full(self.int.natoms + self.int.ndummies, -1, dtype=int)
+        for fid, group in enumerate(self.fragment_groups):
+            frag_id[np.asarray(group, dtype=int)] = fid
+        for fid, dgroup in enumerate(self.fragment_dummy_groups):
+            frag_id[np.asarray(dgroup, dtype=int)] = fid
+
+        saw_active = False
+        for name in self.cons._names:
+            for coord, active in zip(self.cons.internals[name],
+                                     self.cons._active[name]):
+                if not active:
+                    continue
+                saw_active = True
+                if name not in shape_constraint_names:
+                    return False
+                ids = frag_id[np.asarray(coord.indices, dtype=int)]
+                if np.any(ids < 0) or np.unique(ids).size != 1:
+                    return False
+        return saw_active
 
     def _unprojected_cell_motion_derivative(self):
         """d(atom+dummy positions)/d(raw cell C) for the unprojected cell move.
