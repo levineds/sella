@@ -2204,8 +2204,76 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         stress = self.atoms.get_stress()  # 6-component Voigt, eV/Å³
         g_cell = self._stress_to_cell_gradient(stress, forces=forces)
 
+        # Add the constraint-projection work term (nonzero only when internal
+        # constraints are present in the non-rigid path -- see the method).
+        g_cell = g_cell + self._constraint_projection_cell_gradient()
+
         self.write_traj()
         return f, np.concatenate([g_internal, g_cell])
+
+    def _constraint_projection_cell_gradient(self):
+        """Cell-gradient contribution from constraint re-projection.
+
+        With an *internal* constraint (fixed bond/angle/dihedral) and cell
+        optimization, ``set_x`` changes the cell (moving atoms fractionally),
+        which perturbs the constrained coordinate, then re-projects the atoms
+        back onto the constraint manifold. That projection does virtual work
+        against the forces, contributing to dE/d(cell) -- but the stress/virial
+        term computes the gradient at fixed (projected-out) coordinates and
+        misses it.
+
+        The smooth linearized projection is
+        ``dq_proj/du = -Uc @ pinv(Jc @ Uc) @ Rc_u`` (Jc = constraint Jacobian
+        in the non-redundant internal basis, Uc = constraint subspace, Rc_u =
+        d(residual)/d(cell)), so the correction is
+        ``g_proj = g_int^T @ dq_proj/du = -Rc_u^T @ y`` with
+        ``(Jc @ Uc)^T y = Uc^T g_int``.
+
+        Returns a zero vector unless there are constraints and the cell moves
+        atoms affinely (non-rigid). In rigid-fragment mode a constraint inside
+        a rigid fragment is invariant under the rigid cell move, so there is no
+        projection work.
+        """
+        n_cell = self.n_cell_dof
+        if n_cell == 0 or self.rigid_fragments:
+            return np.zeros(n_cell)
+        drdx, Ucons, _, _ = self._compute_basis_int()
+        if Ucons.shape[1] == 0:
+            return np.zeros(n_cell)  # no active constraints
+
+        # Raw internal gradient: use forces WITHOUT the ASE constraint applied.
+        # ASE's constrained forces have already removed the exact component that
+        # does the projection work, which would zero out this term.
+        forces_raw = self.atoms.get_forces(apply_constraint=False)
+        g_int = (-forces_raw.ravel()) @ self._get_Binv()[:forces_raw.size]
+
+        A = drdx @ Ucons
+        y, *_ = np.linalg.lstsq(A.T, Ucons.T @ g_int, rcond=_LSTSQ_RCOND)
+
+        # Residual sensitivity to the raw cell C: the unprojected cell move is
+        # fractional-preserving (scale_atoms=True), so dr/dC[a,b] = frac[:,a]
+        # scattered into cartesian component b. Rc_C = Jc_cart @ dr/dC + dRc/dC.
+        C = self.atoms.get_cell().array
+        if len(self.dummies) > 0:
+            positions = np.vstack([self.atoms.positions,
+                                   self.dummies.positions])
+        else:
+            positions = self.atoms.positions
+        ntot = positions.shape[0]
+        frac = positions @ np.linalg.inv(C)
+        X_C = np.zeros((3 * ntot, 9))
+        for i, s in enumerate(frac):
+            for a in range(3):
+                for b in range(3):
+                    X_C[3 * i + b, 3 * a + b] = s[a]
+        Rc_C = self.cons.jacobian() @ X_C + self.cons.cell_jacobian()
+        G_C_proj = -(Rc_C.T @ y).reshape(3, 3)
+
+        # Map raw-cell gradient to the scaled log-cell params, same as stress.
+        dEdF_proj = G_C_proj @ self.orig_cell.T
+        U = _logm_3x3(self._get_deformation_gradient())
+        g_u = _expm_frechet_3x3_contracted(U, dEdF_proj) / self.exp_cell_factor
+        return g_u[self.cell_mask]
 
     def _virial_to_dEdF(self, virial, forces):
         """Rigid-fragment-aware virial -> dE/dF for internal-coordinate cells.
