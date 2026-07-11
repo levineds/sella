@@ -287,9 +287,21 @@ class ApproximateHessian(LinearOperator):
             self.set_B(B)
             return
 
-        # Force GPU eig cache to populate alongside numpy lams/vecs (if a
-        # GPU is available); keeps update_H's GPU path eligible.
-        lams, vecs = self.evals, self.evecs
+        # Keep the large eigensystem on GPU when the GPU TS-BFGS path is
+        # available.  Downloading the full eigenvector matrix just to pass it
+        # through update_H is pure transfer overhead unless the GPU update
+        # falls back.
+        lams = None
+        vecs = None
+        B_gpu = self._get_B_gpu()
+        if B_gpu is not None:
+            if self._evals_gpu is None or self._evecs_gpu is None:
+                evals_t, evecs_t = gpu_eigh_t(B_gpu)
+                if evals_t is not None:
+                    self._evals_gpu = evals_t
+                    self._evecs_gpu = evecs_t
+        else:
+            lams, vecs = self.evals, self.evecs
 
         result = update_H(B, dx, dg, method=self.update_method,
                           symm=self.symm, lams=lams, vecs=vecs,

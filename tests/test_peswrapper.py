@@ -95,6 +95,34 @@ def test_range_space_projector_exercises_rank_deficient_input():
     assert rank < min(B.shape)
 
 
+def test_internal_df_pred_matches_projected_hessian_formula():
+    """Trust prediction must match the explicit nonredundant projection.
+
+    The optimized implementation avoids materializing ``U.T @ H @ U`` and
+    instead evaluates the same quadratic form with the projected step vector.
+    """
+    rng = np.random.default_rng(7)
+    dim = 18
+    nred = 11
+    U, _ = np.linalg.qr(rng.normal(size=(dim, nred)), mode='reduced')
+    dx = rng.normal(size=dim)
+    g = rng.normal(size=dim)
+    A = rng.normal(size=(dim, dim))
+    H = (A + A.T) * 0.5
+
+    class DummyPES:
+        def get_Unred(self):
+            return U
+
+    dx_r = dx @ U
+    g_r = g @ U
+    H_r = U.T @ H @ U
+    expected = g_r.T @ dx_r + (dx_r.T @ H_r @ dx_r) / 2.
+    actual = InternalPES.get_df_pred(DummyPES(), dx, g, H)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+
 def test_range_space_projector_periodic_rank_deficient():
     """Periodic systems are also column-rank deficient when redundant internals
     (bonds/angles/dihedrals) are used: the intramolecular coordinates fail to

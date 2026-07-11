@@ -1419,9 +1419,8 @@ class InternalPES(PES):
             return None
         Unred = self.get_Unred()
         dx_r = dx @ Unred
-        g_r = g @ Unred
-        H_r = Unred.T @ H @ Unred
-        return g_r.T @ dx_r + (dx_r.T @ H_r @ dx_r) / 2.
+        dx_proj = Unred @ dx_r
+        return g.T @ dx_proj + (dx_proj.T @ H @ dx_proj) / 2.
 
     def get_projected_forces(self):
         """Returns Nx3 array of atomic forces orthogonal to constraints."""
