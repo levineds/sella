@@ -150,6 +150,31 @@ def _range_space_projector(B):
     return Q_r @ Q_r.T
 
 
+def _rigid_motion_nullspace(positions, tol=1e-10):
+    """Orthonormal rigid translation/rotation modes for Cartesian positions."""
+    n = len(positions)
+    if n == 0:
+        return np.empty((0, 0), dtype=np.float64)
+
+    modes = []
+    for dim in range(3):
+        mode = np.zeros((n, 3), dtype=np.float64)
+        mode[:, dim] = 1.0
+        modes.append(mode.ravel())
+
+    rel = np.asarray(positions, dtype=np.float64) - np.mean(positions, axis=0)
+    for axis in np.eye(3):
+        modes.append(np.cross(axis, rel).ravel())
+
+    Z0 = np.column_stack(modes)
+    Qz, Rz = np.linalg.qr(Z0, mode='reduced')
+    diag = np.abs(np.diag(Rz))
+    if diag.size == 0 or diag[0] == 0:
+        return np.empty((3 * n, 0), dtype=np.float64)
+    rank = int(np.sum(diag > tol * diag[0]))
+    return Qz[:, :rank]
+
+
 def _logm_3x3(F):
     """Closed-form 3x3 matrix logarithm via eigendecomposition.
 
@@ -809,6 +834,91 @@ class InternalPES(PES):
     # Cache optimization: Store and reuse Jacobian QR and pseudo-inverse
     # =========================================================================
 
+    def _rigid_nullspace_qr(self, B, rank_rtol=1e-6):
+        """QR/Binv for Jacobians whose nullspace is rigid-body motion.
+
+        For free internal-coordinate systems, the only Cartesian null modes are
+        often global translations and rotations.  If those explicit modes span
+        ``null(B)``, drop a well-conditioned set of gauge columns, QR the
+        reduced full-rank Jacobian, then project the particular inverse back to
+        the minimum-norm Cartesian inverse.  This avoids an SVD of the dense
+        QR factor while preserving the same range basis and Moore-Penrose
+        pseudoinverse.
+        """
+        ncart = B.shape[1]
+        if ncart == 0 or ncart % 3 != 0:
+            return None
+
+        if len(self.dummies):
+            positions = np.vstack((self.atoms.positions,
+                                   self.dummies.positions))
+        else:
+            positions = self.atoms.positions
+        Z = _rigid_motion_nullspace(positions)
+        nullity = Z.shape[1]
+        rank = ncart - nullity
+        if nullity == 0 or rank < 0 or rank > B.shape[0]:
+            return None
+
+        norm_B = np.linalg.norm(B)
+        if norm_B == 0:
+            return None
+        if np.linalg.norm(B @ Z) > 1e-8 * norm_B:
+            return None
+
+        try:
+            _, _, piv = qr(
+                Z.T, mode='economic', pivoting=True, check_finite=False
+            )
+            drop = np.asarray(piv[:nullity], dtype=int)
+            Z_drop = Z[drop, :]
+            if np.linalg.cond(Z_drop) > 1e8:
+                return None
+            keep_mask = np.ones(ncart, dtype=bool)
+            keep_mask[drop] = False
+            keep = np.flatnonzero(keep_mask)
+
+            B_keep = B[:, keep]
+            qr_pinv = _gpu_qr_with_pinv(B_keep)
+            if qr_pinv is None:
+                Q, R_keep = _gpu_qr(B_keep)
+                Binv_keep = None
+            else:
+                Q, R_keep, Binv_keep = qr_pinv
+
+            if R_keep.shape != (rank, rank):
+                return None
+            rdiag = np.abs(np.diag(R_keep))
+            if (rdiag.size == 0 or rdiag.max() == 0
+                    or rdiag.min() < rank_rtol * rdiag.max()):
+                return None
+
+            if Binv_keep is None:
+                Binv_keep = _gpu_solve_triangular(
+                    R_keep, Q.T, upper=True
+                )
+                if Binv_keep is None:
+                    Binv_keep = solve_triangular(
+                        R_keep, Q.T, check_finite=False
+                    )
+
+            X = np.zeros((ncart, B.shape[0]), dtype=B.dtype)
+            X[keep, :] = Binv_keep
+            Binv = X - Z @ (Z.T @ X)
+
+            # Rebuild a non-square R satisfying B = Q @ R.  Downstream
+            # constraint handling uses the non-square shape to choose the
+            # cached-Binv path, while Q remains the exact range(B) basis.
+            Z_keep = Z[keep, :]
+            T = np.linalg.solve(Z_drop.T, Z_keep.T).T
+            R = np.empty((rank, ncart), dtype=B.dtype)
+            R[:, keep] = R_keep
+            R[:, drop] = -(R_keep @ T)
+        except (RuntimeError, MemoryError, np.linalg.LinAlgError, ValueError):
+            return None
+
+        return Q, R, Binv
+
     def _get_jacobian_qr(self):
         """Get cached economy QR of internal Jacobian.
 
@@ -836,9 +946,15 @@ class InternalPES(PES):
             if Binv is not None:
                 self._pinv_cache.put(state_hash, Binv)
 
-        # Check for rank deficiency via R diagonal
+        # Check for rank deficiency.  Overcomplete free molecules usually give
+        # square R with a small diagonal; sparse/minimal internals can give a
+        # non-square R with explicit Cartesian null directions.
         rdiag = np.abs(np.diag(R))
-        if len(rdiag) > 0 and rdiag.min() < 1e-6 * rdiag.max():
+        rank_deficient = (
+            (R.size != 0 and R.shape[0] < R.shape[1])
+            or (len(rdiag) > 0 and rdiag.min() < 1e-6 * rdiag.max())
+        )
+        if rank_deficient:
             # Rank-deficient. Rather than re-factorizing the big (m x n) B
             # with a fresh SVD, reuse the economy QR already computed above
             # (on the GPU when available): with B = Q R and Q orthonormal,
@@ -848,15 +964,21 @@ class InternalPES(PES):
             # it to machine precision. This branch is rare for cell optimization
             # but common for free molecules (redundant internals + rigid-body
             # null space), where it fires essentially every step.
-            Ur, Sr, VTr = _robust_svd(R, full_matrices=False)
-            nnred = _svd_rank(Sr)
+            rigid_qr = self._rigid_nullspace_qr(B)
+            if rigid_qr is not None:
+                Q, R, Binv = rigid_qr
+                self._pinv_cache.put(state_hash, Binv)
+            else:
+                Ur, Sr, VTr = _robust_svd(R, full_matrices=False)
+                nnred = _svd_rank(Sr)
 
-            # Binv = pinv(R) @ Q.T, computed before Q/R are reassigned below.
-            Binv = (VTr[:nnred].T / Sr[:nnred]) @ (Ur[:, :nnred].T @ Q.T)
-            self._pinv_cache.put(state_hash, Binv)
+                # Binv = pinv(R) @ Q.T, computed before Q/R are reassigned below.
+                Binv = (VTr[:nnred].T / Sr[:nnred]) @ (Ur[:, :nnred].T @ Q.T)
+                self._pinv_cache.put(state_hash, Binv)
 
-            Q = Q @ Ur[:, :nnred]              # orthonormal basis for range(B) = Unred
-            R = np.diag(Sr[:nnred]) @ VTr[:nnred]  # (nnred, n) non-square -> signals deficiency
+                Q = Q @ Ur[:, :nnred]  # orthonormal basis for range(B) = Unred
+                # (nnred, n) non-square -> signals deficiency
+                R = np.diag(Sr[:nnred]) @ VTr[:nnred]
 
         self._qr_cache.put(state_hash, (Q, R))
         return Q, R

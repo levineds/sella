@@ -235,6 +235,59 @@ def test_allow_fragments_unwraps_pbc_split_molecule(optimize_cell):
     assert len(dyn.pes.int.internals['rotations']) == 3
 
 
+@pytest.mark.parametrize(
+    "symbols,positions,expected_nullity",
+    [
+        ('H2', [[0.0, 0.0, 0.0], [0.0, 0.0, 0.74]], 5),
+        (
+            'CH4CH4',
+            [
+                [0.00, 0.00, 0.00],
+                [0.63, 0.63, 0.63],
+                [-0.63, -0.63, 0.63],
+                [-0.63, 0.63, -0.63],
+                [0.63, -0.63, -0.63],
+                [5.00, 0.00, 0.00],
+                [5.63, 0.63, 0.63],
+                [4.37, -0.63, 0.63],
+                [4.37, 0.63, -0.63],
+                [5.63, -0.63, -0.63],
+            ],
+            6,
+        ),
+    ],
+)
+def test_rank_deficient_jacobian_uses_rigid_nullspace(
+    monkeypatch, symbols, positions, expected_nullity,
+):
+    """Global rigid-body null modes should not require an SVD fallback."""
+    from ase import Atoms
+    from ase.calculators.lj import LennardJones
+    from sella import Sella
+
+    atoms = Atoms(symbols, positions=positions)
+    atoms.calc = LennardJones()
+    dyn = Sella(
+        atoms, order=0, internal=True, allow_fragments=False,
+        logfile=None,
+    )
+
+    def fail_svd(*args, **kwargs):
+        raise AssertionError("rigid-nullspace path should avoid SVD")
+
+    monkeypatch.setattr("sella.peswrapper._robust_svd", fail_svd)
+    B = dyn.pes.int.jacobian()
+    Q, R = dyn.pes._get_jacobian_qr()
+    Binv = dyn.pes._get_Binv()
+
+    assert Q.shape[1] == B.shape[1] - expected_nullity
+    assert R.shape == (Q.shape[1], B.shape[1])
+    np.testing.assert_allclose(Q.T @ Q, np.eye(Q.shape[1]), atol=1e-10)
+    np.testing.assert_allclose(Q @ R, B, atol=1e-10)
+    np.testing.assert_allclose(B @ Binv @ B, B, atol=1e-10)
+    np.testing.assert_allclose(Binv @ B @ Binv, Binv, atol=1e-10)
+
+
 def test_copy_preserves_fragment_atom_groups():
     from ase import Atoms
     atoms = Atoms('OH2OH2',
