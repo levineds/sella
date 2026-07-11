@@ -201,6 +201,40 @@ def test_genuine_fragments_enable_rigid_fragments():
     assert pes.rigid_fragments is True
 
 
+@pytest.mark.parametrize("optimize_cell", [False, True])
+def test_allow_fragments_unwraps_pbc_split_molecule(optimize_cell):
+    """TRIC fragments must be contiguous before translations/rotations are used."""
+    from ase import Atoms
+    from ase.calculators.lj import LennardJones
+    from sella import Sella
+
+    atoms = Atoms(
+        'OH2',
+        positions=[
+            [9.70, 5.00, 5.00],
+            [0.66, 5.00, 5.00],  # bonded to O through +x periodic image
+            [9.70, 5.90, 5.00],
+        ],
+        cell=np.eye(3) * 10.0,
+        pbc=True,
+    )
+    atoms.calc = LennardJones()
+    initial_extent = np.ptp(atoms.positions, axis=0).max()
+    assert initial_extent > 9.0
+
+    dyn = Sella(
+        atoms, order=0, internal=True, optimize_cell=optimize_cell,
+        allow_fragments=True, logfile=None,
+    )
+
+    final_extent = np.ptp(atoms.positions, axis=0).max()
+    assert final_extent < 1.5
+    assert dyn.pes.int.fragment_atom_groups is not None
+    assert [len(g) for g in dyn.pes.int.fragment_atom_groups] == [3]
+    assert len(dyn.pes.int.internals['translations']) == 3
+    assert len(dyn.pes.int.internals['rotations']) == 3
+
+
 def test_copy_preserves_fragment_atom_groups():
     from ase import Atoms
     atoms = Atoms('OH2OH2',
