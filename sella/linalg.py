@@ -147,7 +147,7 @@ class ApproximateHessian(LinearOperator):
         B0: np.ndarray = None,
         update_method: str = 'TS-BFGS',
         symm: int = 2,
-        initialized: bool = False,
+        initialized=None,
     ) -> None:
         """A wrapper object for the approximate Hessian matrix."""
         self.dim = dim
@@ -155,7 +155,7 @@ class ApproximateHessian(LinearOperator):
         super().__init__(np.float64, (dim, dim))
         self.update_method = update_method
         self.symm = symm
-        self.initialized = initialized
+        self.initialized = False
         # Lazy eigendecomposition: only compute when needed
         self._evals = None
         self._evecs = None
@@ -171,7 +171,7 @@ class ApproximateHessian(LinearOperator):
         # device copy without immediately downloading the full dense matrix.
         self._cpu_current = True
 
-        self.set_B(B0)
+        self.set_B(B0, initialized=initialized)
 
     def _ensure_eigen_computed(self):
         """Compute eigendecomposition if not already done.
@@ -249,7 +249,7 @@ class ApproximateHessian(LinearOperator):
         if value is None:
             self._eigen_computed = False
 
-    def set_B(self, target):
+    def set_B(self, target, initialized=None):
         if target is None:
             self.B = None
             self._evals = None
@@ -263,8 +263,10 @@ class ApproximateHessian(LinearOperator):
             return
         elif np.isscalar(target):
             target = target * np.eye(self.dim)
+            if initialized is not None:
+                self.initialized = initialized
         else:
-            self.initialized = True
+            self.initialized = True if initialized is None else initialized
         assert target.shape == self.shape
         self.B = target
         self._cpu_current = True
@@ -303,17 +305,21 @@ class ApproximateHessian(LinearOperator):
         if not self.initialized:
             if self.B is None and self._B_gpu is None:
                 B = np.zeros(self.shape, dtype=self.dtype)
+                self.initialized = True
+                dx_cart = dx[:self.ncart]
+                dg_cart = dg[:self.ncart]
+                B[:self.ncart, :self.ncart] = update_H(
+                    None, dx_cart, dg_cart, method=self.update_method,
+                    symm=self.symm, lams=None, vecs=None
+                )
+                self.set_B(B)
+                return
             else:
-                B = self.asarray().copy()
-            self.initialized = True
-            dx_cart = dx[:self.ncart]
-            dg_cart = dg[:self.ncart]
-            B[:self.ncart, :self.ncart] = update_H(
-                None, dx_cart, dg_cart, method=self.update_method,
-                symm=self.symm, lams=None, vecs=None
-            )
-            self.set_B(B)
-            return
+                # A caller supplied an explicit initial Hessian but asked to
+                # keep the "not yet updated" flag.  Use that Hessian as the
+                # baseline for the first update; do not discard it and
+                # bootstrap from a single secant pair.
+                self.initialized = True
 
         # Keep the large eigensystem on GPU when the GPU TS-BFGS path is
         # available.  Downloading the full eigenvector matrix just to pass it

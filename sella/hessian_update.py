@@ -50,9 +50,21 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None,
     so the caller can refresh its GPU cache without re-uploading. Falls
     back to numpy if GPU unavailable or for other update methods.
     """
+    if np.linalg.norm(S) < 1e-8:
+        if B_gpu is not None:
+            if download_numpy:
+                if B is None:
+                    try:
+                        B = B_gpu.cpu().numpy()
+                    except (RuntimeError, MemoryError):
+                        _gpu_mod._record_oom(B_gpu.shape[0])
+                        raise
+                return B, B_gpu
+            return B, B_gpu
+        if B is None:
+            return np.eye(S.shape[0], dtype=np.float64)
+        return B
     if len(S.shape) == 1:
-        if np.linalg.norm(S) < 1e-8:
-            return B
         S = S[:, np.newaxis]
     if len(Y.shape) == 1:
         Y = Y[:, np.newaxis]

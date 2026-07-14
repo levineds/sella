@@ -4017,6 +4017,47 @@ class Internals(BaseInternals):
                 self.atoms.positions[j] += cumshifts[j] @ cell
                 queue.append(j)
 
+    def _remap_ncvecs_after_fragment_shifts(self, cumshifts):
+        """Keep periodic internal coordinates consistent after unwrapping.
+
+        Fragment unwrapping changes absolute Cartesian positions by integer
+        cell vectors. Every stored ncvec between consecutive atoms must be
+        shifted by the corresponding endpoint image changes so the represented
+        physical bond/angle/dihedral is unchanged.
+        """
+        zero = np.zeros(3, dtype=np.int32)
+        seen = set()
+        changed_names = set()
+
+        for name in ('bonds', 'angles', 'dihedrals'):
+            for collection in (self.internals[name], self.forbidden[name]):
+                for coord in collection:
+                    if id(coord) in seen:
+                        continue
+                    seen.add(id(coord))
+
+                    old = coord.kwargs['ncvecs']
+                    new = np.asarray(old, dtype=np.int32).copy()
+                    changed = False
+                    for k in range(len(new)):
+                        i = int(coord.indices[k])
+                        j = int(coord.indices[k + 1])
+                        shift_i = cumshifts.get(i, zero)
+                        shift_j = cumshifts.get(j, zero)
+                        if np.any(shift_i != 0) or np.any(shift_j != 0):
+                            new[k] = old[k] - shift_j + shift_i
+                            changed = True
+                    if changed and not np.array_equal(new, old):
+                        coord.kwargs['ncvecs'] = new
+                        changed_names.add(name)
+
+        for name in changed_names:
+            self._internals_set[name] = {
+                self._internal_key(coord) for coord in self.internals[name]
+            }
+        if changed_names:
+            self._invalidate_structure()
+
     def find_all_bonds(
         self,
         nbond_cart_thr: int = 6,
@@ -4129,17 +4170,7 @@ class Internals(BaseInternals):
             cumshifts = {}
 
         if cumshifts:
-            # Update bond ncvecs to match the new wrapped positions.
-            # ncvec_new = ncvec_old - cumshift[j] + cumshift[i]
-            zero = np.zeros(3, dtype=int)
-            for bond in self.internals['bonds']:
-                i, j = bond.indices
-                shift_i = cumshifts.get(i, zero)
-                shift_j = cumshifts.get(j, zero)
-                if np.any(shift_i != 0) or np.any(shift_j != 0):
-                    bond.kwargs['ncvecs'] = np.array(
-                        [bond.kwargs['ncvecs'][0] - shift_j + shift_i]
-                    )
+            self._remap_ncvecs_after_fragment_shifts(cumshifts)
 
     def find_all_angles(
         self,

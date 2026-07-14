@@ -597,6 +597,55 @@ class TestFindAllBondsIdempotent:
         InternalPES(atoms, ic)
 
 
+class TestPeriodicConstraintUnwrap:
+    """Periodic constraints must survive allow_fragments unwrapping."""
+
+    def test_fixed_angle_ncvec_remapped_after_fragment_unwrap(self):
+        atoms = Atoms(
+            'OH2',
+            positions=[
+                [9.70, 5.00, 5.00],
+                [0.66, 5.00, 5.00],
+                [9.70, 5.90, 5.00],
+            ],
+            cell=np.eye(3) * 10.0,
+            pbc=True,
+        )
+        cons = Constraints(atoms)
+        cons.fix_angle((1, 0, 2), mic=True)
+        np.testing.assert_allclose(cons.residual(), [0.0], atol=1e-12)
+
+        ints = Internals(atoms, cons=cons, allow_fragments=True)
+        ints.find_all_bonds()
+
+        assert np.ptp(atoms.positions, axis=0).max() < 2.0
+        np.testing.assert_allclose(cons.residual(), [0.0], atol=1e-12)
+        np.testing.assert_allclose(ints.cons.residual(), [0.0], atol=1e-12)
+
+    def test_fixed_dihedral_ncvec_remapped_after_fragment_unwrap(self):
+        atoms = Atoms(
+            'H4',
+            positions=[
+                [3.70, 0.00, 0.00],
+                [0.30, 0.00, 0.00],
+                [0.90, 0.30, 0.00],
+                [1.40, 0.30, 0.40],
+            ],
+            cell=np.eye(3) * 4.0,
+            pbc=True,
+        )
+        cons = Constraints(atoms)
+        cons.fix_dihedral((0, 1, 2, 3), mic=True)
+        np.testing.assert_allclose(cons.residual(), [0.0], atol=1e-12)
+
+        ints = Internals(atoms, cons=cons, allow_fragments=True)
+        ints.find_all_bonds()
+
+        assert np.ptp(atoms.positions, axis=0).max() < 2.0
+        np.testing.assert_allclose(cons.residual(), [0.0], atol=1e-12)
+        np.testing.assert_allclose(ints.cons.residual(), [0.0], atol=1e-12)
+
+
 class TestFixCartesian:
     """merge_ase_constraint must read ASE FixCartesian across API versions.
 

@@ -25,6 +25,48 @@ from sella.optimize import stepper as stepper_module
 class TestApproximateHessian:
     """Test ApproximateHessian operations."""
 
+    def test_dense_initialized_false_is_respected(self):
+        H0 = 2.0 * np.eye(2)
+        H = ApproximateHessian(2, 2, H0, initialized=False)
+
+        assert H.initialized is False
+        np.testing.assert_allclose(H.asarray(), H0)
+
+        H.update(np.zeros(2), np.ones(2))
+        assert H.initialized is True
+        np.testing.assert_allclose(H.asarray(), H0)
+
+        H.set_B(np.eye(2))
+        assert H.initialized is True
+
+    def test_tiny_uninitialized_update_is_finite_identity(self):
+        H = ApproximateHessian(3, 3)
+
+        H.update(np.zeros(3), np.ones(3))
+
+        assert H.initialized
+        np.testing.assert_allclose(H.asarray(), np.eye(3))
+        assert np.isfinite(H.asarray()).all()
+
+    def test_tiny_gpu_resident_update_is_noop(self):
+        class FakeGpuArray:
+            shape = (3, 3)
+
+        H = ApproximateHessian(3, 3, np.eye(3), initialized=True)
+        fake_gpu = FakeGpuArray()
+        H.B = None
+        H._cpu_current = False
+        H._B_gpu = fake_gpu
+        H._evals_gpu = object()
+        H._evecs_gpu = object()
+
+        H.update(np.zeros(3), np.ones(3))
+
+        assert H.initialized
+        assert H.B is None
+        assert H._B_gpu is fake_gpu
+        assert H._cpu_current is False
+
     def test_hessian_arithmetic(self):
         """Test that ApproximateHessian supports addition with arrays."""
         dim = 5
