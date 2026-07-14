@@ -2969,15 +2969,16 @@ class BaseInternals:
         """Wraps an internal coord. displacement vector into a valid domain."""
         start = 0
         for name in self._names:
-            n = len(self.internals[name])
+            active = self._active[name]
+            n = sum(active)
             if name == 'dihedrals':
                 vec[start:start + n] = (vec[start:start + n] + np.pi) % (2 * np.pi) - np.pi
             elif name == 'rotations' and n > 0:
-                self._wrap_rotation_diff(vec, start)
+                self._wrap_rotation_diff(vec, start, active)
             start += n
         return vec
 
-    def _wrap_rotation_diff(self, vec, rot_start):
+    def _wrap_rotation_diff(self, vec, rot_start, active=None):
         """Wrap rotation coordinate differences along rotation axis.
 
         The exponential map has period 2π along the rotation axis
@@ -2987,6 +2988,15 @@ class BaseInternals:
         rotations = self.internals['rotations']
         if not rotations:
             return
+        if active is None:
+            active = [True] * len(rotations)
+        active = np.asarray(active, dtype=bool)
+        local_index = {}
+        n_active = 0
+        for i, is_active in enumerate(active):
+            if is_active:
+                local_index[i] = n_active
+                n_active += 1
         # Group rotations by fragment (same indices and refpos)
         groups = {}
         for i, r in enumerate(rotations):
@@ -2994,10 +3004,11 @@ class BaseInternals:
             groups.setdefault(key, []).append(i)
 
         for key, indices in groups.items():
-            if len(indices) != 3:
+            active_indices = [i for i in indices if active[i]]
+            if len(active_indices) != 3:
                 continue
             # Get the 3-component rotation difference vector
-            idx = [rot_start + i for i in indices]
+            idx = [rot_start + local_index[i] for i in active_indices]
             v = vec[idx].copy()
             vnorm = np.linalg.norm(v)
             if vnorm < 1e-10:

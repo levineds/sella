@@ -10,12 +10,13 @@ These tests exercise key functionality including:
 import pytest
 import numpy as np
 
+from ase import Atoms
 from ase.build import molecule
 from ase.calculators.emt import EMT
 
 from sella import Sella
 from sella.linalg import ApproximateHessian, NumericalHessian, SparseInternalHessians
-from sella.internal import Internals
+from sella.internal import Constraints, Dihedral, Internals
 from sella.peswrapper import PES, InternalPES
 from sella.eigensolvers import exact, rayleigh_ritz
 from sella.optimize import stepper as stepper_module
@@ -217,6 +218,33 @@ class TestInternals:
         actual_inactive = internal.hessian_rdot_mat(v, mat)
         np.testing.assert_allclose(actual_inactive, expected_inactive,
                                    atol=1e-12)
+
+    def test_constraint_wrap_respects_inactive_inequality_offsets(self):
+        """Inactive constraints before a dihedral must not shift wrap offsets."""
+        atoms = Atoms(
+            'CCCC',
+            positions=[
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [2.0, 1.0, 0.2],
+            ],
+        )
+        current = Dihedral((0, 1, 2, 3)).calc(atoms)
+        cons = Constraints(atoms)
+        cons.fix_bond((0, 1), target=10.0, comparator='lt')
+        cons.fix_dihedral((0, 1, 2, 3),
+                          target=np.degrees(current) + 350.0)
+
+        cons.disable_satisfied_inequalities()
+
+        residual = cons.residual()
+        expected = (
+            (current - (current + np.deg2rad(350.0)) + np.pi)
+            % (2 * np.pi) - np.pi
+        )
+        assert cons._active_mask == [False, True]
+        np.testing.assert_allclose(residual, [expected], atol=1e-12)
 
 
 class TestPES:
