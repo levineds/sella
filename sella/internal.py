@@ -255,6 +255,18 @@ class Coordinate:
         str_out = ', '.join(out)
         return f'{self.__class__.__name__}({str_out})'
 
+    def copy(self) -> 'Coordinate':
+        new = self.__class__.__new__(self.__class__)
+        new.indices = self.indices.copy()
+        new.kwargs = {
+            key: val.copy() if hasattr(val, 'copy') else val
+            for key, val in self.kwargs.items()
+        }
+        if hasattr(self, 'q_prev'):
+            q_prev = self.q_prev
+            new.q_prev = None if q_prev is None else q_prev.copy()
+        return new
+
     @staticmethod
     def _eval0(pos: jnp.ndarray, **kwargs) -> float:
         raise NotImplementedError
@@ -3164,15 +3176,27 @@ class Constraints(BaseInternals):
         for ase_cons in atoms.constraints:
             self.merge_ase_constraint(ase_cons)
 
-    def copy(self) -> 'Constraints':
+    def copy(self, _coord_memo=None) -> 'Constraints':
+        if _coord_memo is None:
+            _coord_memo = {}
+
+        def clone(coord):
+            key = id(coord)
+            if key not in _coord_memo:
+                _coord_memo[key] = coord.copy()
+            return _coord_memo[key]
+
         new = self.__class__(
             self.atoms, self.dummies, self.dinds, self.ignore_rotation
         )
         for name in self._names:
-            new.internals[name] = self.internals[name].copy()
+            new.internals[name] = [
+                clone(coord) for coord in self.internals[name]
+            ]
             new._targets[name] = self._targets[name].copy()
             new._active[name] = self._active[name].copy()
             new._kind[name] = self._kind[name].copy()
+        new._invalidate_structure()
         return new
 
     @property
@@ -3499,23 +3523,42 @@ class Internals(BaseInternals):
         self.fragment_atom_groups = None
 
     def copy(self) -> 'Internals':
+        coord_memo = {}
+
+        def clone(coord):
+            key = id(coord)
+            if key not in coord_memo:
+                coord_memo[key] = coord.copy()
+            return coord_memo[key]
+
         new = self.__class__(
             self.atoms,
             self.dummies,
             self.atol * 180. / np.pi,
             self.dinds,
-            self.cons.copy(),
+            self.cons.copy(_coord_memo=coord_memo),
             self.allow_fragments,
         )
         for name in self._names:
-            new.internals[name] = self.internals[name].copy()
-            new._internals_set[name] = self._internals_set[name].copy()
-            new.forbidden[name] = self.forbidden[name].copy()
+            new.internals[name] = [
+                clone(coord) for coord in self.internals[name]
+            ]
+            if name in ('bonds', 'angles', 'dihedrals'):
+                new._internals_set[name] = {
+                    new._internal_key(coord)
+                    for coord in new.internals[name]
+                }
+            else:
+                new._internals_set[name] = self._internals_set[name].copy()
+            new.forbidden[name] = [
+                clone(coord) for coord in self.forbidden[name]
+            ]
             new._active[name] = self._active[name].copy()
         if self.fragment_atom_groups is not None:
             new.fragment_atom_groups = [
                 g.copy() for g in self.fragment_atom_groups
             ]
+        new._invalidate_structure()
         return new
 
     def add_rotation(
@@ -4057,6 +4100,7 @@ class Internals(BaseInternals):
             }
         if changed_names:
             self._invalidate_structure()
+            self.cons._invalidate_structure()
 
     def find_all_bonds(
         self,

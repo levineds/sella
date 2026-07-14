@@ -2658,6 +2658,8 @@ class CellInternalPES(_CellPESMixin, InternalPES):
                 saw_active = True
                 if name not in shape_constraint_names:
                     return False
+                if np.any(coord.kwargs['ncvecs'] != 0):
+                    return False
                 ids = frag_id[np.asarray(coord.indices, dtype=int)]
                 if np.any(ids < 0) or np.unique(ids).size != 1:
                     return False

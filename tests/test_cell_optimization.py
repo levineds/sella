@@ -1516,6 +1516,29 @@ class TestConstrainedCellGradient:
         assert Ucons.shape[1] == 1
         pes.get_g()  # must not raise
 
+    def test_periodic_image_intrafragment_constraint_not_shortcut(self):
+        # Same-fragment shape constraints are invariant under rigid cell motion
+        # only when their stored periodic image offsets are zero. An explicit
+        # image angle has a nonzero cell derivative and must take the full
+        # projection path.
+        cell = np.array([[10.0, 0, 0], [2.0, 10.0, 0], [0.5, 0.8, 10.0]])
+        atoms = Atoms('OH2',
+                      positions=[[1, 1, 1], [1.9, 1.2, 1], [0.6, 1.9, 1]],
+                      cell=cell, pbc=True)
+        atoms.calc = LennardJones()
+        cons = Constraints(atoms)
+        cons.fix_angle((1, 0, 2), ncvecs=[[1, 0, 0], [0, 0, 0]])
+        ic = Internals(atoms, cons=cons, allow_fragments=True)
+        ic.find_all_bonds(); ic.find_all_angles(); ic.find_all_dihedrals()
+        pes = CellInternalPES(atoms, internals=ic, eta=1e-4,
+                              auto_find_internals=False,
+                              rigid_fragments=True)
+
+        assert not pes._constraints_are_intrafragment_shape_constraints()
+        X_C = pes._unprojected_cell_motion_derivative()
+        Rc_C = pes.cons.jacobian() @ X_C + pes.cons.cell_jacobian()
+        assert np.linalg.norm(Rc_C) > 1e-8
+
 
 class TestSingletonFragmentCellMotion:
     """Isolated one-atom fragments must move rigidly with the cell.
