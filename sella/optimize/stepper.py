@@ -9,6 +9,29 @@ logger = logging.getLogger(__name__)
 from sella.linalg import ApproximateHessian
 
 
+def _eigh_symmetric(
+    A: np.ndarray,
+    sym_rtol: float = 1e-10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Symmetric eigensolver with LAPACK-driver fallback."""
+    asym = np.linalg.norm(A - A.T, ord='fro')
+    scale = max(np.linalg.norm(A, ord='fro'), 1.0)
+    if not np.isfinite(asym) or asym > sym_rtol * scale:
+        raise ValueError(
+            "Symmetric eigensolver received a non-symmetric matrix: "
+            f"||A - A.T||_F={asym:.3e}, ||A||_F={scale:.3e}"
+        )
+    try:
+        return eigh(A)
+    except np.linalg.LinAlgError:
+        for driver in ('evd', 'evx', 'ev'):
+            try:
+                return eigh(A, driver=driver)
+            except np.linalg.LinAlgError:
+                continue
+        return np.linalg.eigh(A)
+
+
 # Classes for optimization algorithms (e.g. MMF, Newton, RFO)
 class BaseStepper:
     alpha0: Optional[float] = None
@@ -79,7 +102,7 @@ class QuasiNewton(BaseStepper):
         # If not already computed, compute them now
         if self.H.evals is None:
             H_array = self.H.asarray()
-            self.H.evals, self.H.evecs = eigh(H_array)
+            self.H.evals, self.H.evecs = _eigh_symmetric(H_array)
 
         self.L = np.abs(self.H.evals)
         self.L[:self.order] *= -1
@@ -130,7 +153,7 @@ class RationalFunctionOptimization(BaseStepper):
     def get_s(self, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
         A = self.A * alpha
         A[:-1, :-1] *= alpha
-        L, V = eigh(A)
+        L, V = _eigh_symmetric(A)
 
         idx = self.order
         # For saddle-point search (order > 0): when eigenvalues near the

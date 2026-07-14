@@ -1,7 +1,7 @@
 from typing import (
     Tuple, Callable, Iterator, Union, TypeVar, Optional, List, Dict, Type
 )
-from itertools import product, combinations
+from itertools import product, combinations, permutations
 from functools import partialmethod
 import warnings
 
@@ -4160,76 +4160,21 @@ class Internals(BaseInternals):
                     linear.append((b1, b2))
             if linear:
                 if len(jbonds) == 2:
-                    # Add a dummy atom to an atom center with only 2 bonds
-                    # sort bonds from shortest to longest to ensure
-                    # permutational invariance
-                    b1, b2 = sorted(jbonds, key=lambda x: x.calc(self.atoms))
-                    # First try to take the cross product of the two bond
-                    # vectors. These two vectors are close to collinear, and
-                    # may be exactly collinear, so there's a backup strategy
-                    # if this results in the zero-vector.
-                    if self.dinds[j] < 0:
-                        self.dinds[j] = self.natoms + self.ndummies
-                        dx1 = -b1.calc_vec(self.atoms)
-                        dx1 /= np.linalg.norm(dx1)
-                        dx2 = b2.calc_vec(self.atoms)
-                        dx2 /= np.linalg.norm(dx2)
-                        dpos = np.cross(dx1, dx2)
-                        dpos_norm = np.linalg.norm(dpos)
-                        if dpos_norm < 1e-4:
-                            # the aforementioned backup strategy
-                            # pick the cartesian basis vector that is maximally
-                            # orthogonal with the shorter of the two
-                            # displacement vectors.
-                            # note: this is not rotationally invariant, but
-                            # there's not much we can do about that
-                            dim = np.argmin(np.abs(dx1))
-                            dpos[:] = 0.
-                            dpos[dim] = 1.
-                            dpos -= dx1 * (dpos @ dx1)
-                            dpos /= np.linalg.norm(dpos)
-                        else:
-                            dpos /= dpos_norm
-                        # Add the dummy atom
-                        dpos += self.atoms.positions[j]
-                        self.dummies += Atom('X', dpos)
-                        self._invalidate_structure()
-                    # Create and fix dummy bond
-                    dbond = Bond((j, self.dinds[j]))
-                    self.cons.fix_bond(dbond, replace_ok=False)
-                    self.add_bond(dbond)
-                    # Fix one dummy angle (only one — for linear O1-C-O2
-                    # the angles O1-C-dummy and O2-C-dummy are supplementary,
-                    # so constraining both over-constrains real atoms)
-                    dangle1 = b1 + dbond
-                    self.cons.fix_angle(dangle1, replace_ok=False)
-                    # Fix the improper dihedral and update relevant internals
-                    if b2.indices[1] == j:
-                        b2 = b2.reverse()
-                    dbond2 = Bond(
-                        (self.dinds[j], b2.indices[1]), b2.kwargs['ncvecs']
-                    )
-                    dangle3 = dbond + dbond2
-                    ddihedral = dangle1 + dangle3
-                    self.add_dihedral(ddihedral)
-                    self.add_dummy_to_internals(j)
-                    self.cons.add_dummy_to_internals(j)
-                    # Add relevant angles
-                    for b1 in jbonds:
-                        new = b1 + dbond
-                        assert new.indices[1] == j
-                        angle = new.calc(self.all_atoms)
-                        if self.atol < angle < np.pi - self.atol:
-                            try:
-                                self.add_angle(new)
-                            except DuplicateInternalError:
-                                pass
-                        else:
-                            self.forbid_angle(new)
+                    self._add_linear_bend_dummy(j, jbonds, *jbonds)
                 else:
+                    dummy_added = False
                     for b1, b2 in linear:
                         for b3 in jbonds:
                             if b3 in (b1, b2):
+                                continue
+                            ordered = (
+                                (int(b1.indices[1]), b1.kwargs['ncvecs'][0]),
+                                (int(b3.indices[1]), b3.kwargs['ncvecs'][0]),
+                                (int(b2.indices[1]), b2.kwargs['ncvecs'][0]),
+                            )
+                            if not self._improper_dihedral_well_defined(
+                                j, ordered
+                            ):
                                 continue
                             indices = (
                                 b1.indices[1], j, b3.indices[1], b2.indices[1]
@@ -4245,10 +4190,85 @@ class Internals(BaseInternals):
                                 pass
                             break
                         else:
-                            raise RuntimeError(
-                                "Unable to find improper dihedral to replace "
-                                "linear angle!"
-                            )
+                            # No existing third bond gives two well-defined
+                            # dihedral planes. Fall back to the dummy linear
+                            # bend machinery instead of adding an undefined
+                            # improper with NaN derivatives.
+                            if not dummy_added:
+                                self._add_linear_bend_dummy(
+                                    j, jbonds, b1, b2
+                                )
+                                dummy_added = True
+                            continue
+
+    def _add_linear_bend_dummy(self, j, jbonds, b1, b2):
+        """Add the dummy-coordinate representation for a linear bend."""
+        # Sort the defining bonds from shortest to longest to keep the dummy
+        # orientation deterministic when both sides are equivalent.
+        b1, b2 = sorted((b1, b2), key=lambda x: x.calc(self.atoms))
+        if self.dinds[j] < 0:
+            self.dinds[j] = self.natoms + self.ndummies
+            dx1 = -b1.calc_vec(self.atoms)
+            dx1 /= np.linalg.norm(dx1)
+            dx2 = b2.calc_vec(self.atoms)
+            dx2 /= np.linalg.norm(dx2)
+            dpos = np.cross(dx1, dx2)
+            dpos_norm = np.linalg.norm(dpos)
+            if dpos_norm < 1e-4:
+                # Pick the cartesian basis vector that is maximally orthogonal
+                # with the shorter of the two displacement vectors.
+                dim = np.argmin(np.abs(dx1))
+                dpos[:] = 0.
+                dpos[dim] = 1.
+                dpos -= dx1 * (dpos @ dx1)
+                dpos /= np.linalg.norm(dpos)
+            else:
+                dpos /= dpos_norm
+            self.dummies += Atom('X', self.atoms.positions[j] + dpos)
+            self._invalidate_structure()
+
+        dbond = Bond((j, self.dinds[j]))
+        try:
+            self.cons.fix_bond(dbond, replace_ok=False)
+        except DuplicateInternalError:
+            pass
+        try:
+            self.add_bond(dbond)
+        except DuplicateInternalError:
+            pass
+
+        # Fix one dummy angle. For linear O1-C-O2, the two dummy angles are
+        # supplementary, so constraining both over-constrains real atoms.
+        dangle1 = b1 + dbond
+        try:
+            self.cons.fix_angle(dangle1, replace_ok=False)
+        except DuplicateInternalError:
+            pass
+
+        if b2.indices[1] == j:
+            b2 = b2.reverse()
+        dbond2 = Bond(
+            (self.dinds[j], b2.indices[1]), b2.kwargs['ncvecs']
+        )
+        dangle3 = dbond + dbond2
+        try:
+            self.add_dihedral(dangle1 + dangle3)
+        except DuplicateInternalError:
+            pass
+        self.add_dummy_to_internals(j)
+        self.cons.add_dummy_to_internals(j)
+
+        for bond in jbonds:
+            new = bond + dbond
+            assert new.indices[1] == j
+            angle = new.calc(self.all_atoms)
+            if self.atol < angle < np.pi - self.atol:
+                try:
+                    self.add_angle(new)
+                except DuplicateInternalError:
+                    pass
+            else:
+                self.forbid_angle(new)
 
     def find_all_dihedrals(self) -> None:
         # First, find proper dihedrals from angle combinations.
@@ -4332,21 +4352,50 @@ class Internals(BaseInternals):
             if center in dihedral_centers:
                 continue
 
-            # Add improper dihedral: neighbors[0]-center-neighbors[1]-neighbors[2]
-            n0, ncvec0 = neighbors[center][0]
-            n1, ncvec1 = neighbors[center][1]
-            n2, ncvec2 = neighbors[center][2]
-            # Improper dihedral indices: (n0, center, n1, n2)
-            # The ncvecs connect consecutive atoms in the dihedral
-            imp_ncvecs = (
-                -ncvec0,  # from n0 to center
-                ncvec1,   # from center to n1
-                ncvec2 - ncvec1,  # from n1 to n2
-            )
-            try:
-                self.add_dihedral((n0, center, n1, n2), imp_ncvecs)
-            except DuplicateInternalError:
-                pass
+            for n0, n1, n2 in permutations(neighbors[center], 3):
+                if not self._improper_dihedral_well_defined(
+                    center, (n0, n1, n2)
+                ):
+                    continue
+                i0, ncvec0 = n0
+                i1, ncvec1 = n1
+                i2, ncvec2 = n2
+                # Improper dihedral indices: (i0, center, i1, i2)
+                # The ncvecs connect consecutive atoms in the dihedral.
+                imp_ncvecs = (
+                    -ncvec0,          # from i0 to center
+                    ncvec1,           # from center to i1
+                    ncvec2 - ncvec1,  # from i1 to i2
+                )
+                try:
+                    self.add_dihedral((i0, center, i1, i2), imp_ncvecs)
+                except DuplicateInternalError:
+                    continue
+                break
+
+    def _improper_dihedral_well_defined(
+        self,
+        center: int,
+        ordered_neighbors,
+        rel_tol: float = 1e-8,
+    ) -> bool:
+        """Return True if an improper-dihedral ordering has two valid planes."""
+        pos = self.atoms.positions
+        cell = self.atoms.cell.array
+        vecs = []
+        for neighbor, ncvec in ordered_neighbors:
+            vecs.append(pos[neighbor] - pos[center] + ncvec @ cell)
+
+        def noncollinear(a, b):
+            denom = np.linalg.norm(a) * np.linalg.norm(b)
+            if denom <= 1e-12:
+                return False
+            return np.linalg.norm(np.cross(a, b)) > rel_tol * denom
+
+        return (
+            noncollinear(vecs[0], vecs[1])
+            and noncollinear(vecs[1], vecs[2])
+        )
 
     def validate_basis(self) -> None:
         jac = self.jacobian()

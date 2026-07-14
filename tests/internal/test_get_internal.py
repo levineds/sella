@@ -160,6 +160,29 @@ class TestTRICs:
         assert len(ints.internals['translations']) == 6  # 3 per fragment × 2 fragments
         assert len(ints.internals['rotations']) == 6     # 3 per fragment × 2 fragments
 
+    def test_mst_weld_improper_dihedral_avoids_collinear_ordering(self):
+        """Improper dihedrals from welded fragments must have valid planes."""
+        atoms = Atoms(
+            symbols=['O', 'H', 'H', 'O', 'H', 'H'],
+            positions=[
+                [9.70, 5.00, 5.00],
+                [10.66, 5.00, 5.00],
+                [9.70, 5.90, 5.00],
+                [5.00, 5.00, 5.00],
+                [5.96, 5.00, 5.00],
+                [5.00, 5.96, 5.00],
+            ],
+            cell=np.eye(3) * 10.0,
+            pbc=True,
+        )
+
+        ints = Internals(atoms, allow_fragments=False)
+        ints.find_all_bonds()
+        ints.find_all_angles()
+        ints.find_all_dihedrals()
+
+        assert np.isfinite(ints.jacobian()).all()
+
     def test_validate_basis_with_trics(self):
         """Test that validate_basis correctly calculates DOF with TRICs."""
         # Two water molecules far apart - use explicit element list for clarity

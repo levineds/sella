@@ -18,6 +18,7 @@ from sella.linalg import ApproximateHessian, NumericalHessian, SparseInternalHes
 from sella.internal import Internals
 from sella.peswrapper import PES, InternalPES
 from sella.eigensolvers import exact, rayleigh_ritz
+from sella.optimize import stepper as stepper_module
 
 
 class TestApproximateHessian:
@@ -91,6 +92,35 @@ class TestApproximateHessian:
         # Verify eigendecomposition
         reconstructed = evecs @ np.diag(evals) @ evecs.T
         np.testing.assert_allclose(H.B, reconstructed, atol=1e-10)
+
+    def test_stepper_eigh_falls_back_after_lapack_error(self, monkeypatch):
+        """PRFO should retry a robust LAPACK driver after dsyevr failures."""
+        real_eigh = stepper_module.eigh
+        calls = []
+
+        def flaky_eigh(A, *args, **kwargs):
+            calls.append(kwargs.get('driver'))
+            if kwargs.get('driver') is None:
+                raise np.linalg.LinAlgError("Internal Error.")
+            return real_eigh(A, *args, **kwargs)
+
+        monkeypatch.setattr(stepper_module, 'eigh', flaky_eigh)
+        A = np.array([[2.0, 0.1], [0.1, -1.0]])
+
+        vals, vecs = stepper_module._eigh_symmetric(A)
+
+        assert calls[:2] == [None, 'evd']
+        np.testing.assert_allclose(
+            vecs @ np.diag(vals) @ vecs.T,
+            A,
+            atol=1e-12,
+        )
+
+    def test_stepper_eigh_rejects_asymmetric_matrix(self):
+        A = np.array([[1.0, 1e-4], [0.0, 2.0]])
+
+        with pytest.raises(ValueError, match="non-symmetric"):
+            stepper_module._eigh_symmetric(A)
 
 
 class TestSparseInternalHessians:
