@@ -41,7 +41,8 @@ def symmetrize_Y(S, Y, symm):
 
 
 def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None,
-             B_gpu=None, evals_gpu=None, evecs_gpu=None):
+             B_gpu=None, evals_gpu=None, evecs_gpu=None,
+             download_numpy=True):
     """Quasi-Newton update.
 
     Optional GPU-resident path: when B_gpu (torch CUDA tensor) is supplied,
@@ -58,7 +59,12 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None,
 
     Ytilde = symmetrize_Y(S, Y, symm)
 
-    if B is None:
+    gpu_ts_bfgs = (
+        method == 'TS-BFGS' and B_gpu is not None
+        and evals_gpu is not None and evecs_gpu is not None
+    )
+
+    if B is None and not gpu_ts_bfgs:
         # Approximate B as a scaled identity matrix, where the
         # scalar is the average Ritz value from S.T @ Y
         thetas, _ = eigh(S.T @ Ytilde)
@@ -70,12 +76,20 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None,
         B = lam0 * np.eye(d)
 
     # GPU-resident TS-BFGS path: requires B_gpu and (evals_gpu, evecs_gpu).
-    if (method == 'TS-BFGS' and B_gpu is not None
-            and evals_gpu is not None and evecs_gpu is not None):
+    if gpu_ts_bfgs:
         result = _gpu_update_TS_BFGS(B_gpu, S, Ytilde, evals_gpu,
-                                     evecs_gpu)
+                                     evecs_gpu,
+                                     download_numpy=download_numpy)
         if result is not None:
             return result  # (Bplus_numpy, Bplus_gpu)
+        if B is None:
+            # Rare GPU fallback path. Download the current Hessian only when
+            # needed so the normal GPU path can keep B device-resident.
+            try:
+                B = B_gpu.cpu().numpy()
+            except (RuntimeError, MemoryError):
+                _gpu_mod._record_oom(B_gpu.shape[0])
+                raise
 
     if lams is None or vecs is None:
         lams, vecs = eigh(B)
@@ -166,7 +180,8 @@ def _MS_Powell(B, S, Y):  # pragma: no cover
     return (Y - B @ S) @ S.T
 
 
-def _gpu_update_TS_BFGS(B_gpu, S, Y, evals_gpu, evecs_gpu):
+def _gpu_update_TS_BFGS(B_gpu, S, Y, evals_gpu, evecs_gpu,
+                        download_numpy=True):
     """GPU-resident TS-BFGS update + symmetrize, returning numpy + torch.
 
     Mirrors `_MS_TS_BFGS` but does the heavy matmuls and lstsq on device,
@@ -206,8 +221,10 @@ def _gpu_update_TS_BFGS(B_gpu, S, Y, evals_gpu, evecs_gpu):
         # Symmetrize on device.
         Bplus_t = 0.5 * (Bplus_t + Bplus_t.T)
 
-        # Single download of the new B.
-        Bplus = Bplus_t.cpu().numpy()
+        # Download only when the caller needs an immediate CPU copy.  The
+        # optimizer's hot path can use Bplus_t for projection, eigensolve, and
+        # Hessian-vector products, and materialize numpy lazily if requested.
+        Bplus = Bplus_t.cpu().numpy() if download_numpy else None
         return Bplus, Bplus_t
     except (RuntimeError, MemoryError):
         _gpu_mod._record_oom(B_gpu.shape[0])

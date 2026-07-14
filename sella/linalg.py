@@ -167,6 +167,9 @@ class ApproximateHessian(LinearOperator):
         # GPU-resident TS-BFGS update can read them without re-uploading.
         self._evals_gpu = None
         self._evecs_gpu = None
+        # True when self.B is the current Hessian.  GPU TS-BFGS can update the
+        # device copy without immediately downloading the full dense matrix.
+        self._cpu_current = True
 
         self.set_B(B0)
 
@@ -177,7 +180,9 @@ class ApproximateHessian(LinearOperator):
         on device for downstream consumers (e.g. _MS_TS_BFGS), while still
         producing the numpy copies the rest of Sella expects.
         """
-        if self._eigen_computed or self.B is None:
+        if self._eigen_computed:
+            return
+        if self.B is None and self._B_gpu is None:
             return
         B_gpu = self._get_B_gpu()
         if B_gpu is not None:
@@ -190,7 +195,7 @@ class ApproximateHessian(LinearOperator):
                 self._eigen_computed = True
                 return
         # CPU fallback (no GPU or OOM)
-        self._evals, self._evecs = gpu_eigh(self.B, A_gpu=None)
+        self._evals, self._evecs = gpu_eigh(self.asarray(), A_gpu=None)
         self._eigen_computed = True
 
     def _get_B_gpu(self):
@@ -199,11 +204,26 @@ class ApproximateHessian(LinearOperator):
         Returns None when no GPU is available, when B is below the size
         threshold, or when an upload attempt has previously OOM'd.
         """
+        if self._B_gpu is not None:
+            return self._B_gpu
         if self.B is None:
             return None
-        if self._B_gpu is None and _gpu_mod._gpu_ok(self.B.shape[0]):
-            self._B_gpu = to_gpu(self.B)
+        if _gpu_mod._gpu_ok(self.B.shape[0]):
+            self._B_gpu = to_gpu(self.asarray())
         return self._B_gpu
+
+    def _sync_B_cpu(self):
+        """Materialize a current numpy copy of B when it is GPU-resident."""
+        if self._cpu_current:
+            return
+        if self._B_gpu is None:
+            raise RuntimeError("Hessian CPU copy is stale and no GPU copy exists")
+        try:
+            self.B = self._B_gpu.cpu().numpy()
+        except (RuntimeError, MemoryError):
+            _gpu_mod._record_oom(self._B_gpu.shape[0])
+            raise
+        self._cpu_current = True
 
     @property
     def evals(self):
@@ -238,6 +258,7 @@ class ApproximateHessian(LinearOperator):
             self._B_gpu = None
             self._evals_gpu = None
             self._evecs_gpu = None
+            self._cpu_current = True
             self.initialized = False
             return
         elif np.isscalar(target):
@@ -246,6 +267,7 @@ class ApproximateHessian(LinearOperator):
             self.initialized = True
         assert target.shape == self.shape
         self.B = target
+        self._cpu_current = True
         # Mark eigendecomposition as stale - will recompute on next access
         self._eigen_computed = False
         # B has changed, so the GPU copies are stale. Don't re-upload eagerly:
@@ -260,8 +282,14 @@ class ApproximateHessian(LinearOperator):
         Used by `update()` to avoid the round-trip when the GPU TS-BFGS path
         produced both a numpy result and the same tensor on device.
         """
-        assert B_numpy.shape == self.shape
-        self.B = B_numpy
+        if B_numpy is not None:
+            assert B_numpy.shape == self.shape
+            self.B = B_numpy
+            self._cpu_current = True
+        else:
+            assert B_gpu is not None and tuple(B_gpu.shape) == self.shape
+            self.B = None
+            self._cpu_current = False
         self.initialized = True
         self._B_gpu = B_gpu
         self._eigen_computed = False
@@ -272,11 +300,11 @@ class ApproximateHessian(LinearOperator):
 
     def update(self, dx, dg):
         """Perform a quasi-Newton update on B"""
-        if self.B is None:
-            B = np.zeros(self.shape, dtype=self.dtype)
-        else:
-            B = self.B.copy()
         if not self.initialized:
+            if self.B is None and self._B_gpu is None:
+                B = np.zeros(self.shape, dtype=self.dtype)
+            else:
+                B = self.asarray().copy()
             self.initialized = True
             dx_cart = dx[:self.ncart]
             dg_cart = dg[:self.ncart]
@@ -293,6 +321,7 @@ class ApproximateHessian(LinearOperator):
         # falls back.
         lams = None
         vecs = None
+        B = None
         B_gpu = self._get_B_gpu()
         if B_gpu is not None:
             if self._evals_gpu is None or self._evecs_gpu is None:
@@ -300,14 +329,22 @@ class ApproximateHessian(LinearOperator):
                 if evals_t is not None:
                     self._evals_gpu = evals_t
                     self._evecs_gpu = evecs_t
-        else:
+            if not (
+                self.update_method == 'TS-BFGS'
+                and self._evals_gpu is not None
+                and self._evecs_gpu is not None
+            ):
+                B = self.asarray().copy()
+        if B_gpu is None:
+            B = self.asarray().copy()
             lams, vecs = self.evals, self.evecs
 
         result = update_H(B, dx, dg, method=self.update_method,
                           symm=self.symm, lams=lams, vecs=vecs,
                           B_gpu=self._B_gpu,
                           evals_gpu=self._evals_gpu,
-                          evecs_gpu=self._evecs_gpu)
+                          evecs_gpu=self._evecs_gpu,
+                          download_numpy=False)
         if isinstance(result, tuple):
             Bplus_numpy, Bplus_gpu = result
             self._set_from_gpu(Bplus_numpy, Bplus_gpu)
@@ -319,31 +356,49 @@ class ApproximateHessian(LinearOperator):
         m, n = U.shape
         assert m == self.dim
 
-        if self.B is None:
+        if self.B is None and self._B_gpu is None:
             Bproj = None
         else:
-            Bproj = U.T @ self.B @ U
+            Bproj = U.T @ self.asarray() @ U
 
         return ApproximateHessian(n, 0, Bproj, self.update_method,
                                   self.symm)
 
     def asarray(self):
         if self.B is not None:
+            self._sync_B_cpu()
+            return self.B
+        if self._B_gpu is not None:
+            self._sync_B_cpu()
             return self.B
         return np.eye(self.dim)
 
     def _matvec(self, v):
-        if self.B is None:
+        if self.B is None and self._B_gpu is None:
             return v
-        return self.B @ v
+        if not self._cpu_current and self._B_gpu is not None:
+            vt = to_gpu(v)
+            if vt is not None:
+                try:
+                    return (self._B_gpu @ vt).cpu().numpy()
+                except (RuntimeError, MemoryError):
+                    _gpu_mod._record_oom(self._B_gpu.shape[0])
+        return self.asarray() @ v
 
     def _rmatvec(self, v):
         return self.matvec(v)
 
     def _matmat(self, X):
-        if self.B is None:
+        if self.B is None and self._B_gpu is None:
             return X
-        return self.B @ X
+        if not self._cpu_current and self._B_gpu is not None:
+            Xt = to_gpu(X)
+            if Xt is not None:
+                try:
+                    return (self._B_gpu @ Xt).cpu().numpy()
+                except (RuntimeError, MemoryError):
+                    _gpu_mod._record_oom(self._B_gpu.shape[0])
+        return self.asarray() @ X
 
     def _rmatmat(self, X):
         return self.matmat(X)
@@ -352,12 +407,15 @@ class ApproximateHessian(LinearOperator):
         initialized = self.initialized
         if isinstance(other, ApproximateHessian):
             initialized = initialized and other.initialized
-            other = other.B
+            if other.B is None and other._B_gpu is None:
+                other = None
+            else:
+                other = other.asarray()
         if not self.initialized or other is None:
             tot = None
             initialized = False
         else:
-            tot = self.B + other
+            tot = self.asarray() + other
         return ApproximateHessian(
             self.dim, self.ncart, tot, self.update_method, self.symm,
             initialized=initialized,

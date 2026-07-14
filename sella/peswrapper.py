@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 from sella._constants import _LSTSQ_RCOND
 
 
+def _hessian_matvec(H, v):
+    if hasattr(H, 'matvec'):
+        return H.matvec(v)
+    return H @ v
+
+
 def _robust_svd(M, full_matrices=True):
     """SVD that falls back to the QR-based LAPACK driver on non-convergence.
 
@@ -521,11 +527,12 @@ class PES:
         full (dim, dim) HL matrix and the intermediate ApproximateHessian.
         """
         H = self.get_H()
-        H_B = H.B
-        if H_B is None:
+        H_gpu = H._get_B_gpu()
+        H_B = H.B if getattr(H, '_cpu_current', True) else None
+        if H_B is None and H_gpu is None:
             Bproj = None
         else:
-            UtHU = gpu_project(H_B, U, H_gpu=H._get_B_gpu())
+            UtHU = gpu_project(H_B, U, H_gpu=H_gpu)
             # Skip the constraint projection entirely when there are no
             # constraints — Hc is allocated as a (dim, dim) zero block in
             # CellInternalPES, so the matmul would just churn through ~N^3
@@ -731,13 +738,14 @@ class PES:
     def get_df_pred(self, dx, g, H):
         if H is None:
             return None
-        return g.T @ dx + (dx.T @ H @ dx) / 2.
+        Hdx = _hessian_matvec(H, dx)
+        return g.T @ dx + (dx.T @ Hdx) / 2.
 
     def kick(self, dx, diag=False, **diag_kwargs):
         x0 = self.get_x()
         f0 = self.get_f()
         g0 = self.get_g()
-        B0 = self.H.asarray()
+        B0 = self.H
 
         dx_initial, dx_final, g_par = self.set_x(x0 + dx)
 
@@ -1542,7 +1550,8 @@ class InternalPES(PES):
         Unred = self.get_Unred()
         dx_r = dx @ Unred
         dx_proj = Unred @ dx_r
-        return g.T @ dx_proj + (dx_proj.T @ H @ dx_proj) / 2.
+        Hdx = _hessian_matvec(H, dx_proj)
+        return g.T @ dx_proj + (dx_proj.T @ Hdx) / 2.
 
     def get_projected_forces(self):
         """Returns Nx3 array of atomic forces orthogonal to constraints."""
@@ -1866,7 +1875,7 @@ class _CellPESMixin:
         if max_deviation <= angle_threshold:
             return False
 
-        H = self.H.B.copy()
+        H = self.H.asarray().copy()
         n = self.n_coords
         T_masked = _niggli_hessian_transform(
             self.atoms, self.orig_cell, self.exp_cell_factor, self.cell_mask

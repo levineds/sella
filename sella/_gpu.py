@@ -283,7 +283,7 @@ def gpu_project(H, U, H_gpu=None):
     skipped — this is the main motivation for the helper, since the same H
     is read by both the BFGS eigh and the projection in the same step.
     """
-    n = H.shape[0]
+    n = H_gpu.shape[0] if H_gpu is not None else H.shape[0]
     if H_gpu is not None or _gpu_ok(n):
         try:
             Ht = H_gpu if H_gpu is not None else to_gpu(H)
@@ -294,4 +294,6 @@ def gpu_project(H, U, H_gpu=None):
                 return R_t.cpu().numpy()
         except (RuntimeError, MemoryError):
             _record_oom(n)
+    if H is None:
+        H = H_gpu.cpu().numpy()
     return U.T @ H @ U
