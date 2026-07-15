@@ -2964,8 +2964,7 @@ class CellCartesianPES(_CellPESMixin, PES):
     atoms : Atoms
         ASE Atoms object with periodic boundary conditions.
     exp_cell_factor : float, optional
-        Scaling factor for cell parameterization. Default is sqrt(n_atoms)
-        when rigid_fragments is active, else n_atoms.
+        Scaling factor for cell parameterization. Default is n_atoms.
     cell_mask : ndarray, optional
         Boolean mask of shape (3, 3) indicating which cell DOF are free.
         Default is all True (full cell optimization).

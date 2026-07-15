@@ -93,7 +93,8 @@ class Sella(Optimizer):
             Boolean mask of shape (3, 3) indicating which cell DOF are free.
             Default is all True (full cell optimization).
         exp_cell_factor : float, optional
-            Scaling factor for cell parameterization. Default is number of atoms.
+            Scaling factor for cell parameterization. Default is sqrt(n_atoms)
+            for rigid-fragment internal cell optimization, otherwise n_atoms.
         scalar_pressure : float, optional
             External pressure in eV/Å³ for cell optimization. Default is 0.
         smax : float, optional
