@@ -571,6 +571,17 @@ class TestFindAllBondsIdempotent:
             ],
         )
 
+    def _linear_co2(self, pbc=False):
+        atoms = Atoms(
+            'OCO',
+            positions=[[1.0, 2.0, 0.0],
+                       [2.0, 2.0, 0.0],
+                       [3.0, 2.0, 0.0]],
+            cell=np.eye(3) * 6.0,
+            pbc=pbc,
+        )
+        return atoms
+
     def test_repeated_find_all_bonds(self):
         ic = Internals(self._two_waters(), allow_fragments=True)
         ic.find_all_bonds()
@@ -595,6 +606,44 @@ class TestFindAllBondsIdempotent:
         ic.find_all_dihedrals()
         # Default auto_find_internals=True re-runs find_all_bonds on the copy.
         InternalPES(atoms, ic)
+
+    def test_internalpes_accepts_prepopulated_linear_bend_dummies(self):
+        from ase.calculators.lj import LennardJones
+        from sella.peswrapper import InternalPES
+        atoms = self._linear_co2()
+        atoms.calc = LennardJones()
+        ic = Internals(atoms)
+        ic.find_all_bonds()
+        ic.find_all_angles()
+        ic.find_all_dihedrals()
+        assert ic.ndummies == 1
+        # Default auto_find_internals=True re-runs find_all_bonds on the copy.
+        InternalPES(atoms, ic)
+
+    def test_internalpes_copy_does_not_share_linear_dummy_state(self):
+        from ase.calculators.lj import LennardJones
+        from sella.peswrapper import CellInternalPES
+        atoms = self._linear_co2(pbc=True)
+        atoms.calc = LennardJones()
+        ic = Internals(atoms)
+        dinds0 = ic.dinds.copy()
+
+        pes = CellInternalPES(atoms, ic, auto_find_internals=True)
+
+        assert pes.int.ndummies == 1
+        assert ic.ndummies == 0
+        np.testing.assert_array_equal(ic.dinds, dinds0)
+
+    def test_supplied_dummy_indices_must_be_appended(self):
+        atoms = self._linear_co2()
+        dummies = Atoms('X', positions=[[2.0, 3.0, 0.0]])
+
+        with pytest.raises(ValueError, match='appended dummy block'):
+            Internals(
+                atoms,
+                dummies=dummies,
+                dinds=np.array([-1, 0, -1], dtype=np.int32),
+            )
 
 
 class TestPeriodicConstraintUnwrap:

@@ -1405,12 +1405,24 @@ class BaseInternals:
         else:
             if dinds is None:
                 raise ValueError('"dummies" provided, but no "dinds"!')
+            dinds = np.asarray(dinds, dtype=np.int32)
             ndum = len(dummies)
             ndind = np.sum(dinds >= 0)
             if ndum != ndind:
                 raise ValueError(
                     '{} dummy atoms were provided, but only {} dummy indices!'
                     .format(ndum, ndind)
+                )
+            dummy_indices = np.sort(dinds[dinds >= 0])
+            expected = np.arange(
+                len(self.atoms),
+                len(self.atoms) + ndum,
+                dtype=np.int32,
+            )
+            if not np.array_equal(dummy_indices, expected):
+                raise ValueError(
+                    'Dummy indices must refer to the appended dummy block '
+                    'natoms:natoms+ndummies.'
                 )
         self.dummies = dummies
         self.dinds = dinds
@@ -3176,9 +3188,18 @@ class Constraints(BaseInternals):
         for ase_cons in atoms.constraints:
             self.merge_ase_constraint(ase_cons)
 
-    def copy(self, _coord_memo=None) -> 'Constraints':
+    def copy(
+        self,
+        _coord_memo=None,
+        _dummies: Atoms = None,
+        _dinds: np.ndarray = None,
+    ) -> 'Constraints':
         if _coord_memo is None:
             _coord_memo = {}
+        if _dummies is None:
+            _dummies = self.dummies.copy()
+        if _dinds is None:
+            _dinds = self.dinds.copy()
 
         def clone(coord):
             key = id(coord)
@@ -3187,7 +3208,7 @@ class Constraints(BaseInternals):
             return _coord_memo[key]
 
         new = self.__class__(
-            self.atoms, self.dummies, self.dinds, self.ignore_rotation
+            self.atoms, _dummies, _dinds, self.ignore_rotation
         )
         for name in self._names:
             new.internals[name] = [
@@ -3524,6 +3545,8 @@ class Internals(BaseInternals):
 
     def copy(self) -> 'Internals':
         coord_memo = {}
+        dummies = self.dummies.copy()
+        dinds = self.dinds.copy()
 
         def clone(coord):
             key = id(coord)
@@ -3533,10 +3556,14 @@ class Internals(BaseInternals):
 
         new = self.__class__(
             self.atoms,
-            self.dummies,
+            dummies,
             self.atol * 180. / np.pi,
-            self.dinds,
-            self.cons.copy(_coord_memo=coord_memo),
+            dinds,
+            self.cons.copy(
+                _coord_memo=coord_memo,
+                _dummies=dummies,
+                _dinds=dinds,
+            ),
             self.allow_fragments,
         )
         for name in self._names:
@@ -4115,6 +4142,8 @@ class Internals(BaseInternals):
 
         for bond in self.internals['bonds']:
             i, j = bond.indices
+            if i >= self.natoms or j >= self.natoms:
+                continue
             c10y[i, nbonds[i]] = j
             nbonds[i] += 1
             c10y[j, nbonds[j]] = i
@@ -4222,10 +4251,10 @@ class Internals(BaseInternals):
         bonds = [[] for _ in range(self.natoms)]
         for bond in self.internals['bonds']:
             i, j = bond.indices
-            if i < self.natoms:
-                bonds[i].append(bond)
-            if j < self.natoms:
-                bonds[j].append(bond.reverse())
+            if i >= self.natoms or j >= self.natoms:
+                continue
+            bonds[i].append(bond)
+            bonds[j].append(bond.reverse())
 
         for j, jbonds in enumerate(bonds):
             linear = []
