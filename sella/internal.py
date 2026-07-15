@@ -2254,11 +2254,14 @@ class BaseInternals:
             self._cache['rotation_pad'] = out
             return out
         groups = {}
+        duplicate_slot = False
         for i, r in enumerate(rotations):
             key = (tuple(r.indices), r.kwargs['refpos'].tobytes())
             slot = groups.setdefault(key, [None, None, None])
+            if slot[r.kwargs['axis']] is not None:
+                duplicate_slot = True
             slot[r.kwargs['axis']] = i
-        if any(None in slot for slot in groups.values()):
+        if duplicate_slot or any(None in slot for slot in groups.values()):
             out = (None, None, None, [], [], False)
             self._cache['rotation_pad'] = out
             return out
@@ -3138,21 +3141,61 @@ class BaseInternals:
         didx = self.dinds[idx]
         assert didx >= 0
         npos = len(self.all_positions)
-        for i, trans in enumerate(self.internals['translations']):
+
+        def dedupe(coords, active):
+            new_coords = []
+            new_active = []
+            changed = len(coords) != len(active)
+            for coord, is_active in zip(coords, active):
+                try:
+                    existing = new_coords.index(coord)
+                except ValueError:
+                    new_coords.append(coord)
+                    new_active.append(is_active)
+                else:
+                    new_active[existing] = new_active[existing] or is_active
+                    changed = True
+            return new_coords, new_active, changed
+
+        changed = False
+        translations = []
+        for trans in self.internals['translations']:
             if idx in trans.indices and didx not in trans.indices:
                 new_indices = (*trans.indices, didx)
-                new_trans = Translation(new_indices, trans.kwargs['dim'])
-                self.internals['translations'][i] = new_trans
+                translations.append(
+                    Translation(new_indices, trans.kwargs['dim'])
+                )
+                changed = True
+            else:
+                translations.append(trans)
+        translations, trans_active, trans_deduped = dedupe(
+            translations, self._active['translations']
+        )
+        self.internals['translations'] = translations
+        self._active['translations'] = trans_active
+        changed = changed or trans_deduped
 
-        for i, rot in enumerate(self.internals['rotations']):
+        rotations = []
+        for rot in self.internals['rotations']:
             if idx in rot.indices and didx not in rot.indices:
                 new_indices = np.array((*rot.indices, didx), dtype=np.int32)
                 if np.all(new_indices < npos):
-                    new_rot = Rotation(
+                    rotations.append(Rotation(
                         new_indices, rot.kwargs['axis'],
                         self.all_positions[new_indices]
-                    )
-                    self.internals['rotations'][i] = new_rot
+                    ))
+                    changed = True
+                    continue
+            rotations.append(rot)
+        rotations, rot_active, rot_deduped = dedupe(
+            rotations, self._active['rotations']
+        )
+        self.internals['rotations'] = rotations
+        self._active['rotations'] = rot_active
+        changed = changed or rot_deduped
+
+        if changed:
+            self._invalidate_structure()
 
     def check_all_gradients(
         self, delta: float = 1e-4, atol: float = 1e-6

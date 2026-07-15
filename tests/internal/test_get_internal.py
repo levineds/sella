@@ -620,6 +620,22 @@ class TestFindAllBondsIdempotent:
         # Default auto_find_internals=True re-runs find_all_bonds on the copy.
         InternalPES(atoms, ic)
 
+    def test_pes_accepts_fragmented_linear_bend_dummies(self):
+        from ase.calculators.lj import LennardJones
+        from sella.peswrapper import InternalPES, CellInternalPES
+        atoms = self._linear_co2(pbc=True)
+        atoms.calc = LennardJones()
+        ic = Internals(atoms, allow_fragments=True)
+        ic.find_all_bonds()
+        ic.find_all_angles()
+        ic.find_all_dihedrals()
+        assert ic.ndummies == 1
+
+        for pes_cls in (InternalPES, CellInternalPES):
+            pes = pes_cls(atoms, ic, auto_find_internals=True)
+            assert len(pes.int.internals['translations']) == 3
+            assert len(pes.int.internals['rotations']) == 3
+
     def test_internalpes_copy_does_not_share_linear_dummy_state(self):
         from ase.calculators.lj import LennardJones
         from sella.peswrapper import CellInternalPES
