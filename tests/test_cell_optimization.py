@@ -8,6 +8,8 @@ from ase import Atoms
 from ase.build import bulk, molecule
 from ase.calculators.emt import EMT
 from ase.calculators.lj import LennardJones
+from ase.calculators.singlepoint import SinglePointCalculator
+from ase.constraints import FixAtoms, FixBondLength
 
 from sella import Sella
 from sella.peswrapper import CellInternalPES, CellCartesianPES, _logm_3x3
@@ -116,6 +118,85 @@ class TestCellDerivatives:
         # Should have shape (n_active_coords, 9)
         n_active = len(internals.calc())
         assert J_cell.shape == (n_active, 9)
+
+
+class TestCellRawASEConstraintForces:
+    """Sella imports ASE constraints, so evals must use raw calculator data."""
+
+    def test_cartesian_cell_eval_uses_raw_forces_with_fixatoms(self):
+        atoms = Atoms('H2',
+                      positions=[[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                      cell=np.eye(3) * 5.0, pbc=True)
+        raw_forces = np.array([[2.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        stress = np.zeros(6)
+        atoms.calc = SinglePointCalculator(
+            atoms, energy=0.0, forces=raw_forces, stress=stress
+        )
+        atoms.set_constraint(FixAtoms([0]))
+        assert_allclose(atoms.get_forces()[0], 0.0)
+
+        pes = CellCartesianPES(atoms)
+        _, g = pes.eval()
+
+        assert_allclose(g[:pes.n_cart], -raw_forces.ravel())
+        assert_allclose(
+            g[pes.n_cart:],
+            pes._stress_to_cell_gradient(stress, raw_forces),
+        )
+
+    def test_internal_cell_eval_uses_raw_forces_with_fixbond(self):
+        atoms = Atoms('OH2',
+                      positions=[[0.0, 0.0, 0.0],
+                                 [1.0, 0.0, 0.0],
+                                 [0.0, 1.0, 0.0]],
+                      cell=np.eye(3) * 5.0, pbc=True)
+        raw_forces = np.array([[0.0, 0.0, 0.0],
+                               [2.0, 0.0, 0.0],
+                               [0.0, 0.0, 0.0]])
+        atoms.calc = SinglePointCalculator(
+            atoms, energy=0.0, forces=raw_forces, stress=np.zeros(6)
+        )
+        atoms.set_constraint(FixBondLength(0, 1))
+        assert not np.allclose(atoms.get_forces(), raw_forces)
+
+        pes = CellInternalPES(atoms, Internals(atoms),
+                              auto_find_internals=True)
+        seen = {}
+
+        def spy_stress_to_cell_gradient(stress, forces=None):
+            seen['forces'] = forces.copy()
+            return np.zeros(pes.n_cell_dof)
+
+        pes._stress_to_cell_gradient = spy_stress_to_cell_gradient
+        pes.eval()
+
+        assert_allclose(seen['forces'], raw_forces)
+
+
+class TestCellHessianFunction:
+    """Cell PES hessian_function installs only the coordinate block."""
+
+    @staticmethod
+    def _atoms():
+        atoms = Atoms('H2',
+                      positions=[[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]],
+                      cell=np.eye(3) * 4.0, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    @staticmethod
+    def _hessian(atoms):
+        return np.eye(3 * len(atoms))
+
+    @pytest.mark.parametrize("internal", [False, True])
+    def test_cell_hessian_function_with_eig_step(self, internal):
+        opt = Sella(self._atoms(), order=0, internal=internal,
+                    optimize_cell=True, hessian_function=self._hessian,
+                    eig=True, logfile=None)
+        opt.step()
+
+        assert opt.pes.H.shape == (opt.pes.dim, opt.pes.dim)
+        assert opt.pes.H.initialized
 
 
 class TestCellInternalPES:

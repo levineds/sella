@@ -571,10 +571,19 @@ class PES:
         if self.traj is not None:
             self.traj.write()
 
+    def _get_potential_energy_raw(self):
+        return self.atoms.get_potential_energy(apply_constraint=False)
+
+    def _get_forces_raw(self):
+        return self.atoms.get_forces(apply_constraint=False)
+
+    def _get_stress_raw(self):
+        return self.atoms.get_stress(apply_constraint=False)
+
     def eval(self):
         self.neval += 1
-        f = self.atoms.get_potential_energy()
-        g = -self.atoms.get_forces().ravel()
+        f = self._get_potential_energy_raw()
+        g = -self._get_forces_raw().ravel()
         self.write_traj()
         return f, g
 
@@ -1940,6 +1949,25 @@ class _CellPESMixin:
 
         return H0_full, refine_level
 
+    def _install_cell_hessian(self, H_coords_or_full):
+        H_coords_or_full = np.asarray(H_coords_or_full, dtype=np.float64)
+        n = self.n_coords
+        if H_coords_or_full.shape == (self.dim, self.dim):
+            H_full = H_coords_or_full
+        elif H_coords_or_full.shape == (n, n):
+            H_full = self.H.asarray().copy()
+            H_full[:n, :n] = H_coords_or_full
+        else:
+            raise ValueError(
+                'hessian_function returned shape {}, expected {} or {}'
+                .format(
+                    H_coords_or_full.shape,
+                    (n, n),
+                    (self.dim, self.dim),
+                )
+            )
+        self.set_H(H_full, initialized=True)
+
     def get_drdx(self):
         """Get constraint Jacobian extended with zeros for cell DOF."""
         drdx_coords = super().get_drdx()
@@ -2558,20 +2586,20 @@ class CellInternalPES(_CellPESMixin, InternalPES):
     def eval(self) -> tuple:
         """Evaluate energy and combined gradient (internal + cell)."""
         self.neval += 1
-        f = self.atoms.get_potential_energy()
+        f = self._get_potential_energy_raw()
 
         # Add pressure contribution: H = E + P*V
         if self.scalar_pressure != 0.0:
             f += self.scalar_pressure * self.atoms.get_volume()
 
         # Atomic forces -> internal coordinate gradient
-        forces = self.atoms.get_forces()
+        forces = self._get_forces_raw()
         g_cart = -forces.ravel()
         Binv = self._get_Binv()
         g_internal = g_cart @ Binv[:len(g_cart)]
 
         # Stress tensor -> cell gradient
-        stress = self.atoms.get_stress()  # 6-component Voigt, eV/Å³
+        stress = self._get_stress_raw()  # 6-component Voigt, eV/Å³
         g_cell = self._stress_to_cell_gradient(stress, forces=forces)
 
         # Add the constraint-projection work term (nonzero only when internal
@@ -2868,6 +2896,29 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         self._Hc_cell_cache.put(state_hash, Hc)
         return Hc
 
+    def calculate_hessian(self):
+        assert self.hessian_function is not None
+        H_raw = np.asarray(self.hessian_function(self.atoms), dtype=np.float64)
+        ncart = 3 * len(self.atoms)
+        if H_raw.shape == (self.dim, self.dim):
+            self._install_cell_hessian(H_raw)
+        elif H_raw.shape == (ncart, ncart):
+            self._install_cell_hessian(
+                self._convert_cartesian_hessian_to_internal(H_raw)
+            )
+        elif H_raw.shape == (self.n_internal, self.n_internal):
+            self._install_cell_hessian(H_raw)
+        else:
+            raise ValueError(
+                'hessian_function returned shape {}, expected {}, {}, or {}'
+                .format(
+                    H_raw.shape,
+                    (ncart, ncart),
+                    (self.n_internal, self.n_internal),
+                    (self.dim, self.dim),
+                )
+            )
+
 
 class CellCartesianPES(_CellPESMixin, PES):
     """Cartesian PES with unit cell optimization.
@@ -3005,7 +3056,7 @@ class CellCartesianPES(_CellPESMixin, PES):
     def eval(self) -> tuple:
         """Evaluate energy and combined gradient (Cartesian + cell)."""
         self.neval += 1
-        f = self.atoms.get_potential_energy()
+        f = self._get_potential_energy_raw()
 
         # Add pressure contribution: H = E + P*V
         if self.scalar_pressure != 0.0:
@@ -3013,15 +3064,19 @@ class CellCartesianPES(_CellPESMixin, PES):
 
         # Cartesian gradient: Sella works in actual Cartesian positions
         # (not the undeformed frame), so no F transformation needed
-        forces = self.atoms.get_forces()
+        forces = self._get_forces_raw()
         g_cart = -forces.ravel()
 
         # Stress tensor -> cell gradient
-        stress = self.atoms.get_stress()  # 6-component Voigt, eV/Å³
+        stress = self._get_stress_raw()  # 6-component Voigt, eV/Å³
         g_cell = self._stress_to_cell_gradient(stress, forces)
 
         self.write_traj()
         return f, np.concatenate([g_cart, g_cell])
+
+    def calculate_hessian(self):
+        assert self.hessian_function is not None
+        self._install_cell_hessian(self.hessian_function(self.atoms))
 
     def _virial_to_dEdF(self, virial, forces):
         """Fixed-Cartesian virial -> dE/dF for Cartesian cells.
