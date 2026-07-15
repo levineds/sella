@@ -200,7 +200,7 @@ class TestCellHessianFunction:
 
 
 class TestCellSmaxSemantics:
-    """Explicit smax is physical stress; omitted smax is ASE-like."""
+    """Explicit smax is effective stress; omitted smax is ASE-like."""
 
     @staticmethod
     def _stressed_water():
@@ -218,7 +218,7 @@ class TestCellSmaxSemantics:
         return atoms
 
     @pytest.mark.parametrize("internal", [False, True])
-    def test_explicit_smax_uses_physical_stress(self, internal):
+    def test_explicit_smax_uses_effective_stress(self, internal):
         opt = Sella(self._stressed_water(), order=0, internal=internal,
                     optimize_cell=True, allow_fragments=internal,
                     logfile=None)
@@ -235,6 +235,23 @@ class TestCellSmaxSemantics:
         opt.smax = 0.005
         assert not opt.converged()
         assert_allclose(opt._last_converged[3], 0.01)
+
+    def test_explicit_smax_uses_corrected_cell_gradient(self):
+        atoms = Atoms('H2',
+                      positions=[[4.4, 5.0, 5.0], [5.6, 5.0, 5.0]],
+                      cell=np.eye(3) * 10.0, pbc=True)
+        atoms.calc = LennardJones()
+        atoms.set_constraint(FixBondLength(0, 1))
+        assert np.abs(atoms.get_stress(apply_constraint=False)).max() > 1e-3
+
+        opt = Sella(atoms, order=0, internal=True, optimize_cell=True,
+                    allow_fragments=True, logfile=None)
+        opt.fmax = 0.05
+        opt.smax = 1e-3
+
+        assert opt.converged()
+        assert opt._last_converged[1] < 1e-12
+        assert_allclose(opt._last_converged[3], 0.0, atol=1e-12)
 
 
 class TestCellInternalPES:

@@ -97,9 +97,10 @@ class Sella(Optimizer):
         scalar_pressure : float, optional
             External pressure in eV/Å³ for cell optimization. Default is 0.
         smax : float, optional
-            Maximum physical stress tolerance for convergence when
-            optimize_cell=True. If None, uses fmax as the tolerance on Sella's
-            ASE-like scaled log-cell gradient.
+            Maximum effective stress tolerance for convergence when
+            optimize_cell=True, derived from Sella's optimized cell-gradient
+            path. If None, uses fmax as the tolerance on Sella's ASE-like
+            scaled log-cell gradient.
         allow_fragments : bool, optional
             If True, allow disconnected molecular fragments when using internal
             coordinates. Adds translation and rotation coordinates (TRICs) for

@@ -2016,26 +2016,26 @@ class _CellPESMixin:
 
         return g_cell_3x3[self.cell_mask]
 
-    def _stress_convergence_max(self):
-        """Maximum physical stress component for user-specified ``smax``.
+    def _effective_stress_convergence_max(self, g_cell):
+        """Maximum effective stress for user-specified ``smax``.
 
-        ``smax=None`` keeps Sella's ASE-like convergence behavior, which
-        compares the scaled log-cell gradient to ``fmax``.  When the user
-        explicitly supplies ``smax``, use a physical stress residual instead
-        so the threshold is independent of volume and ``exp_cell_factor``.
+        ``g_cell`` is Sella's corrected gradient with respect to scaled
+        log-cell coordinates.  Converting it back to eV/A^3 keeps explicit
+        ``smax`` on the same cell-motion path that Sella optimizes, including
+        rigid-fragment and constraint-projection corrections.
         """
-        if self.n_cell_dof == 0:
+        if self.n_cell_dof == 0 or len(g_cell) == 0:
             return 0.0
-        stress_3x3 = voigt_6_to_full_3x3_stress(self._get_stress_raw())
-        if self.scalar_pressure != 0.0:
-            stress_3x3 = stress_3x3 + self.scalar_pressure * np.eye(3)
-        selected = stress_3x3[self.cell_mask]
-        return np.abs(selected).max() if selected.size else 0.0
+        effective_stress = (
+            np.asarray(g_cell) * self.exp_cell_factor
+            / self.atoms.get_volume()
+        )
+        return np.abs(effective_stress).max()
 
     def _cell_convergence_max(self, g_cell, smax):
         if smax is None:
             return np.abs(g_cell).max() if len(g_cell) > 0 else 0.0
-        return self._stress_convergence_max()
+        return self._effective_stress_convergence_max(g_cell)
 
     def _extend_basis_with_cell(self, basis_int):
         """Pad a coordinate-only basis with cell DOF (identity in Unred/Ufree)."""
@@ -2837,7 +2837,7 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         fmax : float
             Maximum force tolerance (eV/Å).
         smax : float, optional
-            Maximum physical stress tolerance. If None, compare the scaled
+            Maximum effective stress tolerance. If None, compare the scaled
             log-cell gradient to fmax for ASE-like behavior.
         cmax : float, optional
             Constraint residual tolerance.
@@ -2851,7 +2851,7 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         cmax_actual : float
             Constraint residual norm.
         smax_actual : float
-            Maximum physical stress when smax is provided, otherwise maximum
+            Maximum effective stress when smax is provided, otherwise maximum
             scaled log-cell gradient.
         """
         smax_threshold = fmax if smax is None else smax
@@ -3153,7 +3153,7 @@ class CellCartesianPES(_CellPESMixin, PES):
         fmax : float
             Maximum force tolerance (eV/Å).
         smax : float, optional
-            Maximum physical stress tolerance. If None, compare the scaled
+            Maximum effective stress tolerance. If None, compare the scaled
             log-cell gradient to fmax for ASE-like behavior.
         cmax : float, optional
             Constraint residual tolerance.
@@ -3167,7 +3167,7 @@ class CellCartesianPES(_CellPESMixin, PES):
         cmax_actual : float
             Constraint residual norm.
         smax_actual : float
-            Maximum physical stress when smax is provided, otherwise maximum
+            Maximum effective stress when smax is provided, otherwise maximum
             scaled log-cell gradient.
         """
         smax_threshold = fmax if smax is None else smax
