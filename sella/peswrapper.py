@@ -2016,6 +2016,27 @@ class _CellPESMixin:
 
         return g_cell_3x3[self.cell_mask]
 
+    def _stress_convergence_max(self):
+        """Maximum physical stress component for user-specified ``smax``.
+
+        ``smax=None`` keeps Sella's ASE-like convergence behavior, which
+        compares the scaled log-cell gradient to ``fmax``.  When the user
+        explicitly supplies ``smax``, use a physical stress residual instead
+        so the threshold is independent of volume and ``exp_cell_factor``.
+        """
+        if self.n_cell_dof == 0:
+            return 0.0
+        stress_3x3 = voigt_6_to_full_3x3_stress(self._get_stress_raw())
+        if self.scalar_pressure != 0.0:
+            stress_3x3 = stress_3x3 + self.scalar_pressure * np.eye(3)
+        selected = stress_3x3[self.cell_mask]
+        return np.abs(selected).max() if selected.size else 0.0
+
+    def _cell_convergence_max(self, g_cell, smax):
+        if smax is None:
+            return np.abs(g_cell).max() if len(g_cell) > 0 else 0.0
+        return self._stress_convergence_max()
+
     def _extend_basis_with_cell(self, basis_int):
         """Pad a coordinate-only basis with cell DOF (identity in Unred/Ufree)."""
         drdx_int, Ucons_int, Unred_int, Ufree_int = basis_int
@@ -2809,14 +2830,15 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         return out
 
     def converged(self, fmax: float, smax: float = None, cmax: float = 1e-5):
-        """Check convergence of forces and stress.
+        """Check convergence of forces and cell criterion.
 
         Parameters
         ----------
         fmax : float
             Maximum force tolerance (eV/Å).
         smax : float, optional
-            Maximum stress tolerance. If None, uses fmax.
+            Maximum physical stress tolerance. If None, compare the scaled
+            log-cell gradient to fmax for ASE-like behavior.
         cmax : float, optional
             Constraint residual tolerance.
 
@@ -2829,10 +2851,10 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         cmax_actual : float
             Constraint residual norm.
         smax_actual : float
-            Maximum stress gradient.
+            Maximum physical stress when smax is provided, otherwise maximum
+            scaled log-cell gradient.
         """
-        if smax is None:
-            smax = fmax
+        smax_threshold = fmax if smax is None else smax
 
         # Force convergence (project out constraints).
         # Associate as U @ (U.T @ g) — two cheap matvecs — instead of
@@ -2849,12 +2871,14 @@ class CellInternalPES(_CellPESMixin, InternalPES):
 
         # Stress convergence
         g_cell = g[self.n_internal:]
-        smax_actual = np.abs(g_cell).max() if len(g_cell) > 0 else 0.0
+        smax_actual = self._cell_convergence_max(g_cell, smax)
 
         # Constraint residual
         cmax_actual = np.linalg.norm(self.get_res())
 
-        conv = (fmax_actual < fmax) and (smax_actual < smax) and (cmax_actual < cmax)
+        conv = ((fmax_actual < fmax)
+                and (smax_actual < smax_threshold)
+                and (cmax_actual < cmax))
         return conv, fmax_actual, cmax_actual, smax_actual
 
     def get_projected_forces(self) -> np.ndarray:
@@ -3122,14 +3146,15 @@ class CellCartesianPES(_CellPESMixin, PES):
         return result
 
     def converged(self, fmax: float, smax: float = None, cmax: float = 1e-5):
-        """Check convergence of forces and stress.
+        """Check convergence of forces and cell criterion.
 
         Parameters
         ----------
         fmax : float
             Maximum force tolerance (eV/Å).
         smax : float, optional
-            Maximum stress tolerance. If None, uses fmax.
+            Maximum physical stress tolerance. If None, compare the scaled
+            log-cell gradient to fmax for ASE-like behavior.
         cmax : float, optional
             Constraint residual tolerance.
 
@@ -3142,10 +3167,10 @@ class CellCartesianPES(_CellPESMixin, PES):
         cmax_actual : float
             Constraint residual norm.
         smax_actual : float
-            Maximum stress gradient.
+            Maximum physical stress when smax is provided, otherwise maximum
+            scaled log-cell gradient.
         """
-        if smax is None:
-            smax = fmax
+        smax_threshold = fmax if smax is None else smax
 
         # Force convergence (project out constraints)
         g = self.get_g()
@@ -3158,12 +3183,14 @@ class CellCartesianPES(_CellPESMixin, PES):
 
         # Stress convergence
         g_cell = g[self.n_cart:]
-        smax_actual = np.abs(g_cell).max() if len(g_cell) > 0 else 0.0
+        smax_actual = self._cell_convergence_max(g_cell, smax)
 
         # Constraint residual
         cmax_actual = np.linalg.norm(self.get_res())
 
-        conv = (fmax_actual < fmax) and (smax_actual < smax) and (cmax_actual < cmax)
+        conv = ((fmax_actual < fmax)
+                and (smax_actual < smax_threshold)
+                and (cmax_actual < cmax))
         return conv, fmax_actual, cmax_actual, smax_actual
 
     def get_projected_forces(self) -> np.ndarray:

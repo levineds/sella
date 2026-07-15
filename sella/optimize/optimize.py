@@ -97,8 +97,9 @@ class Sella(Optimizer):
         scalar_pressure : float, optional
             External pressure in eV/Å³ for cell optimization. Default is 0.
         smax : float, optional
-            Maximum stress tolerance for convergence when optimize_cell=True.
-            If None, uses fmax.
+            Maximum physical stress tolerance for convergence when
+            optimize_cell=True. If None, uses fmax as the tolerance on Sella's
+            ASE-like scaled log-cell gradient.
         allow_fragments : bool, optional
             If True, allow disconnected molecular fragments when using internal
             coordinates. Adds translation and rotation coordinates (TRICs) for
@@ -461,8 +462,7 @@ class Sella(Optimizer):
         # fmax may still be None if converged() is called before run()
         fmax = self.fmax if self.fmax is not None else 0.05  # Default threshold
         if self.optimize_cell:
-            smax = self.smax if self.smax is not None else fmax
-            result = self.pes.converged(fmax, smax=smax)
+            result = self.pes.converged(fmax, smax=self.smax)
             self._last_converged = result
             return result[0]
         result = self.pes.converged(fmax)
@@ -473,10 +473,10 @@ class Sella(Optimizer):
         if self.logfile is None:
             return
         if self.optimize_cell:
-            smax = self.smax if self.smax is not None else self.fmax
             result = self._last_converged
             if result is None or len(result) != 4:
-                result = self.pes.converged(self.fmax, smax=smax)
+                fmax = self.fmax if self.fmax is not None else 0.05
+                result = self.pes.converged(fmax, smax=self.smax)
             _, fmax, cmax, smax_actual = result
             e = self.pes.get_f()
             T = strftime("%H:%M:%S", localtime())

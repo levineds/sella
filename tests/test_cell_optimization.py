@@ -199,6 +199,44 @@ class TestCellHessianFunction:
         assert opt.pes.H.initialized
 
 
+class TestCellSmaxSemantics:
+    """Explicit smax is physical stress; omitted smax is ASE-like."""
+
+    @staticmethod
+    def _stressed_water():
+        atoms = Atoms('OH2',
+                      positions=[[5.0, 5.0, 5.0],
+                                 [5.96, 5.0, 5.0],
+                                 [5.0, 5.96, 5.0]],
+                      cell=np.eye(3) * 10.0, pbc=True)
+        atoms.calc = SinglePointCalculator(
+            atoms,
+            energy=0.0,
+            forces=np.zeros((3, 3)),
+            stress=np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        )
+        return atoms
+
+    @pytest.mark.parametrize("internal", [False, True])
+    def test_explicit_smax_uses_physical_stress(self, internal):
+        opt = Sella(self._stressed_water(), order=0, internal=internal,
+                    optimize_cell=True, allow_fragments=internal,
+                    logfile=None)
+        opt.fmax = 0.05
+
+        opt.smax = None
+        assert not opt.converged()
+        assert opt._last_converged[3] > 1.0
+
+        opt.smax = 0.02
+        assert opt.converged()
+        assert_allclose(opt._last_converged[3], 0.01)
+
+        opt.smax = 0.005
+        assert not opt.converged()
+        assert_allclose(opt._last_converged[3], 0.01)
+
+
 class TestCellInternalPES:
     """Test CellInternalPES class."""
 
