@@ -215,6 +215,12 @@ _dihedral_cell_grad_batched = jit(vmap(_dihedral_cell_grad_single, in_axes=(0, 0
 # =============================================================================
 BLOCK_SIZE = 64
 
+# Maximum working set for one periodic pair-image distance chunk. The full
+# all-pairs table scales as n_pairs * n_images * 3 and can collide with MLIP
+# memory on smaller GPUs; chunking bounds that temporary without changing the
+# selected bonds.
+PERIODIC_PAIR_CHUNK_BYTES = 16 * 1024 * 1024
+
 
 class _BatchedCoordFamily(NamedTuple):
     key: str
@@ -3804,22 +3810,48 @@ class Internals(BaseInternals):
         self.rcell = Cell(rcell)
         self._rcell_reciprocal_T = self.rcell.reciprocal().T
 
-    def _periodic_pair_distances(self, ii, jj):
-        self._ensure_reduced_cell_cache()
-        dx = self.atoms.positions[jj] - self.atoms.positions[ii]
-        dx_sc = dx @ self._rcell_reciprocal_T
+    def _periodic_pair_chunk_size(self, n_images):
+        # Per pair-image, the peak contains integer translations, Cartesian
+        # translations, the displaced vectors used by norm(), and distances.
+        # Use a deliberately conservative estimate to keep real peaks bounded.
+        bytes_per_pair_image = (
+            3 * np.dtype(np.int32).itemsize
+            + 7 * np.dtype(np.float64).itemsize
+        )
+        bytes_per_pair = max(1, n_images * bytes_per_pair_image)
+        return max(1, PERIODIC_PAIR_CHUNK_BYTES // bytes_per_pair)
 
-        offset = np.zeros(dx_sc.shape, dtype=np.int32)
-        for _ in range(2):
-            offset += (
-                self.atoms.pbc * ((dx_sc - offset) // 1.)
-            ).astype(np.int32)
+    def _iter_periodic_pair_distances(self, ii, jj):
+        self._ensure_reduced_cell_cache()
 
         ranges = [np.arange(-1 * p, p + 1) for p in self.atoms.pbc]
         base_ts = np.array(list(product(*ranges)), dtype=np.int32)
-        translations = (base_ts[None, :, :] - offset[:, None, :]) @ self.op
-        tvecs_cart = translations @ self.atoms.cell.array
-        dists = np.linalg.norm(dx[:, None, :] + tvecs_cart, axis=2)
+        chunk_size = self._periodic_pair_chunk_size(len(base_ts))
+        positions = self.atoms.positions
+        cell = self.atoms.cell.array
+
+        for start in range(0, len(ii), chunk_size):
+            stop = min(start + chunk_size, len(ii))
+            dx = positions[jj[start:stop]] - positions[ii[start:stop]]
+            dx_sc = dx @ self._rcell_reciprocal_T
+
+            offset = np.zeros(dx_sc.shape, dtype=np.int32)
+            for _ in range(2):
+                offset += (
+                    self.atoms.pbc * ((dx_sc - offset) // 1.)
+                ).astype(np.int32)
+
+            translations = (base_ts[None, :, :] - offset[:, None, :]) @ self.op
+            tvecs_cart = translations @ cell
+            dists = np.linalg.norm(dx[:, None, :] + tvecs_cart, axis=2)
+            yield start, stop, dists, translations
+
+    def _periodic_pair_distances(self, ii, jj):
+        chunks = list(self._iter_periodic_pair_distances(ii, jj))
+        if not chunks:
+            return np.empty((0, 0)), np.empty((0, 0, 3), dtype=np.int32)
+        dists = np.concatenate([chunk[2] for chunk in chunks])
+        translations = np.concatenate([chunk[3] for chunk in chunks])
         return dists, translations
 
     def _find_bonds_vectorized(self, labels, scale, rcov):
@@ -3837,21 +3869,25 @@ class Internals(BaseInternals):
         if len(ii) == 0:
             return []
 
-        dists, translations = self._periodic_pair_distances(ii, jj)
-        thresholds = scale * (rcov[ii] + rcov[jj])
-        bond_mask = dists <= thresholds[:, None]
-
-        self_bond = (ii == jj)
-        zero_ts = np.all(translations == 0, axis=2)
-        bond_mask &= ~(self_bond[:, None] & zero_ts)
-
-        pair_idx, ts_idx = np.nonzero(bond_mask)
         results = []
-        for k in range(len(pair_idx)):
-            p = pair_idx[k]
-            t = ts_idx[k]
-            ts = translations[p, t].astype(np.int32)
-            results.append((int(ii[p]), int(jj[p]), ts))
+        for start, stop, dists, translations in (
+            self._iter_periodic_pair_distances(ii, jj)
+        ):
+            ii_chunk = ii[start:stop]
+            jj_chunk = jj[start:stop]
+            thresholds = scale * (rcov[ii_chunk] + rcov[jj_chunk])
+            bond_mask = dists <= thresholds[:, None]
+
+            self_bond = (ii_chunk == jj_chunk)
+            zero_ts = np.all(translations == 0, axis=2)
+            bond_mask &= ~(self_bond[:, None] & zero_ts)
+
+            pair_idx, ts_idx = np.nonzero(bond_mask)
+            for k in range(len(pair_idx)):
+                p = pair_idx[k]
+                t = ts_idx[k]
+                ts = translations[p, t].astype(np.int32)
+                results.append((int(ii_chunk[p]), int(jj_chunk[p]), ts))
         return results
 
     def _mst_welding_bonds(self, labels):
@@ -3883,11 +3919,15 @@ class Internals(BaseInternals):
         if len(ii) == 0:
             return []
 
-        dists, translations = self._periodic_pair_distances(ii, jj)
-        best = dists.argmin(axis=1)
-        rows = np.arange(len(dists))
-        best_dist = dists[rows, best]
-        best_ts = translations[rows, best].astype(np.int32)
+        best_dist = np.empty(len(ii), dtype=np.float64)
+        best_ts = np.empty((len(ii), 3), dtype=np.int32)
+        for start, stop, dists, translations in (
+            self._iter_periodic_pair_distances(ii, jj)
+        ):
+            best = dists.argmin(axis=1)
+            rows = np.arange(stop - start)
+            best_dist[start:stop] = dists[rows, best]
+            best_ts[start:stop] = translations[rows, best].astype(np.int32)
 
         # Connect components. A bare minimum-spanning *tree* is minimal but
         # biased: it under-determines extended contact interfaces (one weld

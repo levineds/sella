@@ -4,6 +4,7 @@ import numpy as np
 from ase import Atoms
 from ase.build import molecule
 
+import sella.internal as internal_module
 from sella.internal import (
     Bond, Angle, Dihedral, Displacement, Constraints, Internals
 )
@@ -314,6 +315,54 @@ class TestTRICs:
                     f"Degenerate angle {angle.indices} with identical "
                     f"ncvecs {angle.kwargs['ncvecs']}"
                 )
+
+    def test_periodic_pair_search_chunking_matches_full(self, monkeypatch):
+        atoms = Atoms(
+            'H6',
+            positions=[
+                [0.10, 0.10, 0.10],
+                [0.72, 0.10, 0.10],
+                [2.85, 0.10, 0.10],
+                [1.50, 1.20, 0.20],
+                [1.50, 1.82, 0.20],
+                [1.50, 2.87, 0.20],
+            ],
+            cell=np.diag([3.0, 3.0, 3.0]),
+            pbc=True,
+        )
+        ii, jj = np.triu_indices(len(atoms), k=0)
+        labels = -np.ones(len(atoms), dtype=np.int32)
+        comps = np.arange(len(atoms), dtype=np.int32)
+        rcov = np.full(len(atoms), 0.37)
+
+        def as_tuples(links):
+            return [
+                (i, j, tuple(np.asarray(ts, dtype=np.int32)))
+                for i, j, ts in links
+            ]
+
+        monkeypatch.setattr(
+            internal_module, 'PERIODIC_PAIR_CHUNK_BYTES', 1 << 30
+        )
+        ints_full = Internals(atoms.copy(), allow_fragments=True)
+        dists_full, ts_full = ints_full._periodic_pair_distances(ii, jj)
+        bonds_full = as_tuples(
+            ints_full._find_bonds_vectorized(labels, 1.25, rcov)
+        )
+        welds_full = as_tuples(ints_full._mst_welding_bonds(comps))
+
+        monkeypatch.setattr(internal_module, 'PERIODIC_PAIR_CHUNK_BYTES', 1)
+        ints_chunked = Internals(atoms.copy(), allow_fragments=True)
+        dists_chunked, ts_chunked = ints_chunked._periodic_pair_distances(ii, jj)
+        bonds_chunked = as_tuples(
+            ints_chunked._find_bonds_vectorized(labels, 1.25, rcov)
+        )
+        welds_chunked = as_tuples(ints_chunked._mst_welding_bonds(comps))
+
+        np.testing.assert_allclose(dists_chunked, dists_full)
+        np.testing.assert_array_equal(ts_chunked, ts_full)
+        assert bonds_chunked == bonds_full
+        assert welds_chunked == welds_full
 
 
 class TestInternalEquality:
