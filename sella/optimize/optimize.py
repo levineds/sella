@@ -310,152 +310,184 @@ class Sella(Optimizer):
                 )
             else:
                 self.pes = PES(
-                atoms,
-                constraints=constraints,
-                trajectory=trajectory,
-                eta=eta,
-                v0=v0,
-                hessian_function=hessian_function,
-                **kwargs
-            )
+                    atoms,
+                    constraints=constraints,
+                    trajectory=trajectory,
+                    eta=eta,
+                    v0=v0,
+                    hessian_function=hessian_function,
+                    **kwargs
+                )
         self.trajectory = self.pes.traj
 
-    def _predict_step(self):
+    def _initialize_eigensolver(self):
+        """Build or diagonalize the initial Hessian when eig mode is active."""
+        if self.pes.hessian_function is not None:
+            self.pes.calculate_hessian()
+        else:
+            self.pes.diag(**self.diagkwargs)
+        self.nsteps_since_diag = -1
+
+    def _ensure_initialized(self):
         if not self.initialized:
             self.pes.get_g()
             if self.eig:
-                if self.pes.hessian_function is not None:
-                    self.pes.calculate_hessian()
-                else:
-                    self.pes.diag(**self.diagkwargs)
-                self.nsteps_since_diag = -1
+                self._initialize_eigensolver()
             self.initialized = True
 
+    def _cell_rs_kwargs(self):
+        """Restricted-step kwargs needed when atom and cell radii differ."""
+        if self.optimize_cell and isinstance(self.rs, type) and issubclass(
+            self.rs, (MaxInternalStep, RestrictedAtomicStep)
+        ):
+            return {'wc': self.delta / self.delta_cell}
+        return {}
+
+    def _restricted_step(self, rs_kwargs):
+        return self.rs(
+            self.pes, self.ord, self.delta, method=self.method, **rs_kwargs
+        ).get_s()
+
+    def _valid_inequality_step(self, x0, rs_kwargs):
+        """Retry restricted steps until inactive inequality constraints stay valid."""
+        while True:
+            s, smag = self._restricted_step(rs_kwargs)
+            self.pes.set_x(x0 + s)
+            all_valid = self.pes.cons.validate_inequalities()
+            self.pes._update_basis()
+            self.pes.restore()
+            if all_valid:
+                self.pes._update_basis()
+                return s, smag
+
+    def _predict_step(self):
+        self._ensure_initialized()
         self.pes.cons.disable_satisfied_inequalities()
         self.pes._update_basis()
         self.pes.save()
         x0 = self.pes.get_x()
 
-        rs_kwargs = {}
-        if self.optimize_cell and isinstance(self.rs, type) and issubclass(
-            self.rs, (MaxInternalStep, RestrictedAtomicStep)
-        ):
-            rs_kwargs['wc'] = self.delta / self.delta_cell
-
+        rs_kwargs = self._cell_rs_kwargs()
         if self.pes.cons.has_inequalities():
-            all_valid = False
-            while not all_valid:
-                s, smag = self.rs(
-                    self.pes, self.ord, self.delta, method=self.method,
-                    **rs_kwargs
-                ).get_s()
-                self.pes.set_x(x0 + s)
-                all_valid = self.pes.cons.validate_inequalities()
-                self.pes._update_basis()
-                self.pes.restore()
-            self.pes._update_basis()
-        else:
-            s, smag = self.rs(
-                self.pes, self.ord, self.delta, method=self.method,
-                **rs_kwargs
-            ).get_s()
+            return self._valid_inequality_step(x0, rs_kwargs)
+        return self._restricted_step(rs_kwargs)
 
-        return s, smag
-
-    def step(self):
-        s, smag = self._predict_step()
-
-        # Determine if we need to call the eigensolver, then step
+    def _should_diagonalize(self):
+        """Return whether this step should run the eigensolver."""
         if self.nsteps_since_diag >= self.diag_every_n:
-            ev = True
-        elif self.eig and self.nsteps_since_diag >= self.nsteps_per_diag:
-            if self.pes.H.evals is None:
-                ev = True
-            else:
-                Unred = self.pes.get_Unred()
-                ev = (self.pes.get_HL_projected(Unred)
-                                       .evals[:self.ord] > 0).any()
-        else:
-            ev = False
+            return True
+        if not (self.eig and self.nsteps_since_diag >= self.nsteps_per_diag):
+            return False
+        if self.pes.H.evals is None:
+            return True
 
+        Unred = self.pes.get_Unred()
+        evals = self.pes.get_HL_projected(Unred).evals[:self.ord]
+        return bool((evals > 0).any())
+
+    def _record_diagonalization(self, ev):
         if ev:
             self.nsteps_since_diag = 0
         else:
             self.nsteps_since_diag += 1
 
-        rho = self.pes.kick(s, ev, **self.diagkwargs)
+    def _cell_trust_components(self, s, smag):
+        if not (
+            self.optimize_cell
+            and isinstance(self.pes, (CellInternalPES, CellCartesianPES))
+        ):
+            return smag, 0
 
-        # Check for bad internals, and if found, reset PES object.
-        # This skips the trust radius update.
-        if self.internal and self.pes.int.check_for_bad_internals():
-            if isinstance(self.pes, CellInternalPES):
-                cell_mask = self.pes.cell_mask
-                exp_cell_factor = self.pes.exp_cell_factor
-                scalar_pressure = self.pes.scalar_pressure
-            else:
-                cell_mask = None
-                exp_cell_factor = None
-                scalar_pressure = 0.0
-            self.initialize_pes(
-                atoms=self.pes.atoms,
-                trajectory=self.pes.traj,
-                order=self.ord,
-                eta=self.pes.eta,
-                constraints=self.constraints,
-                v0=None,  # TODO: use leftmost eigenvector from old H
-                internal=self.user_internal,
-                hessian_function=self.pes.hessian_function,
-                optimize_cell=self.optimize_cell,
-                cell_mask=cell_mask,
-                exp_cell_factor=exp_cell_factor,
-                scalar_pressure=scalar_pressure,
-                allow_fragments=self.allow_fragments,
-                exact_geodesic=self.exact_geodesic,
-                # Forward the original PES kwargs (e.g. an explicit
-                # rigid_fragments) so a user override is not lost on rebuild
-                # and silently replaced by auto-detection.
-                **self.peskwargs,
-            )
-            self.initialized = False
-            self.rho = 1
+        # Split the step into coordinate (internal or Cartesian) and cell blocks
+        # so each trust radius adapts independently. The boundary is n_coords
+        # (n_internal for CellInternalPES, n_cart for CellCartesianPES).
+        n_coord = self.pes.n_coords
+        smag_int = np.max(np.abs(s[:n_coord])) if n_coord > 0 else 0
+        smag_cell = np.max(np.abs(s[n_coord:])) if len(s) > n_coord else 0
+        return smag_int, smag_cell
+
+    def _update_trust_radius(self, rho, s, smag):
+        if rho is None:
+            self.rho = 1.
             return
 
-        # Update trust radius
-        if rho is not None:
-            if self.optimize_cell and isinstance(
-                self.pes, (CellInternalPES, CellCartesianPES)
-            ):
-                # Split the step into coordinate (internal or Cartesian) and
-                # cell blocks so each trust radius adapts independently. The
-                # boundary is n_coords (n_internal for CellInternalPES, n_cart
-                # for CellCartesianPES).
-                n_coord = self.pes.n_coords
-                smag_int = np.max(np.abs(s[:n_coord])) if n_coord > 0 else 0
-                smag_cell = (np.max(np.abs(s[n_coord:]))
-                             if len(s) > n_coord else 0)
-            else:
-                smag_int = smag
-                smag_cell = 0
+        smag_int, smag_cell = self._cell_trust_components(s, smag)
+        if rho < 1. / self.rho_dec or rho > self.rho_dec:
+            self.delta = max(smag_int * self.sigma_dec, self.delta_min)
+            if smag_cell > 0:
+                self.delta_cell = max(
+                    self.delta_cell * self.sigma_dec, self.delta_min
+                )
+        elif 1. / self.rho_inc < rho < self.rho_inc:
+            self.delta = max(self.sigma_inc * smag_int, self.delta)
+            if smag_cell > 0:
+                self.delta_cell = max(
+                    self.sigma_inc * smag_cell, self.delta_cell
+                )
+        self.rho = rho
 
-            if rho < 1./self.rho_dec or rho > self.rho_dec:
-                self.delta = max(smag_int * self.sigma_dec, self.delta_min)
-                if smag_cell > 0:
-                    self.delta_cell = max(self.delta_cell * self.sigma_dec,
-                                          self.delta_min)
-            elif 1./self.rho_inc < rho < self.rho_inc:
-                self.delta = max(self.sigma_inc * smag_int, self.delta)
-                if smag_cell > 0:
-                    self.delta_cell = max(self.sigma_inc * smag_cell,
-                                          self.delta_cell)
-            self.rho = rho
-        else:
-            self.rho = 1.
+    def _bad_internal_cell_kwargs(self):
+        if isinstance(self.pes, CellInternalPES):
+            return (
+                self.pes.cell_mask,
+                self.pes.exp_cell_factor,
+                self.pes.scalar_pressure,
+            )
+        return None, None, 0.0
 
-        # Apply Niggli reduction if cell becomes too skewed
+    def _rebuild_after_bad_internals(self):
+        """Recreate the PES after internals become singular or ill-defined."""
+        cell_mask, exp_cell_factor, scalar_pressure = (
+            self._bad_internal_cell_kwargs()
+        )
+        self.initialize_pes(
+            atoms=self.pes.atoms,
+            trajectory=self.pes.traj,
+            order=self.ord,
+            eta=self.pes.eta,
+            constraints=self.constraints,
+            v0=None,  # TODO: use leftmost eigenvector from old H
+            internal=self.user_internal,
+            hessian_function=self.pes.hessian_function,
+            optimize_cell=self.optimize_cell,
+            cell_mask=cell_mask,
+            exp_cell_factor=exp_cell_factor,
+            scalar_pressure=scalar_pressure,
+            allow_fragments=self.allow_fragments,
+            exact_geodesic=self.exact_geodesic,
+            # Forward the original PES kwargs (e.g. an explicit
+            # rigid_fragments) so a user override is not lost on rebuild and
+            # silently replaced by auto-detection.
+            **self.peskwargs,
+        )
+        self.initialized = False
+        self.rho = 1
+
+    def _maybe_rebuild_bad_internals(self):
+        # Bad internal-coordinate rebuilds skip the trust-radius update because
+        # the PES coordinate system has just been regenerated.
+        if self.internal and self.pes.int.check_for_bad_internals():
+            self._rebuild_after_bad_internals()
+            return True
+        return False
+
+    def _maybe_apply_niggli(self):
         if self.optimize_cell and self.niggli and self.pes.maybe_niggli_reduce():
             logger.info("Applied Niggli reduction to reduce cell skewness")
             self.initialized = False
             self.rho = 1.
+
+    def step(self):
+        s, smag = self._predict_step()
+        ev = self._should_diagonalize()
+        self._record_diagonalization(ev)
+        rho = self.pes.kick(s, ev, **self.diagkwargs)
+
+        if self._maybe_rebuild_bad_internals():
+            return
+
+        self._update_trust_radius(rho, s, smag)
+        self._maybe_apply_niggli()
 
     def gradient_converged(self, gradient=None):
         return self.converged()
