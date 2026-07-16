@@ -1531,6 +1531,15 @@ class BaseInternals:
         self._tvecs_cache = None  # set to {'cell_hash': ..., 'tvecs': ...} on first build
         self._hvp_buf = None  # reusable buffer for hessian_rdot output
 
+    @staticmethod
+    def _ignore_duplicate(adder, *args, **kwargs) -> bool:
+        """Call an internal/constraint adder and ignore duplicate coordinates."""
+        try:
+            adder(*args, **kwargs)
+        except DuplicateInternalError:
+            return False
+        return True
+
     @property
     def natoms(self) -> int:
         return self._natoms
@@ -1692,7 +1701,8 @@ class BaseInternals:
 
         Unpadded arrays are used for result indexing and sparse scatter. Padded
         arrays are used for JAX batch calls so bonds, angles, and dihedrals keep
-        consistent shapes and avoid recompilation.
+        consistent shapes and avoid recompilation. Padding masks are not stored
+        because valid rows are always the leading ``n_actual`` prefix.
         """
         coords = self.internals[spec.key]
         n_coords = len(coords)
@@ -3141,15 +3151,6 @@ class Constraints(BaseInternals):
         for ase_cons in atoms.constraints:
             self.merge_ase_constraint(ase_cons)
 
-    @staticmethod
-    def _ignore_duplicate(adder, *args, **kwargs) -> bool:
-        """Call an internal/constraint adder and ignore duplicate coordinates."""
-        try:
-            adder(*args, **kwargs)
-        except DuplicateInternalError:
-            return False
-        return True
-
     def copy(
         self,
         _coord_memo=None,
@@ -3769,14 +3770,6 @@ class Internals(BaseInternals):
             if labels[j] != label:
                 labels[j] = label
                 Internals.flood_fill(j, nbonds, c10y, labels, label)
-
-    @staticmethod
-    def _ignore_duplicate(adder, *args, **kwargs) -> bool:
-        try:
-            adder(*args, **kwargs)
-        except DuplicateInternalError:
-            return False
-        return True
 
     @staticmethod
     def _component_labels(labels, natoms):

@@ -1087,6 +1087,7 @@ class InternalPES(PES):
         return 'converged', stagnation_count
 
     def _apply_internal_newton_step(self, residual):
+        """Apply one Cartesian Newton correction for the current IC residual."""
         dx = np.linalg.lstsq(
             self.int.jacobian(),
             residual,
@@ -1103,6 +1104,7 @@ class InternalPES(PES):
         return True
 
     def _iterative_final_result(self, target, x0, dx_initial, g0):
+        """Return the realized step only if the final residual avoids ODE fallback."""
         final_residual = self.wrap_dx(target - self.get_x())
         final_rms = np.linalg.norm(final_residual) / np.sqrt(len(dx_initial))
         if final_rms > 1e-6:
