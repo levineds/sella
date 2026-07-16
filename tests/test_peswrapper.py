@@ -182,7 +182,8 @@ def test_fixatoms_does_not_enable_rigid_fragments():
                   cell=np.eye(3) * 8.0, pbc=True)
     atoms.calc = LennardJones()
     atoms.set_constraint(FixAtoms(indices=[0]))
-    pes = Sella(atoms, order=0, internal=True, optimize_cell=True).pes
+    with pytest.warns(UserWarning, match="do not span the full coordinate space"):
+        pes = Sella(atoms, order=0, internal=True, optimize_cell=True).pes
     assert pes.rigid_fragments is False
 
 
