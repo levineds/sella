@@ -1054,6 +1054,63 @@ class InternalPES(PES):
     # Falls back to ODE integrator on failure.
     # =========================================================================
 
+    def _restore_internal_positions(self, pos0, dpos0):
+        self.atoms.positions = pos0
+        self.dummies.positions = dpos0
+
+    def _iterative_residual_rms(self, target):
+        residual = self.wrap_dx(target - self.get_x())
+        rms = np.linalg.norm(residual) / np.sqrt(len(residual))
+        return residual, rms
+
+    @staticmethod
+    def _iterative_step_status(iteration, rms, initial_rms, rms_prev,
+                               stagnation_count):
+        """Classify one Newton iteration without changing convergence thresholds."""
+        if rms < 1e-8:
+            return 'converged', stagnation_count
+        if rms > initial_rms * 2.0:
+            return 'failed', stagnation_count
+
+        # Check for stagnation after the first few iterations. Three stagnant
+        # iterations are accepted only if the residual has at least halved.
+        if iteration <= 3:
+            return 'running', stagnation_count
+        if rms <= rms_prev * 0.95:
+            return 'running', 0
+
+        stagnation_count += 1
+        if stagnation_count < 3:
+            return 'running', stagnation_count
+        if rms > initial_rms * 0.5:
+            return 'failed', stagnation_count
+        return 'converged', stagnation_count
+
+    def _apply_internal_newton_step(self, residual):
+        dx = np.linalg.lstsq(
+            self.int.jacobian(),
+            residual,
+            rcond=_LSTSQ_RCOND,
+        )[0].reshape((-1, 3))
+        self.atoms.positions += dx[:len(self.atoms)]
+        self.dummies.positions += dx[len(self.atoms):]
+
+    def _bad_internals_after_iterative_step(self):
+        self.bad_int = self.int.check_for_bad_internals()
+        if self.bad_int is None:
+            return False
+        self.bad_int = None
+        return True
+
+    def _iterative_final_result(self, target, x0, dx_initial, g0):
+        final_residual = self.wrap_dx(target - self.get_x())
+        final_rms = np.linalg.norm(final_residual) / np.sqrt(len(dx_initial))
+        if final_rms > 1e-6:
+            return None
+        dx_final = self.get_x() - x0
+        g_final = self.int.jacobian() @ g0
+        return dx_initial, dx_final, g_final
+
     def _set_x_iterative(self, target, max_iter=20):
         """Fast iterative stepper for internal coordinate updates.
 
@@ -1065,7 +1122,7 @@ class InternalPES(PES):
         x0 = self.get_x()
         dx_initial = target - x0
 
-        # Get initial gradient in Cartesian space
+        # Get initial gradient in Cartesian space.
         g0 = self._get_Binv() @ self.curr.get('g', np.zeros_like(dx_initial))
 
         rms_prev = np.inf
@@ -1073,71 +1130,29 @@ class InternalPES(PES):
         stagnation_count = 0
 
         for iteration in range(max_iter):
-            residual = self.wrap_dx(target - self.get_x())
-            rms = np.linalg.norm(residual) / np.sqrt(len(residual))
-
+            residual, rms = self._iterative_residual_rms(target)
             if initial_rms is None:
                 initial_rms = rms
 
-            # Converged
-            if rms < 1e-8:
+            status, stagnation_count = self._iterative_step_status(
+                iteration, rms, initial_rms, rms_prev, stagnation_count
+            )
+            if status == 'converged':
                 break
-
-            # Check for divergence (getting significantly worse)
-            if rms > initial_rms * 2.0:
-                # Diverging, restore and fall back
-                self.atoms.positions = pos0
-                self.dummies.positions = dpos0
+            if status == 'failed':
+                self._restore_internal_positions(pos0, dpos0)
                 return None
-
-            # Check for stagnation (after first few iterations)
-            if iteration > 3:
-                if rms > rms_prev * 0.95:
-                    stagnation_count += 1
-                    if stagnation_count >= 3:
-                        # Stagnating, give up if we haven't made progress
-                        if rms > initial_rms * 0.5:
-                            self.atoms.positions = pos0
-                            self.dummies.positions = dpos0
-                            return None
-                        break  # Accept partial convergence
-                else:
-                    stagnation_count = 0
 
             rms_prev = rms
-
-            # Newton step
-            dx = np.linalg.lstsq(
-                self.int.jacobian(),
-                residual,
-                rcond=_LSTSQ_RCOND,
-            )[0].reshape((-1, 3))
-
-            # Update positions
-            self.atoms.positions += dx[:len(self.atoms)]
-            self.dummies.positions += dx[len(self.atoms):]
-
-            # Check for bad internals during iteration
-            self.bad_int = self.int.check_for_bad_internals()
-            if self.bad_int is not None:
-                # Restore and return None to trigger ODE fallback
-                self.atoms.positions = pos0
-                self.dummies.positions = dpos0
-                self.bad_int = None
+            self._apply_internal_newton_step(residual)
+            if self._bad_internals_after_iterative_step():
+                self._restore_internal_positions(pos0, dpos0)
                 return None
 
-        # After loop, verify we actually converged well enough
-        final_residual = self.wrap_dx(target - self.get_x())
-        final_rms = np.linalg.norm(final_residual) / np.sqrt(len(dx_initial))
-        if final_rms > 1e-6:
-            # Didn't converge well enough, fall back to ODE
-            self.atoms.positions = pos0
-            self.dummies.positions = dpos0
-            return None
-
-        dx_final = self.get_x() - x0
-        g_final = self.int.jacobian() @ g0
-        return dx_initial, dx_final, g_final
+        result = self._iterative_final_result(target, x0, dx_initial, g0)
+        if result is None:
+            self._restore_internal_positions(pos0, dpos0)
+        return result
 
     def _set_x_ode(self, target):
         """ODE-based stepper for internal coordinate updates.
@@ -2431,6 +2446,129 @@ class CellInternalPES(_CellPESMixin, InternalPES):
                 delta_r[group] -= com
         return delta_r
 
+    def _cell_target_parts(self, target, x0):
+        """Split target into optimizer-requested internal and cell steps."""
+        q0 = x0[:self.n_internal]
+        dq = target[:self.n_internal] - q0
+        cell_target = target[self.n_internal:]
+        cell_params0 = self._masked_cell_params()
+        return dq, cell_target, cell_params0
+
+    def _move_rigid_fragments_after_cell_change(self, cell_before, pos_before):
+        """Move rigid fragments after a cell update without changing shape.
+
+        Rigid fragment mode translates fragment CoMs to maintain fractional
+        positions, and rotates each fragment rigidly.
+
+        For ASE row-vector cells a global rotation is
+        ``cell_after = cell_before @ Q.T``, i.e. the incremental deformation
+        acting on row vectors is the RIGHT factor
+        ``M = inv(cell_before) @ cell_after`` (so a pure rotation gives M = Q.T
+        and r_new = r @ Q.T rotates correctly). Using the left factor
+        ``cell_after @ inv(cell_before)`` with ``@ R.T`` is only correct for
+        orthogonal cells and breaks objectivity on skewed cells (a pure rotation
+        would change the energy).
+        """
+        cell_after = self.atoms.get_cell().array
+        cell_before_inv = np.linalg.inv(cell_before)
+        M_inc = cell_before_inv @ cell_after
+        R_inc, _ = polar(M_inc)
+        for group, dgroup in zip(
+            self.fragment_groups, self.fragment_dummy_groups
+        ):
+            com_old = pos_before[group].mean(axis=0)
+            # Convert old CoM to fractional, then to new Cartesian.
+            com_frac = com_old @ cell_before_inv
+            com_new = com_frac @ cell_after
+            # Rotate relative positions by R (row-vector: r_new = r @ R).
+            delta_r = pos_before[group] - com_old
+            self.atoms.positions[group] = com_new + delta_r @ R_inc
+            # Move dummy atoms with the same transformation.
+            if len(dgroup) > 0:
+                didx = dgroup - self.int.natoms  # Convert to dummies index.
+                delta_d = self.dummies.positions[didx] - com_old
+                self.dummies.positions[didx] = com_new + delta_d @ R_inc
+
+    def _move_nonrigid_dummies_after_cell_change(self, cell_before):
+        """Apply ASE's fractional-preserving real-atom cell move to dummies."""
+        if len(self.dummies) == 0:
+            return
+
+        # Non-rigid mode: ASE's set_cell(scale_atoms=True) scaled the real atoms
+        # by the deformation gradient F = inv(cell_before) @ cell_after
+        # (fractional coords preserved), but it does not know about dummy atoms.
+        # Apply the same transform so dummies track the cell shear/scale instead
+        # of being left behind.
+        F = np.linalg.inv(cell_before) @ self.atoms.get_cell().array
+        self.dummies.positions = self.dummies.positions @ F
+
+    def _set_cell_and_move_attached_positions(self, cell_target):
+        """Update the cell and move atoms/dummies according to fragment mode."""
+        # Save cell before the change so we can transform atoms/dummies that
+        # ASE's set_cell does not touch.
+        cell_before = self.atoms.get_cell().array.copy()
+        pos_before = (
+            self.atoms.get_positions().copy() if self.rigid_fragments else None
+        )
+
+        # Update cell (scales atoms if rigid_fragments=False).
+        self._set_masked_cell_params(cell_target)
+
+        if self.rigid_fragments:
+            self._move_rigid_fragments_after_cell_change(cell_before, pos_before)
+        else:
+            self._move_nonrigid_dummies_after_cell_change(cell_before)
+
+    def _old_cell_gradient(self):
+        """Cell block of the old gradient for Hessian parallel transport."""
+        g_old = self.curr.get('g', None)
+        if g_old is not None:
+            return g_old[self.n_internal:].copy()
+        return np.zeros(self.n_cell_dof)
+
+    def _cell_only_step_result(self, dx_initial, cell_delta):
+        """Return the Hessian-update tuple for a pure cell step."""
+        # Cell-only case: dx_final equals the cell displacement.
+        # Return actual cell gradient at starting position for proper Hessian
+        # update (dg_actual = get_g() - g_par needs g_par to be the old gradient).
+        return dx_initial, cell_delta.copy(), self._old_cell_gradient()
+
+    def _solve_internal_after_cell(self, q_target):
+        """Run internal-coordinate ODE, then project constraints if it succeeds."""
+        # Now update atomic positions to match internal coordinate target.
+        res = self._set_x_ode_internal(q_target)
+        if res is None:
+            return None, None, False
+
+        # Project onto constraint manifold (decoupled from trust radius).
+        # Only when ODE succeeded -- the InternalPES.set_x fallback below
+        # runs its own projection internally.
+        q_after_ode = self.int.calc().copy()
+        proj_moved = self._project_to_constraints()
+        return res, q_after_ode, proj_moved
+
+    def _fallback_internal_step_after_cell(self, q_target, cell_delta,
+                                           g_old_cell):
+        """Fallback to parent internal set_x when the cell-aware ODE fails."""
+        dx_int, _, g_int = InternalPES.set_x(self, q_target)
+        dx_final = np.concatenate([dx_int, cell_delta])
+        g_final = np.concatenate([g_int, g_old_cell])
+        return dx_final, g_final
+
+    def _ode_internal_step_after_cell(self, res, q_after_ode, proj_moved,
+                                      cell_delta, g_old_cell):
+        """Combine ODE internal step, projection delta, and cell secant data."""
+        _, dx_int_final, g_int = res
+        # Combine the ODE-tangent step with the projection's IC delta so BFGS
+        # sees a coherent secant. When the projection didn't fire this is a pure
+        # passthrough of dx_int_final.
+        dx_int_realized = self._add_proj_delta(
+            dx_int_final, q_after_ode, proj_moved
+        )
+        dx_final = np.concatenate([dx_int_realized, cell_delta])
+        g_final = np.concatenate([g_int, g_old_cell])
+        return dx_final, g_final
+
     def set_x(self, target: np.ndarray):
         """Set internal coordinates and cell parameters.
 
@@ -2455,117 +2593,29 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         """
         x0 = self.get_x()
         dx_initial = target - x0
+        dq, cell_target, cell_params0 = self._cell_target_parts(target, x0)
+        cell_delta = cell_target - cell_params0
 
-        # Split target into internal and cell parts
-        # dq is the internal coordinate step the optimizer requested
-        q0 = x0[:self.n_internal]
-        dq = target[:self.n_internal] - q0
-        cell_target = target[self.n_internal:]
-
-        # Get initial cell params
-        cell_params0 = self._masked_cell_params()
-
-        # Save cell before the change so we can transform atoms/dummies that
-        # ASE's set_cell does not touch.
-        cell_before = self.atoms.get_cell().array.copy()
-        if self.rigid_fragments:
-            pos_before = self.atoms.get_positions().copy()
-
-        # Update cell (scales atoms if rigid_fragments=False)
-        self._set_masked_cell_params(cell_target)
-
-        if self.rigid_fragments:
-            # Rigid fragment mode: translate fragment CoMs to maintain
-            # fractional positions, and rotate each fragment rigidly.
-            #
-            # For ASE row-vector cells a global rotation is
-            # ``cell_after = cell_before @ Q.T``, i.e. the incremental
-            # deformation acting on row vectors is the RIGHT factor
-            # ``M = inv(cell_before) @ cell_after`` (so a pure rotation gives
-            # M = Q.T and r_new = r @ Q.T rotates correctly). Using the left
-            # factor ``cell_after @ inv(cell_before)`` with ``@ R.T`` is only
-            # correct for orthogonal cells and breaks objectivity on skewed
-            # cells (a pure rotation would change the energy).
-            cell_after = self.atoms.get_cell().array
-            cell_before_inv = np.linalg.inv(cell_before)
-            M_inc = cell_before_inv @ cell_after
-            R_inc, _ = polar(M_inc)
-            for group, dgroup in zip(self.fragment_groups,
-                                     self.fragment_dummy_groups):
-                com_old = pos_before[group].mean(axis=0)
-                # Convert old CoM to fractional, then to new Cartesian
-                com_frac = com_old @ cell_before_inv
-                com_new = com_frac @ cell_after
-                # Rotate relative positions by R (row-vector: r_new = r @ R)
-                delta_r = pos_before[group] - com_old
-                self.atoms.positions[group] = com_new + delta_r @ R_inc
-                # Move dummy atoms with the same transformation
-                if len(dgroup) > 0:
-                    didx = dgroup - self.int.natoms  # Convert to dummies index
-                    delta_d = self.dummies.positions[didx] - com_old
-                    self.dummies.positions[didx] = com_new + delta_d @ R_inc
-        elif len(self.dummies) > 0:
-            # Non-rigid mode: ASE's set_cell(scale_atoms=True) scaled the real
-            # atoms by the deformation gradient F = inv(cell_before) @ cell_after
-            # (fractional coords preserved), but it does not know about dummy
-            # atoms. Apply the same fractional-preserving transform so dummies
-            # track the cell shear/scale instead of being left behind.
-            F = np.linalg.inv(cell_before) @ self.atoms.get_cell().array
-            self.dummies.positions = self.dummies.positions @ F
+        self._set_cell_and_move_attached_positions(cell_target)
 
         # Read back internal coords AFTER the cell change moved atoms.
         # The solver targets q_after_cell + dq, not the raw q_target.
         # This ensures we don't undo the atom motion from the cell change.
-        q_after_cell = self.int.calc()
-        q_target = q_after_cell + dq
+        q_target = self.int.calc() + dq
 
-        # If there are no internal coordinates, we're done
         if self.n_internal == 0:
-            # Cell-only case: dx_final equals the cell displacement
-            dx_cell = cell_target - cell_params0
-            dx_final = dx_cell.copy()
-            # Return actual cell gradient at starting position for proper Hessian update
-            # (dg_actual = get_g() - g_par needs g_par to be the old gradient)
-            g_old = self.curr.get('g', None)
-            if g_old is not None:
-                g_final = g_old[-self.n_cell_dof:].copy()
-            else:
-                g_final = np.zeros(self.n_cell_dof)
-            return dx_initial, dx_final, g_final
+            return self._cell_only_step_result(dx_initial, cell_delta)
 
-        # Now update atomic positions to match internal coordinate target
-        res = self._set_x_ode_internal(q_target)
-
-        # Project onto constraint manifold (decoupled from trust radius).
-        # Only when ODE succeeded — the InternalPES.set_x fallback below
-        # runs its own projection internally.
-        proj_moved = False
-        if res is not None:
-            q_after_ode = self.int.calc().copy()
-            proj_moved = self._project_to_constraints()
-
-        # Get old cell gradient for parallel transport (needed for correct
-        # BFGS secant condition on the cell block of the Hessian)
-        g_old = self.curr.get('g', None)
-        if g_old is not None:
-            g_old_cell = g_old[self.n_internal:].copy()
-        else:
-            g_old_cell = np.zeros(self.n_cell_dof)
-
+        res, q_after_ode, proj_moved = self._solve_internal_after_cell(q_target)
+        g_old_cell = self._old_cell_gradient()
         if res is None:
-            # Fallback: just do parent set_x ignoring cell
-            dx_int, _, g_int = InternalPES.set_x(self, q_target)
-            dx_final = np.concatenate([dx_int, cell_target - cell_params0])
-            g_final = np.concatenate([g_int, g_old_cell])
+            dx_final, g_final = self._fallback_internal_step_after_cell(
+                q_target, cell_delta, g_old_cell
+            )
         else:
-            dx_int_initial, dx_int_final, g_int = res
-            # Combine the ODE-tangent step with the projection's IC delta
-            # so BFGS sees a coherent secant. When the projection didn't
-            # fire this is a pure passthrough of dx_int_final.
-            dx_int_realized = self._add_proj_delta(dx_int_final, q_after_ode,
-                                                    proj_moved)
-            dx_final = np.concatenate([dx_int_realized, cell_target - cell_params0])
-            g_final = np.concatenate([g_int, g_old_cell])
+            dx_final, g_final = self._ode_internal_step_after_cell(
+                res, q_after_ode, proj_moved, cell_delta, g_old_cell
+            )
 
         return dx_initial, dx_final, g_final
 
