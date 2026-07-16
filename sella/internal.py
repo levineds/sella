@@ -1,5 +1,6 @@
 from typing import (
-    Tuple, Callable, Iterator, Union, TypeVar, Optional, List, Dict, Type
+    Tuple, Callable, Iterator, Union, TypeVar, Optional, List, Dict, Type,
+    NamedTuple,
 )
 from itertools import product, combinations, permutations
 from functools import partialmethod
@@ -215,8 +216,28 @@ _dihedral_cell_grad_batched = jit(vmap(_dihedral_cell_grad_single, in_axes=(0, 0
 BLOCK_SIZE = 64
 
 
-_BATCHED_COORD_FAMILIES = (
-    dict(
+class _BatchedCoordFamily(NamedTuple):
+    key: str
+    indices_attr: str
+    ncvecs_attr: str
+    indices_padded_attr: str
+    ncvecs_padded_attr: str
+    mask_attr: str
+    n_actual_attr: str
+    flat_cols_attr: str
+    csr_offset_attr: str
+    n_atoms: int
+    n_tvecs: int
+    width: int
+    value_fn: Callable
+    grad_fn: Callable
+    hess_fn: Callable
+    hvp_fn: Callable
+    cell_grad_fn: Callable
+
+
+_BATCHED_COORD_FAMILIES: Tuple[_BatchedCoordFamily, ...] = (
+    _BatchedCoordFamily(
         key='bonds',
         indices_attr='_bond_indices',
         ncvecs_attr='_bond_ncvecs',
@@ -235,7 +256,7 @@ _BATCHED_COORD_FAMILIES = (
         hvp_fn=_bond_hvp_batched,
         cell_grad_fn=_bond_cell_grad_batched,
     ),
-    dict(
+    _BatchedCoordFamily(
         key='angles',
         indices_attr='_angle_indices',
         ncvecs_attr='_angle_ncvecs',
@@ -254,7 +275,7 @@ _BATCHED_COORD_FAMILIES = (
         hvp_fn=_angle_hvp_batched,
         cell_grad_fn=_angle_cell_grad_batched,
     ),
-    dict(
+    _BatchedCoordFamily(
         key='dihedrals',
         indices_attr='_dihedral_indices',
         ncvecs_attr='_dihedral_ncvecs',
@@ -1685,7 +1706,7 @@ class BaseInternals:
             axis=1,
         )
 
-    def _build_batched_family_arrays(self, spec) -> None:
+    def _build_batched_family_arrays(self, spec: _BatchedCoordFamily) -> None:
         """Build padded and unpadded arrays for one vectorized coordinate family.
 
         Unpadded arrays are used for result indexing and sparse scatter. Padded
@@ -1693,10 +1714,10 @@ class BaseInternals:
         consistent shapes and avoid recompilation. Masks are stored for kernels
         that need to ignore padded entries.
         """
-        coords = self.internals[spec['key']]
+        coords = self.internals[spec.key]
         n_coords = len(coords)
-        n_atoms = spec['n_atoms']
-        n_tvecs = spec['n_tvecs']
+        n_atoms = spec.n_atoms
+        n_tvecs = spec.n_tvecs
 
         if n_coords > 0:
             n_padded = self._pad_to_block(n_coords)
@@ -1717,16 +1738,16 @@ class BaseInternals:
             ncvecs_padded = ncvecs.copy()
             mask = np.empty(0, dtype=np.float64)
 
-        setattr(self, spec['indices_attr'], indices)
-        setattr(self, spec['ncvecs_attr'], ncvecs)
-        setattr(self, spec['indices_padded_attr'], indices_padded)
-        setattr(self, spec['ncvecs_padded_attr'], ncvecs_padded)
-        setattr(self, spec['mask_attr'], mask)
-        setattr(self, spec['n_actual_attr'], n_coords)
+        setattr(self, spec.indices_attr, indices)
+        setattr(self, spec.ncvecs_attr, ncvecs)
+        setattr(self, spec.indices_padded_attr, indices_padded)
+        setattr(self, spec.ncvecs_padded_attr, ncvecs_padded)
+        setattr(self, spec.mask_attr, mask)
+        setattr(self, spec.n_actual_attr, n_coords)
         setattr(
             self,
-            spec['flat_cols_attr'],
-            self._flat_cols(indices, n_atoms, spec['width']),
+            spec.flat_cols_attr,
+            self._flat_cols(indices, n_atoms, spec.width),
         )
 
     def _build_hvp_csr_structure(self) -> None:
@@ -1742,17 +1763,17 @@ class BaseInternals:
         n_rot = len(self.internals['rotations'])
         n_active = n_trans + n_other + n_rot
         for spec in _BATCHED_COORD_FAMILIES:
-            n_active += getattr(self, spec['n_actual_attr'])
+            n_active += getattr(self, spec.n_actual_attr)
 
         col_blocks = []
         nnz_per_row = [0] * n_trans
         data_offset = 0
         for spec in _BATCHED_COORD_FAMILIES:
-            n_coords = getattr(self, spec['n_actual_attr'])
-            setattr(self, spec['csr_offset_attr'], data_offset)
+            n_coords = getattr(self, spec.n_actual_attr)
+            setattr(self, spec.csr_offset_attr, data_offset)
             if n_coords > 0:
-                width = spec['width']
-                col_blocks.append(getattr(self, spec['flat_cols_attr']).ravel())
+                width = spec.width
+                col_blocks.append(getattr(self, spec.flat_cols_attr).ravel())
                 nnz_per_row.extend([width] * n_coords)
                 data_offset += n_coords * width
 
@@ -1810,17 +1831,17 @@ class BaseInternals:
         # n_tvec = 1/2/3 for bonds/angles/dihedrals. Unpadded entries are used
         # for result indexing; padded entries are used for GPU-friendly batch ops.
         for spec in _BATCHED_COORD_FAMILIES:
-            key = spec['key']
-            n_tvecs = spec['n_tvecs']
+            key = spec.key
+            n_tvecs = spec.n_tvecs
             tvecs[key] = self._tvec_or_empty(
-                getattr(self, spec['indices_attr']),
-                getattr(self, spec['ncvecs_attr']),
+                getattr(self, spec.indices_attr),
+                getattr(self, spec.ncvecs_attr),
                 cell,
                 n_tvecs,
             )
             tvecs[f'{key}_padded'] = self._tvec_or_empty(
-                getattr(self, spec['indices_padded_attr']),
-                getattr(self, spec['ncvecs_padded_attr']),
+                getattr(self, spec.indices_padded_attr),
+                getattr(self, spec.ncvecs_padded_attr),
                 cell,
                 n_tvecs,
             )
@@ -1852,24 +1873,25 @@ class BaseInternals:
         """Invalidate batched arrays (call when internals change)."""
         self._invalidate_structure()
 
-    def _compute_batched_value_family(self, spec, positions, tvecs):
+    def _compute_batched_value_family(self, spec: _BatchedCoordFamily,
+                                      positions, tvecs):
         """Compute values for one batched family, then slice off padding."""
-        n_actual = getattr(self, spec['n_actual_attr'])
+        n_actual = getattr(self, spec.n_actual_attr)
         if n_actual == 0:
             return np.empty(0)
-        pos = positions[getattr(self, spec['indices_padded_attr'])]
-        values = spec['value_fn'](pos, tvecs[f"{spec['key']}_padded"])
+        pos = positions[getattr(self, spec.indices_padded_attr)]
+        values = spec.value_fn(pos, tvecs[f"{spec.key}_padded"])
         return np.asarray(device_get(values))[:n_actual]
 
-    def _compute_batched_tensor_family(self, spec, positions, tvecs, fn,
-                                       empty_tail):
+    def _compute_batched_tensor_family(self, spec: _BatchedCoordFamily,
+                                       positions, tvecs, fn, empty_tail):
         """Compute gradient/Hessian tensors for one family with padded batches."""
-        n_actual = getattr(self, spec['n_actual_attr'])
-        indices = getattr(self, spec['indices_attr'])
+        n_actual = getattr(self, spec.n_actual_attr)
+        indices = getattr(self, spec.indices_attr)
         if n_actual == 0:
             return indices, np.empty((0,) + empty_tail)
-        pos = positions[getattr(self, spec['indices_padded_attr'])]
-        padded = fn(pos, tvecs[f"{spec['key']}_padded"])
+        pos = positions[getattr(self, spec.indices_padded_attr)]
+        padded = fn(pos, tvecs[f"{spec.key}_padded"])
         return indices, np.asarray(device_get(padded))[:n_actual]
 
     def _compute_batched_values(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
@@ -1880,7 +1902,7 @@ class BaseInternals:
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
         return {
-            spec['key']: self._compute_batched_value_family(
+            spec.key: self._compute_batched_value_family(
                 spec, positions, tvecs
             )
             for spec in _BATCHED_COORD_FAMILIES
@@ -1895,9 +1917,9 @@ class BaseInternals:
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
         return {
-            spec['key']: self._compute_batched_tensor_family(
-                spec, positions, tvecs, spec['grad_fn'],
-                (spec['n_atoms'], 3),
+            spec.key: self._compute_batched_tensor_family(
+                spec, positions, tvecs, spec.grad_fn,
+                (spec.n_atoms, 3),
             )
             for spec in _BATCHED_COORD_FAMILIES
         }
@@ -1911,9 +1933,9 @@ class BaseInternals:
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
         return {
-            spec['key']: self._compute_batched_tensor_family(
-                spec, positions, tvecs, spec['hess_fn'],
-                (spec['n_atoms'], 3, spec['n_atoms'], 3),
+            spec.key: self._compute_batched_tensor_family(
+                spec, positions, tvecs, spec.hess_fn,
+                (spec.n_atoms, 3, spec.n_atoms, 3),
             )
             for spec in _BATCHED_COORD_FAMILIES
         }
@@ -1930,9 +1952,9 @@ class BaseInternals:
         result = {}
 
         for spec in _BATCHED_COORD_FAMILIES:
-            key = spec['key']
-            n_actual = getattr(self, spec['n_actual_attr'])
-            ncvecs = getattr(self, spec['ncvecs_attr'])
+            key = spec.key
+            n_actual = getattr(self, spec.n_actual_attr)
+            ncvecs = getattr(self, spec.ncvecs_attr)
             if n_actual == 0:
                 result[key] = np.empty((0, 3, 3))
                 continue
@@ -1943,14 +1965,14 @@ class BaseInternals:
             if cell_jax is None:
                 cell_jax = jnp.asarray(cell, dtype=np.float64)
             pos = jnp.asarray(
-                positions[getattr(self, spec['indices_padded_attr'])],
+                positions[getattr(self, spec.indices_padded_attr)],
                 dtype=np.float64,
             )
             ncvecs_padded = jnp.asarray(
-                getattr(self, spec['ncvecs_padded_attr']),
+                getattr(self, spec.ncvecs_padded_attr),
                 dtype=np.float64,
             )
-            grads = spec['cell_grad_fn'](pos, ncvecs_padded, cell_jax)
+            grads = spec.cell_grad_fn(pos, ncvecs_padded, cell_jax)
             result[key] = np.asarray(device_get(grads))[:n_actual]
 
         return result
@@ -2078,7 +2100,7 @@ class BaseInternals:
             _BATCHED_COORD_FAMILIES,
             (bonds_active, angles_active, dihedrals_active),
         ):
-            indices, grads = batched[spec['key']]
+            indices, grads = batched[spec.key]
             row = self._scatter_batched_jacobian_family(
                 B, row, indices, grads, active
             )
@@ -2159,7 +2181,7 @@ class BaseInternals:
             (bonds_active, angles_active, dihedrals_active),
         ):
             row = self._scatter_batched_cell_gradient_family(
-                B_cell, row, cell_grads[spec['key']], active
+                B_cell, row, cell_grads[spec.key], active
             )
 
         # Other has zero cell derivatives (custom coordinates, not periodic)
@@ -2449,7 +2471,7 @@ class BaseInternals:
             _BATCHED_COORD_FAMILIES,
             (bonds_active, angles_active, dihedrals_active),
         ):
-            indices, hess = batched[spec['key']]
+            indices, hess = batched[spec.key]
             self._append_batched_hessian_family(
                 hessians, n_atoms, indices, hess, active
             )
@@ -2499,8 +2521,8 @@ class BaseInternals:
     def _active_array(active):
         return np.asarray(active, dtype=bool)
 
-    def _launch_batched_hvp_family(self, spec, positions, tvecs, v_atoms,
-                                   active):
+    def _launch_batched_hvp_family(self, spec: _BatchedCoordFamily,
+                                   positions, tvecs, v_atoms, active):
         """Launch one batched HVP kernel for active coordinates.
 
         If every coordinate in the family is active, use padded arrays to keep the
@@ -2509,21 +2531,21 @@ class BaseInternals:
         inactive rows.
         """
         active = self._active_array(active)
-        n_actual = getattr(self, spec['n_actual_attr'])
+        n_actual = getattr(self, spec.n_actual_attr)
         if n_actual == 0 or not active.any():
             return None
 
         if active.all():
-            indices = getattr(self, spec['indices_padded_attr'])
+            indices = getattr(self, spec.indices_padded_attr)
             pos = positions[indices]
-            tvec = tvecs[f"{spec['key']}_padded"]
+            tvec = tvecs[f"{spec.key}_padded"]
             v_sub = v_atoms[indices]
         else:
-            indices = getattr(self, spec['indices_attr'])[active]
+            indices = getattr(self, spec.indices_attr)[active]
             pos = positions[indices]
-            tvec = tvecs[spec['key']][active]
+            tvec = tvecs[spec.key][active]
             v_sub = v_atoms[indices]
-        return spec['hvp_fn'](pos, tvec, v_sub)
+        return spec.hvp_fn(pos, tvec, v_sub)
 
     def _scatter_batched_jacobian_family(self, B, row, indices, grads,
                                          active):
@@ -2638,7 +2660,7 @@ class BaseInternals:
 
         batched_active = (bonds_active, angles_active, dihedrals_active)
         batched_hvp = {
-            spec['key']: self._launch_batched_hvp_family(
+            spec.key: self._launch_batched_hvp_family(
                 spec, positions, tvecs, v_atoms, active
             )
             for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active)
@@ -2685,9 +2707,9 @@ class BaseInternals:
 
         for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active):
             row = self._contract_batched_hvp_family(
-                batched_hvp[spec['key']], active,
-                getattr(self, spec['n_actual_attr']),
-                getattr(self, spec['indices_attr']),
+                batched_hvp[spec.key], active,
+                getattr(self, spec.n_actual_attr),
+                getattr(self, spec.indices_attr),
                 mat_atoms, out, row,
             )
 
@@ -2791,7 +2813,7 @@ class BaseInternals:
 
         batched_active = (bonds_active, angles_active, dihedrals_active)
         batched_hvp = {
-            spec['key']: self._launch_batched_hvp_family(
+            spec.key: self._launch_batched_hvp_family(
                 spec, positions, tvecs, v_atoms, active
             )
             for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active)
@@ -2842,11 +2864,11 @@ class BaseInternals:
 
         for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active):
             row = self._scatter_batched_family(
-                batched_hvp[spec['key']], active,
-                getattr(self, spec['n_actual_attr']),
-                getattr(self, spec['flat_cols_attr']),
-                getattr(self, spec['csr_offset_attr']),
-                spec['width'], use_sparse, data, out, row,
+                batched_hvp[spec.key], active,
+                getattr(self, spec.n_actual_attr),
+                getattr(self, spec.flat_cols_attr),
+                getattr(self, spec.csr_offset_attr),
+                spec.width, use_sparse, data, out, row,
             )
 
         # Other - use existing hessian computation (typically few coords, loop is fine)
