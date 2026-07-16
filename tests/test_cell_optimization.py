@@ -12,7 +12,9 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from ase.constraints import FixAtoms, FixBondLength
 
 from sella import Sella
-from sella.peswrapper import CellInternalPES, CellCartesianPES, _logm_3x3
+from sella.peswrapper import (
+    InternalPES, CellInternalPES, CellCartesianPES, _logm_3x3
+)
 from sella.internal import Internals, Bond, Angle, Constraints
 
 
@@ -2116,6 +2118,34 @@ class TestDummyAtomCellHandling:
         return atoms
 
     @staticmethod
+    def _linear_co2_with_off_axis_probe():
+        atoms = Atoms(
+            'OCOH',
+            positions=[
+                [0.0, 0.0, 0.0],
+                [1.16, 0.0, 0.0],
+                [2.32, 0.0, 0.0],
+                [4.0, 1.7, 0.9],
+            ],
+        )
+        atoms.calc = LennardJones()
+        return atoms
+
+    @staticmethod
+    def _mostly_linear_hoh(cell_diag=10.0):
+        theta = np.deg2rad(178.0)
+        r = 0.96
+        positions = np.array([
+            [r, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [r * np.cos(theta), r * np.sin(theta), 0.0],
+        ]) + 0.5 * cell_diag
+        atoms = Atoms('HOH', positions=positions,
+                      cell=np.eye(3) * cell_diag, pbc=True)
+        atoms.calc = LennardJones()
+        return atoms
+
+    @staticmethod
     def _two_linear_co2(cell_diag=10.0):
         # Two separated CO2, second off-axis so a cell shear rotates it.
         atoms = Atoms('OCOOCO',
@@ -2229,6 +2259,113 @@ class TestDummyAtomCellHandling:
         assert_allclose(dx_final[list(aux_rows)], 0.0, atol=1e-12)
         ddih = pes._wrapped_angle_delta(pes._dummy_dihedral_values(), dih0)
         assert_allclose(ddih, 0.0, atol=1e-8)
+
+    def test_linear_dummy_projection_accounts_free_dummy_dihedral(self):
+        atoms = self._linear_co2_with_off_axis_probe()
+        internals = Internals(atoms)
+        internals.find_all_bonds()
+        internals.find_all_angles()
+        internals.find_all_dihedrals()
+
+        natoms = internals.natoms
+        extra_dihedral = (natoms, 0, 3, 1)
+        internals.add_dihedral(extra_dihedral)
+        pes = InternalPES(atoms, internals, auto_find_internals=False)
+        pes.get_g()
+
+        extra_row = None
+        row = 0
+        for name in pes.int._names:
+            for coord, active in zip(pes.int.internals[name],
+                                     pes.int._active[name]):
+                if active:
+                    if (name == 'dihedrals'
+                            and tuple(coord.indices) == extra_dihedral):
+                        extra_row = row
+                    row += 1
+        assert extra_row is not None
+        aux_rows = pes._dummy_auxiliary_projection_filter_rows()
+        assert extra_row not in aux_rows
+
+        pes.dummies.positions += np.array([[8e-4, -1.7e-3, 1.1e-3]])
+        target = pes.get_x().copy()
+        dx_initial, dx_final, _ = pes.set_x(target)
+        actual_delta = pes._wrapped_angle_delta(
+            np.array([pes.get_x()[extra_row]]),
+            np.array([target[extra_row]]),
+        )[0]
+
+        assert pes._last_linear_dummy_projection_mode == 'cone'
+        assert pes._last_linear_dummy_projection_ddih > 1e-4
+        assert abs(actual_delta) > 1e-4
+        assert_allclose(dx_initial, 0.0, atol=1e-14)
+        assert_allclose(dx_final[list(aux_rows)], 0.0, atol=1e-12)
+        assert_allclose(dx_final[extra_row], actual_delta, atol=1e-10)
+
+    def test_near_linear_hoh_bend_rows_are_accounted(self):
+        def make_pes():
+            return Sella(
+                self._mostly_linear_hoh(),
+                order=0,
+                internal=True,
+                optimize_cell=True,
+                allow_fragments=True,
+                rigid_fragments=True,
+                logfile=None,
+            ).pes
+
+        def dummy_rows(pes):
+            natoms = pes.int.natoms
+            aux_rows = set(pes._dummy_auxiliary_projection_filter_rows())
+            rows = []
+            row = 0
+            for name in pes.int._names:
+                for coord, active in zip(pes.int.internals[name],
+                                         pes.int._active[name]):
+                    if active:
+                        has_dummy = np.any(np.asarray(coord.indices) >= natoms)
+                        rows.append((row, name, has_dummy, row in aux_rows))
+                        row += 1
+            return rows
+
+        pes = make_pes()
+        rows = dummy_rows(pes)
+        free_angles = [
+            row for row, name, has_dummy, is_aux in rows
+            if name == 'angles' and has_dummy and not is_aux
+        ]
+        free_dihedrals = [
+            row for row, name, has_dummy, is_aux in rows
+            if name == 'dihedrals' and has_dummy and not is_aux
+        ]
+        aux_rows = list(pes._dummy_auxiliary_projection_filter_rows())
+        assert len(free_angles) == 1
+        assert len(free_dihedrals) == 1
+        assert len(aux_rows) > 0
+
+        pes.get_g()
+        pes.dummies.positions += np.array([[7e-4, -1.3e-3, 9e-4]])
+        target = pes.get_x().copy()
+        dx_initial, dx_final, _ = pes.set_x(target)
+
+        assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
+        assert_allclose(dx_initial, 0.0, atol=1e-14)
+        assert_allclose(dx_final[list(aux_rows)], 0.0, atol=1e-12)
+        assert abs(dx_final[free_angles[0]]) > 1e-4
+        assert abs(dx_final[free_dihedrals[0]]) > 1e-10
+
+        for row in free_angles + free_dihedrals:
+            pes = make_pes()
+            pes.get_g()
+            x0 = pes.get_x().copy()
+            target = x0.copy()
+            target[row] += 1e-3
+            dx_initial, dx_final, _ = pes.set_x(target)
+
+            assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
+            assert_allclose(dx_initial[row], 1e-3, atol=1e-12)
+            assert_allclose(dx_final[row], 1e-3, atol=1e-8)
+            assert_allclose(dx_final[list(aux_rows)], 0.0, atol=1e-10)
 
     def test_linear_dummy_projection_preserves_requested_dummy_rows(self):
         pes = Sella(self._two_linear_co2(), order=0, internal=True,
