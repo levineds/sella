@@ -550,6 +550,9 @@ class PES:
     def get_res(self):
         return self.cons.residual()
 
+    def get_convergence_res(self):
+        return self.get_res()
+
     def get_drdx(self):
         return self.cons.jacobian()
 
@@ -737,7 +740,7 @@ class PES:
 
     def converged(self, fmax, cmax=1e-5):
         fmax1 = np.linalg.norm(self.get_projected_forces(), axis=1).max()
-        cmax1 = np.linalg.norm(self.get_res())
+        cmax1 = np.linalg.norm(self.get_convergence_res())
         conv = (fmax1 < fmax) and (cmax1 < cmax)
         return conv, fmax1, cmax1
 
@@ -1244,6 +1247,10 @@ class InternalPES(PES):
                 (delta_proj[dih_start:dih_end] + np.pi)
                 % (2 * np.pi) - np.pi
             )
+        filter_rows = getattr(self, '_last_projection_filter_rows', ())
+        if filter_rows:
+            delta_proj[np.asarray(filter_rows, dtype=int)] = 0.0
+            self._last_projection_filter_rows = ()
         return dx_int_final + delta_proj
 
     def _project_to_constraints(self, target_tol=1e-7, max_iter=8,
@@ -1281,6 +1288,7 @@ class InternalPES(PES):
         Hessian noise. Bailing leaves the projection as a strict
         improvement: it can only help, never hurt.
         """
+        self._last_projection_filter_rows = ()
         if self.cons.residual().size == 0:
             return False
 
@@ -1288,6 +1296,7 @@ class InternalPES(PES):
         if np.linalg.norm(r, ord=np.inf) < target_tol:
             return False
 
+        self._last_linear_dummy_projection_mode = None
         moved = self._project_linear_bend_dummies(
             target_tol=target_tol,
             safety_limit=safety_limit,
@@ -1299,31 +1308,103 @@ class InternalPES(PES):
         n_dummy = 3 * len(self.dummies)
         moved = False
 
-        for _ in range(max_iter):
-            r = self.cons.residual()
-            if np.linalg.norm(r, ord=np.inf) < target_tol:
-                return moved
+        self._force_linear_dummy_constraint_basis = True
+        try:
+            for _ in range(max_iter):
+                r = self.cons.residual()
+                if np.linalg.norm(r, ord=np.inf) < target_tol:
+                    return moved
 
-            # _compute_basis_int returns (drdx, Ucons, Unred, Ufree) for the
-            # internal-only block (no cell DOF). drdx is ncons × n_int in
-            # IC space; Ucons is n_int × ncons'.
-            drdx, Ucons, _, _ = self._compute_basis_int()
-            if Ucons.shape[1] == 0:
-                return moved  # no constraint subspace — nothing to project
+                # _compute_basis_int returns (drdx, Ucons, Unred, Ufree) for the
+                # internal-only block (no cell DOF). drdx is ncons × n_int in
+                # IC space; Ucons is n_int × ncons'.
+                drdx, Ucons, _, _ = self._compute_basis_int()
+                if Ucons.shape[1] == 0:
+                    return moved  # no constraint subspace — nothing to project
 
-            s, *_ = np.linalg.lstsq(drdx @ Ucons, -r, rcond=_LSTSQ_RCOND)
-            dq_int = Ucons @ s                       # IC-space step (n_int,)
-            dx = self._get_Binv() @ dq_int            # Cartesian (n_cart,)
+                s, *_ = np.linalg.lstsq(drdx @ Ucons, -r, rcond=_LSTSQ_RCOND)
+                dq_int = Ucons @ s                       # IC-space step (n_int,)
+                dx = self._get_Binv() @ dq_int            # Cartesian (n_cart,)
 
-            if np.linalg.norm(dx, ord=np.inf) > safety_limit:
-                return moved  # would override optimizer's step — bail
+                if np.linalg.norm(dx, ord=np.inf) > safety_limit:
+                    return moved  # would override optimizer's step — bail
 
-            self.atoms.positions += dx[:n_real].reshape(-1, 3)
-            if n_dummy > 0:
-                self.dummies.positions += dx[n_real:n_real + n_dummy].reshape(-1, 3)
-            moved = True
+                self.atoms.positions += dx[:n_real].reshape(-1, 3)
+                if n_dummy > 0:
+                    self.dummies.positions += dx[n_real:n_real + n_dummy].reshape(-1, 3)
+                moved = True
+        finally:
+            self._force_linear_dummy_constraint_basis = False
 
         return moved
+
+    def _dummy_dihedral_values(self):
+        natoms = self.int.natoms
+        vals = []
+        atoms = self.int.all_atoms
+        for coord, active in zip(self.int.internals['dihedrals'],
+                                 self.int._active['dihedrals']):
+            if active and np.any(np.asarray(coord.indices) >= natoms):
+                vals.append(float(coord.calc(atoms)))
+        return np.asarray(vals)
+
+    def _dummy_containing_coord_rows(self):
+        natoms = self.int.natoms
+        rows = []
+        row = 0
+        for name in self.int._names:
+            for coord, active in zip(self.int.internals[name],
+                                     self.int._active[name]):
+                if not active:
+                    continue
+                if np.any(np.asarray(coord.indices) >= natoms):
+                    rows.append(row)
+                row += 1
+        return tuple(sorted(set(rows)))
+
+    @staticmethod
+    def _wrapped_angle_delta(after, before):
+        return (after - before + np.pi) % (2 * np.pi) - np.pi
+
+    @staticmethod
+    def _project_one_linear_dummy_on_cone(positions, cell, dummy, parent,
+                                          length, angle_coord, theta,
+                                          dummy_is_first, safety_limit):
+        ids = np.asarray(angle_coord.indices, dtype=int)
+        tvecs = angle_coord.kwargs['ncvecs'] @ cell
+        old_pos = positions[dummy].copy()
+
+        if dummy_is_first:
+            neighbor_vec = positions[ids[2]] - positions[parent] + tvecs[1]
+            dummy_shift = tvecs[0]
+            current = positions[dummy] - positions[parent] - dummy_shift
+        else:
+            neighbor_vec = positions[ids[0]] - positions[parent] - tvecs[0]
+            dummy_shift = -tvecs[1]
+            current = positions[dummy] - positions[parent] - dummy_shift
+
+        neighbor_norm = np.linalg.norm(neighbor_vec)
+        if neighbor_norm <= 1e-12:
+            return False
+        axis = neighbor_vec / neighbor_norm
+        perp = current - (current @ axis) * axis
+        perp_norm = np.linalg.norm(perp)
+        if perp_norm <= 1e-12:
+            fallback = np.zeros(3)
+            fallback[np.argmin(np.abs(axis))] = 1.0
+            perp = fallback - (fallback @ axis) * axis
+            perp_norm = np.linalg.norm(perp)
+        azimuth = perp / perp_norm
+
+        new_vec = length * (
+            np.cos(theta) * axis + np.sin(theta) * azimuth
+        )
+        positions[dummy] = positions[parent] + dummy_shift + new_vec
+        if np.linalg.norm(positions[dummy] - old_pos,
+                          ord=np.inf) > safety_limit:
+            positions[dummy] = old_pos
+            return False
+        return True
 
     def _linear_bend_dummy_projection_records(self):
         """Return dummy projection records, or None for the general path."""
@@ -1354,7 +1435,7 @@ class InternalPES(PES):
             parent = int(reals[0])
             if parent_of.get(dummy) != parent or dummy in bond_rec:
                 return None
-            bond_rec[dummy] = (parent, float(target))
+            bond_rec[dummy] = (parent, coord, float(target))
 
         for coord, active, target in zip(self.cons.internals['angles'],
                                          self.cons._active['angles'],
@@ -1379,6 +1460,7 @@ class InternalPES(PES):
 
         return [
             (dummy, bond_rec[dummy][0], bond_rec[dummy][1],
+             bond_rec[dummy][2],
              angle_rec[dummy][0], angle_rec[dummy][1], angle_rec[dummy][2])
             for dummy in sorted(bond_rec)
         ]
@@ -1401,6 +1483,14 @@ class InternalPES(PES):
                     return False
         return True
 
+    def get_convergence_res(self):
+        res = self.get_res()
+        if res.size == 0:
+            return res
+        if self._linear_bend_dummy_projection_records() is None:
+            return res
+        return res[:0]
+
     @staticmethod
     def _split_real_dummy_ids(indices, natoms):
         ids = np.asarray(indices, dtype=int)
@@ -1421,62 +1511,41 @@ class InternalPES(PES):
         if records is None:
             return None
 
-        natoms = self.int.natoms
         old_dpos = self.dummies.positions.copy()
-        if len(self.dummies) > 0:
-            all_positions = np.vstack([self.atoms.positions,
-                                       self.dummies.positions])
-        else:
-            all_positions = self.atoms.positions
+        dummy_dihedrals0 = self._dummy_dihedral_values()
+        all_positions = np.vstack([self.atoms.positions,
+                                   self.dummies.positions])
         cell = self.atoms.cell.array
 
-        for dummy, parent, length, angle_coord, theta, dummy_is_first in records:
+        for (dummy, parent, bond_coord, length, angle_coord, theta,
+             dummy_is_first) in records:
             if length <= 0 or theta <= 1e-8 or abs(np.pi - theta) <= 1e-8:
                 self.dummies.positions[:] = old_dpos
                 return None
 
-            ids = np.asarray(angle_coord.indices, dtype=int)
-            tvecs = angle_coord.kwargs['ncvecs'] @ cell
-            if dummy_is_first:
-                neighbor_vec = all_positions[ids[2]] - all_positions[parent] + tvecs[1]
-                dummy_shift = tvecs[0]
-                current = all_positions[dummy] - all_positions[parent] - dummy_shift
-            else:
-                neighbor_vec = all_positions[ids[0]] - all_positions[parent] - tvecs[0]
-                dummy_shift = -tvecs[1]
-                current = all_positions[dummy] - all_positions[parent] - dummy_shift
-
-            neighbor_norm = np.linalg.norm(neighbor_vec)
-            if neighbor_norm <= 1e-12:
-                self.dummies.positions[:] = old_dpos
-                return None
-            axis = neighbor_vec / neighbor_norm
-            perp = current - (current @ axis) * axis
-            perp_norm = np.linalg.norm(perp)
-            if perp_norm <= 1e-12:
-                fallback = np.zeros(3)
-                fallback[np.argmin(np.abs(axis))] = 1.0
-                perp = fallback - (fallback @ axis) * axis
-                perp_norm = np.linalg.norm(perp)
-            azimuth = perp / perp_norm
-
-            new_vec = length * (
-                np.cos(theta) * axis + np.sin(theta) * azimuth
-            )
-            local_dummy = dummy - natoms
-            old_pos = self.dummies.positions[local_dummy].copy()
-            self.dummies.positions[local_dummy] = (
-                all_positions[parent] + dummy_shift + new_vec
-            )
-            if (np.linalg.norm(self.dummies.positions[local_dummy] - old_pos,
-                               ord=np.inf) > safety_limit):
+            if not self._project_one_linear_dummy_on_cone(
+                all_positions, cell, dummy, parent, length, angle_coord,
+                theta, dummy_is_first, safety_limit,
+            ):
                 self.dummies.positions[:] = old_dpos
                 return None
 
+        self.dummies.positions[:] = all_positions[self.int.natoms:]
         residual = self.cons.residual()
         if np.linalg.norm(residual, ord=np.inf) >= target_tol:
             self.dummies.positions[:] = old_dpos
             return None
+        dummy_dihedrals1 = self._dummy_dihedral_values()
+        if dummy_dihedrals0.size:
+            ddih = self._wrapped_angle_delta(dummy_dihedrals1,
+                                             dummy_dihedrals0)
+            self._last_linear_dummy_projection_ddih = float(
+                np.linalg.norm(ddih, ord=np.inf)
+            )
+        else:
+            self._last_linear_dummy_projection_ddih = 0.0
+        self._last_linear_dummy_projection_mode = 'cone'
+        self._last_projection_filter_rows = self._dummy_containing_coord_rows()
         return True
 
     def get_x(self):
@@ -1542,7 +1611,9 @@ class InternalPES(PES):
         """
         Q, R = self._get_jacobian_qr()
         n_int = Q.shape[0]
-        if self._linear_bend_dummy_projection_records() is not None:
+        if (self._linear_bend_dummy_projection_records() is not None
+                and not getattr(self, '_force_linear_dummy_constraint_basis',
+                                False)):
             # Linear-bend dummy constraints are auxiliary: they only keep each
             # dummy on its parent bond/angle cone and are enforced exactly after
             # every step by _project_linear_bend_dummies(). Keeping them in the
@@ -2939,7 +3010,7 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         smax_actual = self._cell_convergence_max(g_cell, smax)
 
         # Constraint residual
-        cmax_actual = np.linalg.norm(self.get_res())
+        cmax_actual = np.linalg.norm(self.get_convergence_res())
 
         conv = ((fmax_actual < fmax)
                 and (smax_actual < smax_threshold)
@@ -3250,7 +3321,7 @@ class CellCartesianPES(_CellPESMixin, PES):
         smax_actual = self._cell_convergence_max(g_cell, smax)
 
         # Constraint residual
-        cmax_actual = np.linalg.norm(self.get_res())
+        cmax_actual = np.linalg.norm(self.get_convergence_res())
 
         conv = ((fmax_actual < fmax)
                 and (smax_actual < smax_threshold)

@@ -2197,6 +2197,55 @@ class TestDummyAtomCellHandling:
         assert_allclose(pes.atoms.positions, apos0, atol=1e-12)
         assert np.linalg.norm(pes.cons.residual(), ord=np.inf) < 1e-7
 
+    def test_linear_dummy_residual_is_auxiliary_for_convergence(self):
+        pes = Sella(self._two_linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True,
+                    rigid_fragments=True, logfile=None).pes
+        assert pes._linear_bend_dummy_projection_records() is not None
+
+        pes.dummies.positions += np.array([1e-3, -2e-3, 1.5e-3])
+        assert np.linalg.norm(pes.get_res()) > 1e-5
+        assert_allclose(np.linalg.norm(pes.get_convergence_res()), 0.0)
+
+    def test_linear_dummy_projection_filters_projection_only_dummy_rows(self):
+        pes = Sella(self._two_linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True,
+                    rigid_fragments=True, logfile=None).pes
+        pes.get_g()
+
+        pes.dummies.positions += np.array([1e-3, -2e-3, 1.5e-3])
+        x0 = pes.get_x().copy()
+        pes.get_g()
+        dummy_rows = pes._dummy_containing_coord_rows()
+        dih0 = pes._dummy_dihedral_values()
+
+        dx_initial, dx_final, _ = pes.set_x(x0)
+
+        assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
+        assert_allclose(dx_initial, 0.0, atol=1e-14)
+        assert_allclose(dx_final, 0.0, atol=1e-12)
+        assert len(dummy_rows) > 0
+        ddih = pes._wrapped_angle_delta(pes._dummy_dihedral_values(), dih0)
+        assert_allclose(ddih, 0.0, atol=1e-8)
+
+    def test_linear_dummy_projection_preserves_requested_dummy_rows(self):
+        pes = Sella(self._two_linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True,
+                    rigid_fragments=True, logfile=None).pes
+        dummy_rows = pes._dummy_containing_coord_rows()
+        assert len(dummy_rows) > 0
+
+        requested = np.zeros(pes.int.nint)
+        requested[dummy_rows[-1]] = 3e-4
+        q_after_ode = pes.int.calc().copy()
+        pes.dummies.positions += np.array([1e-3, -2e-3, 1.5e-3])
+        pes._last_projection_filter_rows = dummy_rows
+
+        dx_final = pes._add_proj_delta(requested, q_after_ode, True)
+
+        assert_allclose(dx_final[list(dummy_rows)],
+                        requested[list(dummy_rows)], atol=1e-12)
+
 
 class TestRestrictedAtomicStepCellDOF:
     """Cartesian cell optimization must not crash under the default limiter.
