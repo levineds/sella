@@ -215,6 +215,67 @@ _dihedral_cell_grad_batched = jit(vmap(_dihedral_cell_grad_single, in_axes=(0, 0
 BLOCK_SIZE = 64
 
 
+_BATCHED_COORD_FAMILIES = (
+    dict(
+        key='bonds',
+        indices_attr='_bond_indices',
+        ncvecs_attr='_bond_ncvecs',
+        indices_padded_attr='_bond_indices_padded',
+        ncvecs_padded_attr='_bond_ncvecs_padded',
+        mask_attr='_bond_mask',
+        n_actual_attr='_n_bonds_actual',
+        flat_cols_attr='_bond_flat_cols',
+        csr_offset_attr='_csr_bond_offset',
+        n_atoms=2,
+        n_tvecs=1,
+        width=6,
+        value_fn=_bond_value_batched,
+        grad_fn=_bond_grad_batched,
+        hess_fn=_bond_hess_batched,
+        hvp_fn=_bond_hvp_batched,
+        cell_grad_fn=_bond_cell_grad_batched,
+    ),
+    dict(
+        key='angles',
+        indices_attr='_angle_indices',
+        ncvecs_attr='_angle_ncvecs',
+        indices_padded_attr='_angle_indices_padded',
+        ncvecs_padded_attr='_angle_ncvecs_padded',
+        mask_attr='_angle_mask',
+        n_actual_attr='_n_angles_actual',
+        flat_cols_attr='_angle_flat_cols',
+        csr_offset_attr='_csr_angle_offset',
+        n_atoms=3,
+        n_tvecs=2,
+        width=9,
+        value_fn=_angle_value_batched,
+        grad_fn=_angle_grad_batched,
+        hess_fn=_angle_hess_batched,
+        hvp_fn=_angle_hvp_batched,
+        cell_grad_fn=_angle_cell_grad_batched,
+    ),
+    dict(
+        key='dihedrals',
+        indices_attr='_dihedral_indices',
+        ncvecs_attr='_dihedral_ncvecs',
+        indices_padded_attr='_dihedral_indices_padded',
+        ncvecs_padded_attr='_dihedral_ncvecs_padded',
+        mask_attr='_dihedral_mask',
+        n_actual_attr='_n_dihedrals_actual',
+        flat_cols_attr='_dihedral_flat_cols',
+        csr_offset_attr='_csr_dih_offset',
+        n_atoms=4,
+        n_tvecs=3,
+        width=12,
+        value_fn=_dihedral_value_batched,
+        grad_fn=_dihedral_grad_batched,
+        hess_fn=_dihedral_hess_batched,
+        hvp_fn=_dihedral_hvp_batched,
+        cell_grad_fn=_dihedral_cell_grad_batched,
+    ),
+)
+
+
 IVec = Tuple[int, int, int]
 
 
@@ -1602,173 +1663,100 @@ class BaseInternals:
         if self.ndummies > 0:
             self._cache.setdefault('all_positions', self._lastpos)
 
-    def _build_batched_arrays(self) -> None:
-        """Build batched index arrays for vectorized computation.
+    @staticmethod
+    def _pad_to_block(n: int) -> int:
+        return ((n + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
 
-        Arrays are padded to multiples of BLOCK_SIZE for GPU/SIMD efficiency.
-        Masks are stored to filter results back to actual sizes.
-        """
-        if self._batched_arrays_valid:
-            return
-
-        def pad_to_block(n: int) -> int:
-            """Round up to nearest multiple of BLOCK_SIZE."""
-            return ((n + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
-
-        # Build arrays for bonds
-        bonds = self.internals['bonds']
-        n_bonds = len(bonds)
-        if n_bonds > 0:
-            n_bonds_padded = pad_to_block(n_bonds)
-            # Original (unpadded) arrays for indexing
-            self._bond_indices = np.array([b.indices for b in bonds], dtype=np.int32)
-            self._bond_ncvecs = np.array(
-                [b.kwargs['ncvecs'] for b in bonds], dtype=np.int32
-            )
-            # Padded arrays for batch computation
-            self._bond_indices_padded = np.zeros((n_bonds_padded, 2), dtype=np.int32)
-            self._bond_ncvecs_padded = np.zeros((n_bonds_padded, 1, 3), dtype=np.int32)
-            self._bond_indices_padded[:n_bonds] = self._bond_indices
-            self._bond_ncvecs_padded[:n_bonds] = self._bond_ncvecs
-            self._bond_mask = np.zeros(n_bonds_padded, dtype=np.float64)
-            self._bond_mask[:n_bonds] = 1.0
-            self._n_bonds_actual = n_bonds
-        else:
-            self._bond_indices = np.empty((0, 2), dtype=np.int32)
-            self._bond_ncvecs = np.empty((0, 1, 3), dtype=np.int32)
-            self._bond_indices_padded = np.empty((0, 2), dtype=np.int32)
-            self._bond_ncvecs_padded = np.empty((0, 1, 3), dtype=np.int32)
-            self._bond_mask = np.empty(0, dtype=np.float64)
-            self._n_bonds_actual = 0
-
-        # Build arrays for angles
-        angles = self.internals['angles']
-        n_angles = len(angles)
-        if n_angles > 0:
-            n_angles_padded = pad_to_block(n_angles)
-            self._angle_indices = np.array([a.indices for a in angles], dtype=np.int32)
-            self._angle_ncvecs = np.array(
-                [a.kwargs['ncvecs'] for a in angles], dtype=np.int32
-            )
-            self._angle_indices_padded = np.zeros((n_angles_padded, 3), dtype=np.int32)
-            self._angle_ncvecs_padded = np.zeros((n_angles_padded, 2, 3), dtype=np.int32)
-            self._angle_indices_padded[:n_angles] = self._angle_indices
-            self._angle_ncvecs_padded[:n_angles] = self._angle_ncvecs
-            self._angle_mask = np.zeros(n_angles_padded, dtype=np.float64)
-            self._angle_mask[:n_angles] = 1.0
-            self._n_angles_actual = n_angles
-        else:
-            self._angle_indices = np.empty((0, 3), dtype=np.int32)
-            self._angle_ncvecs = np.empty((0, 2, 3), dtype=np.int32)
-            self._angle_indices_padded = np.empty((0, 3), dtype=np.int32)
-            self._angle_ncvecs_padded = np.empty((0, 2, 3), dtype=np.int32)
-            self._angle_mask = np.empty(0, dtype=np.float64)
-            self._n_angles_actual = 0
-
-        # Build arrays for dihedrals
-        dihedrals = self.internals['dihedrals']
-        n_dihedrals = len(dihedrals)
-        if n_dihedrals > 0:
-            n_dihedrals_padded = pad_to_block(n_dihedrals)
-            self._dihedral_indices = np.array(
-                [d.indices for d in dihedrals], dtype=np.int32
-            )
-            self._dihedral_ncvecs = np.array(
-                [d.kwargs['ncvecs'] for d in dihedrals], dtype=np.int32
-            )
-            self._dihedral_indices_padded = np.zeros((n_dihedrals_padded, 4), dtype=np.int32)
-            self._dihedral_ncvecs_padded = np.zeros((n_dihedrals_padded, 3, 3), dtype=np.int32)
-            self._dihedral_indices_padded[:n_dihedrals] = self._dihedral_indices
-            self._dihedral_ncvecs_padded[:n_dihedrals] = self._dihedral_ncvecs
-            self._dihedral_mask = np.zeros(n_dihedrals_padded, dtype=np.float64)
-            self._dihedral_mask[:n_dihedrals] = 1.0
-            self._n_dihedrals_actual = n_dihedrals
-        else:
-            self._dihedral_indices = np.empty((0, 4), dtype=np.int32)
-            self._dihedral_ncvecs = np.empty((0, 3, 3), dtype=np.int32)
-            self._dihedral_indices_padded = np.empty((0, 4), dtype=np.int32)
-            self._dihedral_ncvecs_padded = np.empty((0, 3, 3), dtype=np.int32)
-            self._dihedral_mask = np.empty(0, dtype=np.float64)
-            self._n_dihedrals_actual = 0
-
-        # Precompute flat column indices for direct scatter in hessian_rdot.
-        # For bond (a,b), the non-zero columns in the (ndof,) output are
-        # [3a, 3a+1, 3a+2, 3b, 3b+1, 3b+2].  Analogous for angles (9 cols)
-        # and dihedrals (12 cols).  These are topology-dependent and
-        # invalidated together with the rest of the batched arrays.
+    @staticmethod
+    def _flat_cols(indices: np.ndarray, n_atoms: int, width: int) -> np.ndarray:
+        if len(indices) == 0:
+            return np.empty((0, width), dtype=np.intp)
         offsets = np.arange(3)
-        if self._n_bonds_actual > 0:
-            bi = self._bond_indices  # (n_bonds, 2)
-            self._bond_flat_cols = np.concatenate([
-                bi[:, k:k+1] * 3 + offsets for k in range(2)
-            ], axis=1)  # (n_bonds, 6)
-        else:
-            self._bond_flat_cols = np.empty((0, 6), dtype=np.intp)
+        return np.concatenate(
+            [indices[:, k:k + 1] * 3 + offsets for k in range(n_atoms)],
+            axis=1,
+        )
 
-        if self._n_angles_actual > 0:
-            ai = self._angle_indices  # (n_angles, 3)
-            self._angle_flat_cols = np.concatenate([
-                ai[:, k:k+1] * 3 + offsets for k in range(3)
-            ], axis=1)  # (n_angles, 9)
-        else:
-            self._angle_flat_cols = np.empty((0, 9), dtype=np.intp)
+    def _build_batched_family_arrays(self, spec) -> None:
+        coords = self.internals[spec['key']]
+        n_coords = len(coords)
+        n_atoms = spec['n_atoms']
+        n_tvecs = spec['n_tvecs']
 
-        if self._n_dihedrals_actual > 0:
-            di = self._dihedral_indices  # (n_dihedrals, 4)
-            self._dihedral_flat_cols = np.concatenate([
-                di[:, k:k+1] * 3 + offsets for k in range(4)
-            ], axis=1)  # (n_dihedrals, 12)
+        if n_coords > 0:
+            n_padded = self._pad_to_block(n_coords)
+            indices = np.array([c.indices for c in coords], dtype=np.int32)
+            ncvecs = np.array(
+                [c.kwargs['ncvecs'] for c in coords], dtype=np.int32
+            )
+            indices_padded = np.zeros((n_padded, n_atoms), dtype=np.int32)
+            ncvecs_padded = np.zeros((n_padded, n_tvecs, 3), dtype=np.int32)
+            indices_padded[:n_coords] = indices
+            ncvecs_padded[:n_coords] = ncvecs
+            mask = np.zeros(n_padded, dtype=np.float64)
+            mask[:n_coords] = 1.0
         else:
-            self._dihedral_flat_cols = np.empty((0, 12), dtype=np.intp)
+            indices = np.empty((0, n_atoms), dtype=np.int32)
+            ncvecs = np.empty((0, n_tvecs, 3), dtype=np.int32)
+            indices_padded = indices.copy()
+            ncvecs_padded = ncvecs.copy()
+            mask = np.empty(0, dtype=np.float64)
 
-        # Build CSR structure for sparse hessian_rdot output.
-        # Bonds/angles/dihedrals have fixed nnz per row (6/9/12).
-        # Translations have zero rows. Rotations/other are dense (ndof cols).
+        setattr(self, spec['indices_attr'], indices)
+        setattr(self, spec['ncvecs_attr'], ncvecs)
+        setattr(self, spec['indices_padded_attr'], indices_padded)
+        setattr(self, spec['ncvecs_padded_attr'], ncvecs_padded)
+        setattr(self, spec['mask_attr'], mask)
+        setattr(self, spec['n_actual_attr'], n_coords)
+        setattr(
+            self,
+            spec['flat_cols_attr'],
+            self._flat_cols(indices, n_atoms, spec['width']),
+        )
+
+    def _build_hvp_csr_structure(self) -> None:
         ndof = self.ndof
         n_trans = len(self.internals['translations'])
         n_other = len(self.internals['other'])
         n_rot = len(self.internals['rotations'])
-        n_active = (n_trans + self._n_bonds_actual + self._n_angles_actual
-                    + self._n_dihedrals_actual + n_other + n_rot)
+        n_active = n_trans + n_other + n_rot
+        for spec in _BATCHED_COORD_FAMILIES:
+            n_active += getattr(self, spec['n_actual_attr'])
 
         col_blocks = []
-        nnz_per_row = []
+        nnz_per_row = [0] * n_trans
+        data_offset = 0
+        for spec in _BATCHED_COORD_FAMILIES:
+            n_coords = getattr(self, spec['n_actual_attr'])
+            setattr(self, spec['csr_offset_attr'], data_offset)
+            if n_coords > 0:
+                width = spec['width']
+                col_blocks.append(getattr(self, spec['flat_cols_attr']).ravel())
+                nnz_per_row.extend([width] * n_coords)
+                data_offset += n_coords * width
 
-        # Translations: zero rows
-        for _ in range(n_trans):
-            nnz_per_row.append(0)
-
-        # Bonds: 6 nnz per row
-        if self._n_bonds_actual > 0:
-            col_blocks.append(self._bond_flat_cols.ravel())
-            nnz_per_row.extend([6] * self._n_bonds_actual)
-
-        # Angles: 9 nnz per row
-        if self._n_angles_actual > 0:
-            col_blocks.append(self._angle_flat_cols.ravel())
-            nnz_per_row.extend([9] * self._n_angles_actual)
-
-        # Dihedrals: 12 nnz per row
-        if self._n_dihedrals_actual > 0:
-            col_blocks.append(self._dihedral_flat_cols.ravel())
-            nnz_per_row.extend([12] * self._n_dihedrals_actual)
-
-        # Other/rotations: dense rows (ndof cols each)
+        self._csr_other_offset = data_offset
         for _ in range(n_other + n_rot):
             col_blocks.append(np.arange(ndof))
             nnz_per_row.append(ndof)
 
         self._csr_indptr = np.zeros(n_active + 1, dtype=np.int32)
         np.cumsum(nnz_per_row, out=self._csr_indptr[1:])
-        self._csr_indices = np.concatenate(col_blocks).astype(np.int32) if col_blocks else np.empty(0, dtype=np.int32)
+        self._csr_indices = (
+            np.concatenate(col_blocks).astype(np.int32)
+            if col_blocks else np.empty(0, dtype=np.int32)
+        )
         self._csr_data = np.zeros(len(self._csr_indices), dtype=np.float64)
         self._csr_n_active = n_active
-        # Precompute data offset for each section
-        self._csr_bond_offset = n_trans * 0  # bonds start after translations (0 nnz)
-        self._csr_angle_offset = self._csr_bond_offset + self._n_bonds_actual * 6
-        self._csr_dih_offset = self._csr_angle_offset + self._n_angles_actual * 9
-        self._csr_other_offset = self._csr_dih_offset + self._n_dihedrals_actual * 12
 
+    def _build_batched_arrays(self) -> None:
+        """Build batched index arrays for vectorized computation."""
+        if self._batched_arrays_valid:
+            return
+
+        for spec in _BATCHED_COORD_FAMILIES:
+            self._build_batched_family_arrays(spec)
+        self._build_hvp_csr_structure()
         self._batched_arrays_valid = True
 
     @staticmethod
@@ -1793,23 +1781,22 @@ class BaseInternals:
 
         self._build_batched_arrays()
 
-        # n_tvec = 1/2/3 for bonds/angles/dihedrals. Unpadded entries are used
-        # for result indexing; padded entries for GPU-efficient batch ops.
-        tvecs = {
-            'bonds': self._tvec_or_empty(
-                self._bond_indices, self._bond_ncvecs, cell, 1),
-            'angles': self._tvec_or_empty(
-                self._angle_indices, self._angle_ncvecs, cell, 2),
-            'dihedrals': self._tvec_or_empty(
-                self._dihedral_indices, self._dihedral_ncvecs, cell, 3),
-            'bonds_padded': self._tvec_or_empty(
-                self._bond_indices_padded, self._bond_ncvecs_padded, cell, 1),
-            'angles_padded': self._tvec_or_empty(
-                self._angle_indices_padded, self._angle_ncvecs_padded, cell, 2),
-            'dihedrals_padded': self._tvec_or_empty(
-                self._dihedral_indices_padded, self._dihedral_ncvecs_padded,
-                cell, 3),
-        }
+        tvecs = {}
+        for spec in _BATCHED_COORD_FAMILIES:
+            key = spec['key']
+            n_tvecs = spec['n_tvecs']
+            tvecs[key] = self._tvec_or_empty(
+                getattr(self, spec['indices_attr']),
+                getattr(self, spec['ncvecs_attr']),
+                cell,
+                n_tvecs,
+            )
+            tvecs[f'{key}_padded'] = self._tvec_or_empty(
+                getattr(self, spec['indices_padded_attr']),
+                getattr(self, spec['ncvecs_padded_attr']),
+                cell,
+                n_tvecs,
+            )
 
         self._tvecs_cache = {'cell_hash': cell_hash, 'tvecs': tvecs}
         return tvecs
@@ -1838,165 +1825,88 @@ class BaseInternals:
         """Invalidate batched arrays (call when internals change)."""
         self._invalidate_structure()
 
-    def _compute_batched_values(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
-        """Compute all internal coordinate values using vectorized operations.
+    def _compute_batched_value_family(self, spec, positions, tvecs):
+        n_actual = getattr(self, spec['n_actual_attr'])
+        if n_actual == 0:
+            return np.empty(0)
+        pos = positions[getattr(self, spec['indices_padded_attr'])]
+        values = spec['value_fn'](pos, tvecs[f"{spec['key']}_padded"])
+        return np.asarray(device_get(values))[:n_actual]
 
-        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
-        """
+    def _compute_batched_tensor_family(self, spec, positions, tvecs, fn,
+                                       empty_tail):
+        n_actual = getattr(self, spec['n_actual_attr'])
+        indices = getattr(self, spec['indices_attr'])
+        if n_actual == 0:
+            return indices, np.empty((0,) + empty_tail)
+        pos = positions[getattr(self, spec['indices_padded_attr'])]
+        padded = fn(pos, tvecs[f"{spec['key']}_padded"])
+        return indices, np.asarray(device_get(padded))[:n_actual]
+
+    def _compute_batched_values(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
+        """Compute all internal coordinate values using vectorized operations."""
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
-        result = {}
-
-        # Bonds - use padded arrays for consistent JAX shapes
-        if self._n_bonds_actual > 0:
-            bond_pos = positions[self._bond_indices_padded]  # (n_padded, 2, 3)
-            values_padded = np.asarray(device_get(_bond_value_batched(bond_pos, tvecs['bonds_padded'])))
-            result['bonds'] = values_padded[:self._n_bonds_actual]
-        else:
-            result['bonds'] = np.empty(0)
-
-        # Angles
-        if self._n_angles_actual > 0:
-            angle_pos = positions[self._angle_indices_padded]  # (n_padded, 3, 3)
-            values_padded = np.asarray(device_get(_angle_value_batched(angle_pos, tvecs['angles_padded'])))
-            result['angles'] = values_padded[:self._n_angles_actual]
-        else:
-            result['angles'] = np.empty(0)
-
-        # Dihedrals
-        if self._n_dihedrals_actual > 0:
-            dihedral_pos = positions[self._dihedral_indices_padded]  # (n_padded, 4, 3)
-            values_padded = np.asarray(device_get(_dihedral_value_batched(dihedral_pos, tvecs['dihedrals_padded'])))
-            result['dihedrals'] = values_padded[:self._n_dihedrals_actual]
-        else:
-            result['dihedrals'] = np.empty(0)
-
-        return result
+        return {
+            spec['key']: self._compute_batched_value_family(
+                spec, positions, tvecs
+            )
+            for spec in _BATCHED_COORD_FAMILIES
+        }
 
     def _compute_batched_gradients(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
-        """Compute all internal coordinate gradients using vectorized operations.
-
-        Returns dict mapping coord type to (indices, gradients) tuples.
-        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
-        """
+        """Compute all internal coordinate gradients using vectorized operations."""
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
-        result = {}
-
-        # Bonds - use padded arrays
-        if self._n_bonds_actual > 0:
-            bond_pos = positions[self._bond_indices_padded]  # (n_padded, 2, 3)
-            grads_padded = np.asarray(device_get(_bond_grad_batched(bond_pos, tvecs['bonds_padded'])))
-            result['bonds'] = (self._bond_indices, grads_padded[:self._n_bonds_actual])
-        else:
-            result['bonds'] = (np.empty((0, 2), dtype=np.int32), np.empty((0, 2, 3)))
-
-        # Angles
-        if self._n_angles_actual > 0:
-            angle_pos = positions[self._angle_indices_padded]
-            grads_padded = np.asarray(device_get(_angle_grad_batched(angle_pos, tvecs['angles_padded'])))
-            result['angles'] = (self._angle_indices, grads_padded[:self._n_angles_actual])
-        else:
-            result['angles'] = (np.empty((0, 3), dtype=np.int32), np.empty((0, 3, 3)))
-
-        # Dihedrals
-        if self._n_dihedrals_actual > 0:
-            dihedral_pos = positions[self._dihedral_indices_padded]
-            grads_padded = np.asarray(device_get(_dihedral_grad_batched(dihedral_pos, tvecs['dihedrals_padded'])))
-            result['dihedrals'] = (self._dihedral_indices, grads_padded[:self._n_dihedrals_actual])
-        else:
-            result['dihedrals'] = (np.empty((0, 4), dtype=np.int32), np.empty((0, 4, 3)))
-
-        return result
+        return {
+            spec['key']: self._compute_batched_tensor_family(
+                spec, positions, tvecs, spec['grad_fn'],
+                (spec['n_atoms'], 3),
+            )
+            for spec in _BATCHED_COORD_FAMILIES
+        }
 
     def _compute_batched_hessians(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
-        """Compute all internal coordinate hessians using vectorized operations.
-
-        Returns dict mapping coord type to (indices, hessians) tuples.
-        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
-        """
+        """Compute all internal coordinate hessians using vectorized operations."""
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
-        result = {}
-
-        # Bonds - use padded arrays
-        if self._n_bonds_actual > 0:
-            bond_pos = positions[self._bond_indices_padded]
-            hess_padded = np.asarray(device_get(_bond_hess_batched(bond_pos, tvecs['bonds_padded'])))
-            result['bonds'] = (self._bond_indices, hess_padded[:self._n_bonds_actual])
-        else:
-            result['bonds'] = (np.empty((0, 2), dtype=np.int32), np.empty((0, 2, 3, 2, 3)))
-
-        # Angles
-        if self._n_angles_actual > 0:
-            angle_pos = positions[self._angle_indices_padded]
-            hess_padded = np.asarray(device_get(_angle_hess_batched(angle_pos, tvecs['angles_padded'])))
-            result['angles'] = (self._angle_indices, hess_padded[:self._n_angles_actual])
-        else:
-            result['angles'] = (np.empty((0, 3), dtype=np.int32), np.empty((0, 3, 3, 3, 3)))
-
-        # Dihedrals
-        if self._n_dihedrals_actual > 0:
-            dihedral_pos = positions[self._dihedral_indices_padded]
-            hess_padded = np.asarray(device_get(_dihedral_hess_batched(dihedral_pos, tvecs['dihedrals_padded'])))
-            result['dihedrals'] = (self._dihedral_indices, hess_padded[:self._n_dihedrals_actual])
-        else:
-            result['dihedrals'] = (np.empty((0, 4), dtype=np.int32), np.empty((0, 4, 3, 4, 3)))
-
-        return result
+        return {
+            spec['key']: self._compute_batched_tensor_family(
+                spec, positions, tvecs, spec['hess_fn'],
+                (spec['n_atoms'], 3, spec['n_atoms'], 3),
+            )
+            for spec in _BATCHED_COORD_FAMILIES
+        }
 
     def _compute_batched_cell_gradients(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
-        """Compute all internal coordinate cell gradients using vectorized operations.
-
-        Returns dict mapping coord type to cell gradient arrays.
-        Each gradient has shape (n_coords, 3, 3) for d(coord)/d(cell).
-        Uses padded arrays for GPU/SIMD efficiency, then slices to actual size.
-        """
+        """Compute all internal coordinate cell gradients using vectorized operations."""
         self._build_batched_arrays()
         cell_jax = None
         result = {}
 
-        # Bonds - use padded arrays for consistent JAX shapes
-        if self._n_bonds_actual > 0:
-            if np.any(self._bond_ncvecs):
-                if cell_jax is None:
-                    cell_jax = jnp.asarray(cell, dtype=np.float64)
-                bond_pos = jnp.asarray(positions[self._bond_indices_padded], dtype=np.float64)
-                bond_ncvecs = jnp.asarray(self._bond_ncvecs_padded, dtype=np.float64)
-                grads_padded = np.asarray(device_get(_bond_cell_grad_batched(bond_pos, bond_ncvecs, cell_jax)))
-                result['bonds'] = grads_padded[:self._n_bonds_actual]
-            else:
-                result['bonds'] = np.zeros((self._n_bonds_actual, 3, 3))
-        else:
-            result['bonds'] = np.empty((0, 3, 3))
+        for spec in _BATCHED_COORD_FAMILIES:
+            key = spec['key']
+            n_actual = getattr(self, spec['n_actual_attr'])
+            ncvecs = getattr(self, spec['ncvecs_attr'])
+            if n_actual == 0:
+                result[key] = np.empty((0, 3, 3))
+                continue
+            if not np.any(ncvecs):
+                result[key] = np.zeros((n_actual, 3, 3))
+                continue
 
-        # Angles
-        if self._n_angles_actual > 0:
-            if np.any(self._angle_ncvecs):
-                if cell_jax is None:
-                    cell_jax = jnp.asarray(cell, dtype=np.float64)
-                angle_pos = jnp.asarray(positions[self._angle_indices_padded], dtype=np.float64)
-                angle_ncvecs = jnp.asarray(self._angle_ncvecs_padded, dtype=np.float64)
-                grads_padded = np.asarray(device_get(_angle_cell_grad_batched(angle_pos, angle_ncvecs, cell_jax)))
-                result['angles'] = grads_padded[:self._n_angles_actual]
-            else:
-                result['angles'] = np.zeros((self._n_angles_actual, 3, 3))
-        else:
-            result['angles'] = np.empty((0, 3, 3))
-
-        # Dihedrals
-        if self._n_dihedrals_actual > 0:
-            if np.any(self._dihedral_ncvecs):
-                if cell_jax is None:
-                    cell_jax = jnp.asarray(cell, dtype=np.float64)
-                dihedral_pos = jnp.asarray(positions[self._dihedral_indices_padded], dtype=np.float64)
-                dihedral_ncvecs = jnp.asarray(self._dihedral_ncvecs_padded, dtype=np.float64)
-                grads_padded = np.asarray(device_get(_dihedral_cell_grad_batched(dihedral_pos, dihedral_ncvecs, cell_jax)))
-                result['dihedrals'] = grads_padded[:self._n_dihedrals_actual]
-            else:
-                result['dihedrals'] = np.zeros((self._n_dihedrals_actual, 3, 3))
-        else:
-            result['dihedrals'] = np.empty((0, 3, 3))
+            if cell_jax is None:
+                cell_jax = jnp.asarray(cell, dtype=np.float64)
+            pos = jnp.asarray(
+                positions[getattr(self, spec['indices_padded_attr'])],
+                dtype=np.float64,
+            )
+            ncvecs_padded = jnp.asarray(
+                getattr(self, spec['ncvecs_padded_attr']),
+                dtype=np.float64,
+            )
+            grads = spec['cell_grad_fn'](pos, ncvecs_padded, cell_jax)
+            result[key] = np.asarray(device_get(grads))[:n_actual]
 
         return result
 
@@ -2119,41 +2029,14 @@ class BaseInternals:
                 np.add.at(B, (row, idx), jac)
                 row += 1
 
-        # Bonds (batched) - vectorized scatter
-        bond_indices, bond_grads = batched['bonds']
-        bonds_active_arr = np.array(bonds_active, dtype=bool)
-        n_active_bonds = bonds_active_arr.sum()
-        if n_active_bonds > 0:
-            active_bond_idx = bond_indices[bonds_active_arr]
-            active_bond_grads = bond_grads[bonds_active_arr]
-            # Vectorized scatter: replace loop with advanced indexing
-            rows_idx = np.arange(row, row + n_active_bonds)[:, None]
-            B[rows_idx, active_bond_idx] = active_bond_grads
-            row += n_active_bonds
-
-        # Angles (batched) - vectorized scatter
-        angle_indices, angle_grads = batched['angles']
-        angles_active_arr = np.array(angles_active, dtype=bool)
-        n_active_angles = angles_active_arr.sum()
-        if n_active_angles > 0:
-            active_angle_idx = angle_indices[angles_active_arr]
-            active_angle_grads = angle_grads[angles_active_arr]
-            # Vectorized scatter
-            rows_idx = np.arange(row, row + n_active_angles)[:, None]
-            B[rows_idx, active_angle_idx] = active_angle_grads
-            row += n_active_angles
-
-        # Dihedrals (batched) - vectorized scatter
-        dihedral_indices, dihedral_grads = batched['dihedrals']
-        dihedrals_active_arr = np.array(dihedrals_active, dtype=bool)
-        n_active_dihedrals = dihedrals_active_arr.sum()
-        if n_active_dihedrals > 0:
-            active_dih_idx = dihedral_indices[dihedrals_active_arr]
-            active_dih_grads = dihedral_grads[dihedrals_active_arr]
-            # Vectorized scatter
-            rows_idx = np.arange(row, row + n_active_dihedrals)[:, None]
-            B[rows_idx, active_dih_idx] = active_dih_grads
-            row += n_active_dihedrals
+        for spec, active in zip(
+            _BATCHED_COORD_FAMILIES,
+            (bonds_active, angles_active, dihedrals_active),
+        ):
+            indices, grads = batched[spec['key']]
+            row = self._scatter_batched_jacobian_family(
+                B, row, indices, grads, active
+            )
 
         # Other (not batched)
         for i, (idx, jac) in enumerate(other_data):
@@ -2226,26 +2109,13 @@ class BaseInternals:
         # Translations have zero cell derivatives (they're CoM positions)
         row += sum(trans_active)
 
-        # Bonds
-        bonds_active_arr = np.array(bonds_active, dtype=bool)
-        n_active_bonds = bonds_active_arr.sum()
-        if n_active_bonds > 0:
-            B_cell[row:row+n_active_bonds] = cell_grads['bonds'][bonds_active_arr]
-            row += n_active_bonds
-
-        # Angles
-        angles_active_arr = np.array(angles_active, dtype=bool)
-        n_active_angles = angles_active_arr.sum()
-        if n_active_angles > 0:
-            B_cell[row:row+n_active_angles] = cell_grads['angles'][angles_active_arr]
-            row += n_active_angles
-
-        # Dihedrals
-        dihedrals_active_arr = np.array(dihedrals_active, dtype=bool)
-        n_active_dihedrals = dihedrals_active_arr.sum()
-        if n_active_dihedrals > 0:
-            B_cell[row:row+n_active_dihedrals] = cell_grads['dihedrals'][dihedrals_active_arr]
-            row += n_active_dihedrals
+        for spec, active in zip(
+            _BATCHED_COORD_FAMILIES,
+            (bonds_active, angles_active, dihedrals_active),
+        ):
+            row = self._scatter_batched_cell_gradient_family(
+                B_cell, row, cell_grads[spec['key']], active
+            )
 
         # Other has zero cell derivatives (custom coordinates, not periodic)
         row += sum(other_active)
@@ -2530,33 +2400,14 @@ class BaseInternals:
             if trans_active[i]:
                 hessians.append(SparseInternalHessian(n_atoms, idx, hess))
 
-        # Bonds (batched). Fancy indexing already returns a fresh array; per-row
-        # views into it are read-only consumers, so no per-coord copy is needed.
-        bond_indices, bond_hess = batched['bonds']
-        bonds_active_arr = np.asarray(bonds_active, dtype=bool)
-        if bonds_active_arr.any():
-            active_bond_idx = bond_indices[bonds_active_arr]
-            active_bond_hess = bond_hess[bonds_active_arr]
-            for i in range(len(active_bond_idx)):
-                hessians.append(SparseInternalHessian(n_atoms, active_bond_idx[i], active_bond_hess[i]))
-
-        # Angles (batched)
-        angle_indices, angle_hess = batched['angles']
-        angles_active_arr = np.asarray(angles_active, dtype=bool)
-        if angles_active_arr.any():
-            active_angle_idx = angle_indices[angles_active_arr]
-            active_angle_hess = angle_hess[angles_active_arr]
-            for i in range(len(active_angle_idx)):
-                hessians.append(SparseInternalHessian(n_atoms, active_angle_idx[i], active_angle_hess[i]))
-
-        # Dihedrals (batched)
-        dihedral_indices, dihedral_hess = batched['dihedrals']
-        dihedrals_active_arr = np.asarray(dihedrals_active, dtype=bool)
-        if dihedrals_active_arr.any():
-            active_dih_idx = dihedral_indices[dihedrals_active_arr]
-            active_dih_hess = dihedral_hess[dihedrals_active_arr]
-            for i in range(len(active_dih_idx)):
-                hessians.append(SparseInternalHessian(n_atoms, active_dih_idx[i], active_dih_hess[i]))
+        for spec, active in zip(
+            _BATCHED_COORD_FAMILIES,
+            (bonds_active, angles_active, dihedrals_active),
+        ):
+            indices, hess = batched[spec['key']]
+            self._append_batched_hessian_family(
+                hessians, n_atoms, indices, hess, active
+            )
 
         # Other (not batched)
         for i, (idx, hess) in enumerate(other_data):
@@ -2598,6 +2449,59 @@ class BaseInternals:
             out[np.arange(row, row + n_coords)[:, None], flat_cols] = \
                 hvp.reshape(n_coords, -1)
         return row + n_coords
+
+    @staticmethod
+    def _active_array(active):
+        return np.asarray(active, dtype=bool)
+
+    def _launch_batched_hvp_family(self, spec, positions, tvecs, v_atoms,
+                                   active):
+        active = self._active_array(active)
+        n_actual = getattr(self, spec['n_actual_attr'])
+        if n_actual == 0 or not active.any():
+            return None
+
+        if active.all():
+            indices = getattr(self, spec['indices_padded_attr'])
+            pos = positions[indices]
+            tvec = tvecs[f"{spec['key']}_padded"]
+            v_sub = v_atoms[indices]
+        else:
+            indices = getattr(self, spec['indices_attr'])[active]
+            pos = positions[indices]
+            tvec = tvecs[spec['key']][active]
+            v_sub = v_atoms[indices]
+        return spec['hvp_fn'](pos, tvec, v_sub)
+
+    def _scatter_batched_jacobian_family(self, B, row, indices, grads,
+                                         active):
+        active = self._active_array(active)
+        n_active = int(active.sum())
+        if n_active == 0:
+            return row
+        rows_idx = np.arange(row, row + n_active)[:, None]
+        B[rows_idx, indices[active]] = grads[active]
+        return row + n_active
+
+    def _append_batched_hessian_family(self, hessians, n_atoms, indices, hess,
+                                       active):
+        active = self._active_array(active)
+        if not active.any():
+            return
+        active_idx = indices[active]
+        active_hess = hess[active]
+        for i in range(len(active_idx)):
+            hessians.append(
+                SparseInternalHessian(n_atoms, active_idx[i], active_hess[i])
+            )
+
+    def _scatter_batched_cell_gradient_family(self, B_cell, row, grads,
+                                              active):
+        active = self._active_array(active)
+        n_active = int(active.sum())
+        if n_active > 0:
+            B_cell[row:row + n_active] = grads[active]
+        return row + n_active
 
     def _scatter_full_row(self, hvp, idx, use_sparse, data, out, off, row,
                           ndof):
@@ -2680,47 +2584,13 @@ class BaseInternals:
         out = np.zeros((sum(active_mask), mat.shape[1]), dtype=np.float64)
         row = sum(trans_active)  # Translation Hessians are zero.
 
-        bond_jax_result = None
-        if bonds_active.any() and self._n_bonds_actual > 0:
-            if bonds_active.all():
-                bond_pos = positions[self._bond_indices_padded]
-                bond_tvecs = tvecs['bonds_padded']
-                v_sub = v_atoms[self._bond_indices_padded]
-                bond_jax_result = _bond_hvp_batched(bond_pos, bond_tvecs, v_sub)
-            else:
-                bond_active_idx = self._bond_indices[bonds_active]
-                bond_pos = positions[bond_active_idx]
-                bond_tvecs = tvecs['bonds'][bonds_active]
-                v_sub = v_atoms[bond_active_idx]
-                bond_jax_result = _bond_hvp_batched(bond_pos, bond_tvecs, v_sub)
-
-        angle_jax_result = None
-        if angles_active.any() and self._n_angles_actual > 0:
-            if angles_active.all():
-                angle_pos = positions[self._angle_indices_padded]
-                angle_tvecs = tvecs['angles_padded']
-                v_sub = v_atoms[self._angle_indices_padded]
-                angle_jax_result = _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
-            else:
-                angle_active_idx = self._angle_indices[angles_active]
-                angle_pos = positions[angle_active_idx]
-                angle_tvecs = tvecs['angles'][angles_active]
-                v_sub = v_atoms[angle_active_idx]
-                angle_jax_result = _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
-
-        dih_jax_result = None
-        if dihedrals_active.any() and self._n_dihedrals_actual > 0:
-            if dihedrals_active.all():
-                dih_pos = positions[self._dihedral_indices_padded]
-                dih_tvecs = tvecs['dihedrals_padded']
-                v_sub = v_atoms[self._dihedral_indices_padded]
-                dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
-            else:
-                dih_active_idx = self._dihedral_indices[dihedrals_active]
-                dih_pos = positions[dih_active_idx]
-                dih_tvecs = tvecs['dihedrals'][dihedrals_active]
-                v_sub = v_atoms[dih_active_idx]
-                dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
+        batched_active = (bonds_active, angles_active, dihedrals_active)
+        batched_hvp = {
+            spec['key']: self._launch_batched_hvp_family(
+                spec, positions, tvecs, v_atoms, active
+            )
+            for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active)
+        }
 
         rot_closed_results = []
         rot_batched_slots = None
@@ -2761,15 +2631,13 @@ class BaseInternals:
                                                q_stable=coord.q_prev)
                     rot_closed_results.append((hvp, idx))
 
-        row = self._contract_batched_hvp_family(
-            bond_jax_result, bonds_active, self._n_bonds_actual,
-            self._bond_indices, mat_atoms, out, row)
-        row = self._contract_batched_hvp_family(
-            angle_jax_result, angles_active, self._n_angles_actual,
-            self._angle_indices, mat_atoms, out, row)
-        row = self._contract_batched_hvp_family(
-            dih_jax_result, dihedrals_active, self._n_dihedrals_actual,
-            self._dihedral_indices, mat_atoms, out, row)
+        for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active):
+            row = self._contract_batched_hvp_family(
+                batched_hvp[spec['key']], active,
+                getattr(self, spec['n_actual_attr']),
+                getattr(self, spec['indices_attr']),
+                mat_atoms, out, row,
+            )
 
         atoms = self.light_atoms
         for i, coord in enumerate(self.internals['other']):
@@ -2869,53 +2737,13 @@ class BaseInternals:
         # Launch all JAX HVP computations, deferring device_get
         # This allows JAX to pipeline the computations before we block on transfer
 
-        bond_jax_result = None
-        bond_active_idx = None
-        if bonds_active.any() and self._n_bonds_actual > 0:
-            if bonds_active.all():
-                bond_pos = positions[self._bond_indices_padded]
-                bond_tvecs = tvecs['bonds_padded']
-                v_sub = v_atoms[self._bond_indices_padded]
-                bond_jax_result = _bond_hvp_batched(bond_pos, bond_tvecs, v_sub)
-                bond_active_idx = self._bond_indices
-            else:
-                bond_active_idx = self._bond_indices[bonds_active]
-                bond_pos = positions[bond_active_idx]
-                bond_tvecs = tvecs['bonds'][bonds_active]
-                v_sub = v_atoms[bond_active_idx]
-                bond_jax_result = _bond_hvp_batched(bond_pos, bond_tvecs, v_sub)
-
-        angle_jax_result = None
-        angle_active_idx = None
-        if angles_active.any() and self._n_angles_actual > 0:
-            if angles_active.all():
-                angle_pos = positions[self._angle_indices_padded]
-                angle_tvecs = tvecs['angles_padded']
-                v_sub = v_atoms[self._angle_indices_padded]
-                angle_jax_result = _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
-                angle_active_idx = self._angle_indices
-            else:
-                angle_active_idx = self._angle_indices[angles_active]
-                angle_pos = positions[angle_active_idx]
-                angle_tvecs = tvecs['angles'][angles_active]
-                v_sub = v_atoms[angle_active_idx]
-                angle_jax_result = _angle_hvp_batched(angle_pos, angle_tvecs, v_sub)
-
-        dih_jax_result = None
-        dih_active_idx = None
-        if dihedrals_active.any() and self._n_dihedrals_actual > 0:
-            if dihedrals_active.all():
-                dih_pos = positions[self._dihedral_indices_padded]
-                dih_tvecs = tvecs['dihedrals_padded']
-                v_sub = v_atoms[self._dihedral_indices_padded]
-                dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
-                dih_active_idx = self._dihedral_indices
-            else:
-                dih_active_idx = self._dihedral_indices[dihedrals_active]
-                dih_pos = positions[dih_active_idx]
-                dih_tvecs = tvecs['dihedrals'][dihedrals_active]
-                v_sub = v_atoms[dih_active_idx]
-                dih_jax_result = _dihedral_hvp_batched(dih_pos, dih_tvecs, v_sub)
+        batched_active = (bonds_active, angles_active, dihedrals_active)
+        batched_hvp = {
+            spec['key']: self._launch_batched_hvp_family(
+                spec, positions, tvecs, v_atoms, active
+            )
+            for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active)
+        }
 
         # Compute rotation HVPs using closed-form Hessian (handles
         # degenerate eigenvalues for linear/near-linear fragments).
@@ -2960,18 +2788,14 @@ class BaseInternals:
 
         # Now collect results with device_get and scatter into output
 
-        row = self._scatter_batched_family(
-            bond_jax_result, bonds_active, self._n_bonds_actual,
-            self._bond_flat_cols, self._csr_bond_offset, 6,
-            use_sparse, data, out, row)
-        row = self._scatter_batched_family(
-            angle_jax_result, angles_active, self._n_angles_actual,
-            self._angle_flat_cols, self._csr_angle_offset, 9,
-            use_sparse, data, out, row)
-        row = self._scatter_batched_family(
-            dih_jax_result, dihedrals_active, self._n_dihedrals_actual,
-            self._dihedral_flat_cols, self._csr_dih_offset, 12,
-            use_sparse, data, out, row)
+        for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active):
+            row = self._scatter_batched_family(
+                batched_hvp[spec['key']], active,
+                getattr(self, spec['n_actual_attr']),
+                getattr(self, spec['flat_cols_attr']),
+                getattr(self, spec['csr_offset_attr']),
+                spec['width'], use_sparse, data, out, row,
+            )
 
         # Other - use existing hessian computation (typically few coords, loop is fine)
         atoms = self.light_atoms
