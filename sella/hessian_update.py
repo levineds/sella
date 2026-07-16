@@ -40,6 +40,72 @@ def symmetrize_Y(S, Y, symm):
         raise ValueError("Unknown symmetrization method {}".format(symm))
 
 
+def _as_column_matrix(arr):
+    if len(arr.shape) == 1:
+        return arr[:, np.newaxis]
+    return arr
+
+
+def _download_gpu_hessian(B_gpu):
+    try:
+        return B_gpu.cpu().numpy()
+    except (RuntimeError, MemoryError):
+        _gpu_mod._record_oom(B_gpu.shape[0])
+        raise
+
+
+def _zero_step_update(B, S, B_gpu, download_numpy):
+    if B_gpu is None:
+        if B is None:
+            return np.eye(S.shape[0], dtype=np.float64)
+        return B
+    if not download_numpy:
+        return B, B_gpu
+    if B is None:
+        B = _download_gpu_hessian(B_gpu)
+    return B, B_gpu
+
+
+def _initial_hessian_from_secant(S, Y):
+    # Approximate B as a scaled identity matrix, where the scalar is the
+    # average Ritz value from S.T @ Y.
+    thetas, _ = eigh(S.T @ Y)
+    thetas_abs = np.maximum(np.abs(thetas), 1e-12)
+    lam0 = np.exp(np.average(np.log(thetas_abs)))
+    d, _ = S.shape
+    return lam0 * np.eye(d)
+
+
+def _can_gpu_ts_bfgs(method, B_gpu, evals_gpu, evecs_gpu):
+    return (
+        method == 'TS-BFGS' and B_gpu is not None
+        and evals_gpu is not None and evecs_gpu is not None
+    )
+
+
+def _resolve_update_method(method, S, Y, lams):
+    if method != 'BFGS_auto':
+        return method
+
+    # Default to TS-BFGS, and only use BFGS if B and S.T @ Y are both positive
+    # definite.
+    if lams is not None and np.all(lams > 0):
+        lams_STY, _ = eigh(S.T @ Y, S.T @ S)
+        if np.all(lams_STY > 0):
+            return 'BFGS'
+    return 'TS-BFGS'
+
+
+def _update_delta(method, B, S, Y, lams, vecs):
+    if method == 'TS-BFGS':
+        return _MS_TS_BFGS(B, S, Y, lams, vecs)
+    try:
+        updater = _MS_UPDATE_METHODS[method]
+    except KeyError:  # pragma: no cover
+        raise ValueError('Unknown update method {}'.format(method))
+    return updater(B, S, Y)
+
+
 def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None,
              B_gpu=None, evals_gpu=None, evecs_gpu=None,
              download_numpy=True):
@@ -51,41 +117,15 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None,
     back to numpy if GPU unavailable or for other update methods.
     """
     if np.linalg.norm(S) < 1e-8:
-        if B_gpu is not None:
-            if download_numpy:
-                if B is None:
-                    try:
-                        B = B_gpu.cpu().numpy()
-                    except (RuntimeError, MemoryError):
-                        _gpu_mod._record_oom(B_gpu.shape[0])
-                        raise
-                return B, B_gpu
-            return B, B_gpu
-        if B is None:
-            return np.eye(S.shape[0], dtype=np.float64)
-        return B
-    if len(S.shape) == 1:
-        S = S[:, np.newaxis]
-    if len(Y.shape) == 1:
-        Y = Y[:, np.newaxis]
+        return _zero_step_update(B, S, B_gpu, download_numpy)
 
+    S = _as_column_matrix(S)
+    Y = _as_column_matrix(Y)
     Ytilde = symmetrize_Y(S, Y, symm)
-
-    gpu_ts_bfgs = (
-        method == 'TS-BFGS' and B_gpu is not None
-        and evals_gpu is not None and evecs_gpu is not None
-    )
+    gpu_ts_bfgs = _can_gpu_ts_bfgs(method, B_gpu, evals_gpu, evecs_gpu)
 
     if B is None and not gpu_ts_bfgs:
-        # Approximate B as a scaled identity matrix, where the
-        # scalar is the average Ritz value from S.T @ Y
-        thetas, _ = eigh(S.T @ Ytilde)
-        # Guard against zero eigenvalues which would give log(0) = -Inf
-        thetas_abs = np.abs(thetas)
-        thetas_abs = np.maximum(thetas_abs, 1e-12)
-        lam0 = np.exp(np.average(np.log(thetas_abs)))
-        d, _ = S.shape
-        B = lam0 * np.eye(d)
+        B = _initial_hessian_from_secant(S, Ytilde)
 
     # GPU-resident TS-BFGS path: requires B_gpu and (evals_gpu, evecs_gpu).
     if gpu_ts_bfgs:
@@ -97,38 +137,13 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None,
         if B is None:
             # Rare GPU fallback path. Download the current Hessian only when
             # needed so the normal GPU path can keep B device-resident.
-            try:
-                B = B_gpu.cpu().numpy()
-            except (RuntimeError, MemoryError):
-                _gpu_mod._record_oom(B_gpu.shape[0])
-                raise
+            B = _download_gpu_hessian(B_gpu)
 
     if lams is None or vecs is None:
         lams, vecs = eigh(B)
 
-    if method == 'BFGS_auto':
-        # Default to TS-BFGS, and only use BFGS if B and S.T @ Y are
-        # both positive definite
-        method = 'TS-BFGS'
-        if lams is not None and np.all(lams > 0):
-            lams_STY, _ = eigh(S.T @ Ytilde, S.T @ S)
-            if np.all(lams_STY > 0):
-                method = 'BFGS'
-
-    if method == 'BFGS':
-        Bplus = _MS_BFGS(B, S, Ytilde)
-    elif method == 'TS-BFGS':
-        Bplus = _MS_TS_BFGS(B, S, Ytilde, lams, vecs)
-    elif method == 'PSB':
-        Bplus = _MS_PSB(B, S, Ytilde)
-    elif method == 'DFP':
-        Bplus = _MS_DFP(B, S, Ytilde)
-    elif method == 'SR1':
-        Bplus = _MS_SR1(B, S, Ytilde)
-    elif method == 'Greenstadt':
-        Bplus = _MS_Greenstadt(B, S, Ytilde)
-    else:  # pragma: no cover
-        raise ValueError('Unknown update method {}'.format(method))
+    method = _resolve_update_method(method, S, Ytilde, lams)
+    Bplus = _update_delta(method, B, S, Ytilde, lams, vecs)
 
     Bplus += B
     # Symmetrize to clean up floating-point roundoff. The MS_* updates above
@@ -200,6 +215,15 @@ def _MS_Greenstadt(B, S, Y):
     U = solve(S.T @ MS, MS.T).T
     UJT = U @ J.T
     return (UJT + UJT.T) - U @ (J.T @ S) @ U.T
+
+
+_MS_UPDATE_METHODS = {
+    'BFGS': _MS_BFGS,
+    'PSB': _MS_PSB,
+    'DFP': _MS_DFP,
+    'SR1': _MS_SR1,
+    'Greenstadt': _MS_Greenstadt,
+}
 
 
 # Not a symmetric update, so not available my default

@@ -43,6 +43,30 @@ class LightAtoms:
         self.cell = cell
 
 
+class _DisjointSet:
+    __slots__ = ('parent', 'n_active')
+
+    def __init__(self, size: int, n_active: int = None) -> None:
+        self.parent = list(range(size))
+        self.n_active = size if n_active is None else n_active
+
+    def find(self, item: int) -> int:
+        parent = self.parent
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(self, a: int, b: int) -> bool:
+        root_a = self.find(a)
+        root_b = self.find(b)
+        if root_a == root_b:
+            return False
+        self.parent[root_a] = root_b
+        self.n_active -= 1
+        return True
+
+
 # =============================================================================
 # Vectorized (batched) internal coordinate functions using jax.vmap
 # =============================================================================
@@ -3854,6 +3878,65 @@ class Internals(BaseInternals):
                 labels[j] = label
                 Internals.flood_fill(j, nbonds, c10y, labels, label)
 
+    @staticmethod
+    def _ignore_duplicate(adder, *args, **kwargs) -> bool:
+        try:
+            adder(*args, **kwargs)
+        except DuplicateInternalError:
+            return False
+        return True
+
+    @staticmethod
+    def _component_labels(labels, natoms):
+        comp = labels.copy()
+        next_label = int(comp.max()) + 1 if comp.size else 0
+        for atom in range(natoms):
+            if comp[atom] < 0:
+                comp[atom] = next_label
+                next_label += 1
+        return comp, next_label
+
+    @staticmethod
+    def _component_pair_key(comp_a, comp_b):
+        return frozenset((int(comp_a), int(comp_b)))
+
+    @staticmethod
+    def _record_link(links, have, a, b, ts):
+        pair = (min(a, b), max(a, b))
+        if pair in have:
+            return False
+        links.append((a, b, ts))
+        have.add(pair)
+        return True
+
+    def _ensure_reduced_cell_cache(self):
+        if self.cell is not None and np.allclose(self.cell, self.atoms.cell):
+            return
+        self.cell = self.atoms.cell.array.copy()
+        rcell, self.op = minkowski_reduce(
+            complete_cell(self.cell), pbc=self.atoms.pbc
+        )
+        self.rcell = Cell(rcell)
+        self._rcell_reciprocal_T = self.rcell.reciprocal().T
+
+    def _periodic_pair_distances(self, ii, jj):
+        self._ensure_reduced_cell_cache()
+        dx = self.atoms.positions[jj] - self.atoms.positions[ii]
+        dx_sc = dx @ self._rcell_reciprocal_T
+
+        offset = np.zeros(dx_sc.shape, dtype=np.int32)
+        for _ in range(2):
+            offset += (
+                self.atoms.pbc * ((dx_sc - offset) // 1.)
+            ).astype(np.int32)
+
+        ranges = [np.arange(-1 * p, p + 1) for p in self.atoms.pbc]
+        base_ts = np.array(list(product(*ranges)), dtype=np.int32)
+        translations = (base_ts[None, :, :] - offset[:, None, :]) @ self.op
+        tvecs_cart = translations @ self.atoms.cell.array
+        dists = np.linalg.norm(dx[:, None, :] + tvecs_cart, axis=2)
+        return dists, translations
+
     def _find_bonds_vectorized(self, labels, scale, rcov):
         """Vectorized bond search across all candidate atom pairs.
 
@@ -3861,70 +3944,28 @@ class Internals(BaseInternals):
         distance threshold, where ts is the integer translation vector.
         """
         natoms = self.natoms
-        pos = self.atoms.positions
-        cell = self.atoms.cell.array
-        pbc = self.atoms.pbc
 
-        # Ensure cell/rcell/op are cached
-        if self.cell is None or not np.allclose(self.cell, self.atoms.cell):
-            self.cell = self.atoms.cell.array.copy()
-            rcell, self.op = minkowski_reduce(
-                complete_cell(self.cell), pbc=pbc
-            )
-            self.rcell = Cell(rcell)
-            self._rcell_reciprocal_T = self.rcell.reciprocal().T
-
-        # 1. Generate all candidate pairs (i <= j)
         ii, jj = np.triu_indices(natoms, k=0)
-        # Skip pairs in the same labeled fragment
         same_frag = (labels[ii] == labels[jj]) & (labels[ii] != -1)
         keep = ~same_frag
         ii, jj = ii[keep], jj[keep]
-
         if len(ii) == 0:
             return []
 
-        # 2. All pairwise displacements
-        dx = pos[jj] - pos[ii]  # (n_pairs, 3)
-
-        # 3. Pair-dependent offsets (vectorized _get_neighbors logic)
-        dx_sc = dx @ self._rcell_reciprocal_T
-        offset = np.zeros(dx_sc.shape, dtype=np.int32)
-        for _ in range(2):
-            offset += (pbc * ((dx_sc - offset) // 1.)).astype(np.int32)
-
-        # 4. Base translation vectors from PBC dimensions
-        ranges = [np.arange(-1 * p, p + 1) for p in pbc]
-        base_ts = np.array(
-            list(product(*ranges)), dtype=np.int32
-        )  # (n_ts, 3)
-
-        # 5. Shifted translations and Cartesian vectors
-        shifted = base_ts[None, :, :] - offset[:, None, :]  # (n_pairs, n_ts, 3)
-        tvecs_cart = (shifted @ self.op) @ cell  # (n_pairs, n_ts, 3)
-
-        # 6. Distances
-        dists = np.linalg.norm(
-            dx[:, None, :] + tvecs_cart, axis=2
-        )  # (n_pairs, n_ts)
-
-        # 7. Covalent radius threshold
+        dists, translations = self._periodic_pair_distances(ii, jj)
         thresholds = scale * (rcov[ii] + rcov[jj])
         bond_mask = dists <= thresholds[:, None]
 
-        # 8. Exclude self-bonds (i==j) with zero translation
         self_bond = (ii == jj)
-        zero_ts = np.all(shifted @ self.op == 0, axis=2)
+        zero_ts = np.all(translations == 0, axis=2)
         bond_mask &= ~(self_bond[:, None] & zero_ts)
 
-        # 9. Collect hits
         pair_idx, ts_idx = np.nonzero(bond_mask)
-        op = self.op
         results = []
         for k in range(len(pair_idx)):
             p = pair_idx[k]
             t = ts_idx[k]
-            ts = (shifted[p, t] @ op).astype(np.int32)
+            ts = translations[p, t].astype(np.int32)
             results.append((int(ii[p]), int(jj[p]), ts))
         return results
 
@@ -3948,51 +3989,20 @@ class Internals(BaseInternals):
         fragment id and ``-1`` marks a lone (unbonded) atom, treated here as its
         own singleton component.
         """
-        natoms = self.natoms
-        pos = self.atoms.positions
-        cell = self.atoms.cell.array
-        pbc = self.atoms.pbc
+        comp, next_label = self._component_labels(labels, self.natoms)
+        n_components = len({int(c) for c in comp})
 
-        # Ensure cell/rcell/op are cached (mirrors _find_bonds_vectorized).
-        if self.cell is None or not np.allclose(self.cell, self.atoms.cell):
-            self.cell = self.atoms.cell.array.copy()
-            rcell, self.op = minkowski_reduce(
-                complete_cell(self.cell), pbc=pbc
-            )
-            self.rcell = Cell(rcell)
-            self._rcell_reciprocal_T = self.rcell.reciprocal().T
-
-        # Component id per atom: fragment label, or a unique id per lone atom.
-        comp = labels.copy()
-        nxt = int(comp.max()) + 1 if comp.size else 0
-        for a in range(natoms):
-            if comp[a] < 0:
-                comp[a] = nxt
-                nxt += 1
-
-        # Candidate pairs across different components.
-        ii, jj = np.triu_indices(natoms, k=1)
+        ii, jj = np.triu_indices(self.natoms, k=1)
         keep = comp[ii] != comp[jj]
         ii, jj = ii[keep], jj[keep]
         if len(ii) == 0:
             return []
 
-        # Minimum-image distance and translation for every candidate pair
-        # (mirrors the offset logic in _find_bonds_vectorized).
-        dx = pos[jj] - pos[ii]
-        dx_sc = dx @ self._rcell_reciprocal_T
-        offset = np.zeros(dx_sc.shape, dtype=np.int32)
-        for _ in range(2):
-            offset += (pbc * ((dx_sc - offset) // 1.)).astype(np.int32)
-        ranges = [np.arange(-1 * p, p + 1) for p in pbc]
-        base_ts = np.array(list(product(*ranges)), dtype=np.int32)
-        shifted = base_ts[None, :, :] - offset[:, None, :]
-        tvecs_cart = (shifted @ self.op) @ cell
-        dists = np.linalg.norm(dx[:, None, :] + tvecs_cart, axis=2)
+        dists, translations = self._periodic_pair_distances(ii, jj)
         best = dists.argmin(axis=1)
         rows = np.arange(len(dists))
         best_dist = dists[rows, best]
-        best_ts = (shifted[rows, best] @ self.op).astype(np.int32)
+        best_ts = translations[rows, best].astype(np.int32)
 
         # Connect components. A bare minimum-spanning *tree* is minimal but
         # biased: it under-determines extended contact interfaces (one weld
@@ -4006,28 +4016,10 @@ class Internals(BaseInternals):
         # physical gate (<= `_weld_gate` x sum of covalent radii) ensures
         # genuinely-separated fragments still get only a single minimal weld, so
         # we never re-introduce the stretched/transannular bonds MST replaced.
-        parent = list(range(nxt))
-
-        def find(a):
-            while parent[a] != a:
-                parent[a] = parent[parent[a]]
-                a = parent[a]
-            return a
-
-        ncomp = len({int(c) for c in comp})
-        n_active = [ncomp]
-
-        def union(a, b):
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[ra] = rb
-                n_active[0] -= 1
-                return True
-            return False
-
         order = np.argsort(best_dist, kind='stable')
         links = []
         have = set()
+        weld_set = _DisjointSet(next_label, n_components)
 
         if self._weld_augment:
             tol = self._weld_tol
@@ -4043,35 +4035,26 @@ class Internals(BaseInternals):
             # handles weakly-bonded / large-vdW fragments (e.g. noble-gas
             # clusters) whose real contacts sit far outside a covalent-radius
             # gate, without loosening that gate for tightly-bonded organics.
-            p2 = list(range(nxt))
-
-            def _find2(a):
-                while p2[a] != a:
-                    p2[a] = p2[p2[a]]
-                    a = p2[a]
-                return a
-
-            active2 = ncomp
+            raw_set = _DisjointSet(next_label, n_components)
             dmst_max = 0.0
             for k in order:
-                if active2 == 1:
+                if raw_set.n_active == 1:
                     break
-                ra, rb = _find2(int(comp[ii[k]])), _find2(int(comp[jj[k]]))
-                if ra != rb:
-                    p2[ra] = rb
-                    active2 -= 1
+                if raw_set.union(int(comp[ii[k]]), int(comp[jj[k]])):
                     if best_dist[k] > dmst_max:
                         dmst_max = best_dist[k]
+
             # Shortest contact per component-pair (order is sorted, so the first
             # time a pair is seen is its minimum).
             pair_min = {}
             for k in order:
-                key = frozenset((int(comp[ii[k]]), int(comp[jj[k]])))
+                key = self._component_pair_key(comp[ii[k]], comp[jj[k]])
                 if key not in pair_min:
                     pair_min[key] = best_dist[k]
+
             for k in order:
                 a, b = int(ii[k]), int(jj[k])
-                dmin = pair_min[frozenset((int(comp[a]), int(comp[b])))]
+                dmin = pair_min[self._component_pair_key(comp[a], comp[b])]
                 rcov_sum = (covalent_radii[self.atoms.numbers[a]]
                             + covalent_radii[self.atoms.numbers[b]])
                 # Near this interface's own minimum (never a transannular
@@ -4081,21 +4064,17 @@ class Internals(BaseInternals):
                     best_dist[k] <= gate * rcov_sum
                     or best_dist[k] <= dmst_max * (1. + tol)
                 ):
-                    links.append((a, b, best_ts[k]))
-                    have.add((min(a, b), max(a, b)))
-                    union(int(comp[a]), int(comp[b]))
+                    self._record_link(links, have, a, b, best_ts[k])
+                    weld_set.union(int(comp[a]), int(comp[b]))
 
         # MST pass: add the shortest contact that still merges two separate
         # components until the whole graph is connected.
         for k in order:
-            if n_active[0] == 1:
+            if weld_set.n_active == 1:
                 break
             a, b = int(ii[k]), int(jj[k])
-            if union(int(comp[a]), int(comp[b])):
-                pair = (min(a, b), max(a, b))
-                if pair not in have:
-                    links.append((a, b, best_ts[k]))
-                    have.add(pair)
+            if weld_set.union(int(comp[a]), int(comp[b])):
+                self._record_link(links, have, a, b, best_ts[k])
         return links
 
     def _wrap_fragment_positions(self, group, cumshifts):
@@ -4172,17 +4151,9 @@ class Internals(BaseInternals):
             self._invalidate_structure()
             self.cons._invalidate_structure()
 
-    def find_all_bonds(
-        self,
-        nbond_cart_thr: int = 6,
-        max_bonds: int = 20,
-        scale: float = 1.25,
-    ) -> None:
-        rcov = covalent_radii[self.atoms.numbers]
+    def _initial_bond_adjacency(self, max_bonds):
         nbonds = np.zeros(self.natoms, dtype=np.int32)
-        labels = -np.ones(self.natoms, dtype=np.int32)
         c10y = -np.ones((self.natoms, max_bonds), dtype=np.int32)
-
         for bond in self.internals['bonds']:
             i, j = bond.indices
             if i >= self.natoms or j >= self.natoms:
@@ -4191,20 +4162,113 @@ class Internals(BaseInternals):
             nbonds[i] += 1
             c10y[j, nbonds[j]] = i
             nbonds[j] += 1
+        return nbonds, c10y
+
+    def _connected_fragment_labels(self, nbonds, c10y, labels):
+        labels[:] = -1
+        nlabels = 0
+        for i in range(self.natoms):
+            if labels[i] == -1:
+                labels[i] = nlabels
+                self.flood_fill(i, nbonds, c10y, labels, nlabels)
+                nlabels += 1
+        return nlabels
+
+    def _add_bond_candidates(self, candidates, nbonds, c10y, max_bonds):
+        for i, j, ts in candidates:
+            if not self._ignore_duplicate(self.add_bond, (i, j), ts):
+                continue
+            if nbonds[i] < max_bonds and nbonds[j] < max_bonds:
+                c10y[i, nbonds[i]] = j
+                nbonds[i] += 1
+                c10y[j, nbonds[j]] = i
+                nbonds[j] += 1
+
+    def _add_disconnected_fragment_coords(self, labels, nlabels):
+        assert nlabels > 1
+        groups = [[] for _ in range(nlabels)]
+        singletons = []
+        for i, label in enumerate(labels):
+            if label == -1:
+                self._add_fragment_coords([i], with_rotation=False)
+                singletons.append(i)
+            else:
+                groups[label].append(i)
+
+        cumshifts = {}
+        self.fragment_atom_groups = []
+        for group in groups:
+            if not group:
+                continue
+            self._wrap_fragment_positions(group, cumshifts)
+            self.fragment_atom_groups.append(np.array(group, dtype=np.int32))
+            self._add_fragment_coords(group)
+
+        for i in singletons:
+            self.fragment_atom_groups.append(np.array([i], dtype=np.int32))
+        return cumshifts
+
+    def _add_single_fragment_pbc_coords(self):
+        group = list(range(self.natoms))
+        cumshifts = {}
+        self._wrap_fragment_positions(group, cumshifts)
+        self.fragment_atom_groups = [np.array(group, dtype=np.int32)]
+        self._add_fragment_coords(group)
+        return cumshifts
+
+    def _add_improper_dihedral_for_linear_angle(self, j, jbonds, b1, b2):
+        for b3 in jbonds:
+            if b3 in (b1, b2):
+                continue
+
+            ordered = (
+                (int(b1.indices[1]), b1.kwargs['ncvecs'][0]),
+                (int(b3.indices[1]), b3.kwargs['ncvecs'][0]),
+                (int(b2.indices[1]), b2.kwargs['ncvecs'][0]),
+            )
+            if not self._improper_dihedral_well_defined(j, ordered):
+                continue
+
+            indices = (b1.indices[1], j, b3.indices[1], b2.indices[1])
+            ncvecs = (
+                -b1.kwargs['ncvecs'][0],
+                b3.kwargs['ncvecs'][0],
+                b2.kwargs['ncvecs'][0] - b3.kwargs['ncvecs'][0]
+            )
+            self._ignore_duplicate(self.add_dihedral, indices, ncvecs)
+            return True
+        return False
+
+    def _add_linear_angle_replacements(self, j, jbonds, linear):
+        if len(jbonds) == 2:
+            self._add_linear_bend_dummy(j, jbonds, *jbonds)
+            return
+
+        dummy_added = False
+        for b1, b2 in linear:
+            if self._add_improper_dihedral_for_linear_angle(j, jbonds, b1, b2):
+                continue
+
+            # No existing third bond gives two well-defined dihedral planes.
+            # Fall back to the dummy linear bend machinery instead of adding an
+            # undefined improper with NaN derivatives.
+            if not dummy_added:
+                self._add_linear_bend_dummy(j, jbonds, b1, b2)
+                dummy_added = True
+
+    def find_all_bonds(
+        self,
+        nbond_cart_thr: int = 6,
+        max_bonds: int = 20,
+        scale: float = 1.25,
+    ) -> None:
+        rcov = covalent_radii[self.atoms.numbers]
+        nbonds, c10y = self._initial_bond_adjacency(max_bonds)
+        labels = -np.ones(self.natoms, dtype=np.int32)
 
         first_run = True
         while True:
-            # use flood fill algorithm to count the number of disconnected
-            # fragments
-            nlabels = 0
-            labels[:] = -1
-            for i in range(self.natoms):
-                if labels[i] == -1:
-                    labels[i] = nlabels
-                    self.flood_fill(i, nbonds, c10y, labels, nlabels)
-                    nlabels += 1
-            # if there is only one fragment, then the internal coordinates
-            # are complete, and we can stop
+            nlabels = self._connected_fragment_labels(nbonds, c10y, labels)
             if nlabels == 1:
                 break
 
@@ -4218,10 +4282,7 @@ class Internals(BaseInternals):
                 break
 
             if first_run:
-                # Initial covalent-bond detection at the base scale.
-                candidates = self._find_bonds_vectorized(
-                    labels, scale, rcov
-                )
+                candidates = self._find_bonds_vectorized(labels, scale, rcov)
                 first_run = False
                 weld_pass = False
             else:
@@ -4232,56 +4293,19 @@ class Internals(BaseInternals):
                 # pass connects every component.
                 candidates = self._mst_welding_bonds(labels)
                 weld_pass = True
-            for i, j, ts in candidates:
-                try:
-                    self.add_bond((i, j), ts)
-                except DuplicateInternalError:
-                    continue
-                if nbonds[i] < max_bonds and nbonds[j] < max_bonds:
-                    c10y[i, nbonds[i]] = j
-                    nbonds[i] += 1
-                    c10y[j, nbonds[j]] = i
-                    nbonds[j] += 1
+
+            self._add_bond_candidates(candidates, nbonds, c10y, max_bonds)
             if weld_pass:
                 # MST spans all components in one pass; connectivity is
                 # guaranteed by construction, so we are done welding.
                 break
 
         if self.allow_fragments and nlabels != 1:
-            assert nlabels > 1
-            groups = [[] for _ in range(nlabels)]
-            singletons = []
-            for i, label in enumerate(labels):
-                if label == -1:
-                    # A lone atom not bonded to anything else
-                    self._add_fragment_coords([i], with_rotation=False)
-                    singletons.append(i)
-                else:
-                    groups[label].append(i)
-            cumshifts = {}
-            self.fragment_atom_groups = []
-            for group in groups:
-                if not group:
-                    continue
-                self._wrap_fragment_positions(group, cumshifts)
-                self.fragment_atom_groups.append(np.array(group, dtype=np.int32))
-                self._add_fragment_coords(group)
-            # Isolated one-atom fragments are also fragments for rigid-body cell
-            # motion: they get a translation TRIC and must move fractionally
-            # with the cell. Record them so CellInternalPES treats them as
-            # rigid singletons (zero delta_r, CoM follows the cell).
-            for i in singletons:
-                self.fragment_atom_groups.append(
-                    np.array([i], dtype=np.int32)
-                )
+            cumshifts = self._add_disconnected_fragment_coords(labels, nlabels)
         elif (self.allow_fragments and nlabels == 1
               and np.any(self.atoms.pbc)
               and len(self.internals['bonds']) > 0):
-            group = list(range(self.natoms))
-            cumshifts = {}
-            self._wrap_fragment_positions(group, cumshifts)
-            self.fragment_atom_groups = [np.array(group, dtype=np.int32)]
-            self._add_fragment_coords(group)
+            cumshifts = self._add_single_fragment_pbc_coords()
         else:
             cumshifts = {}
 
@@ -4309,55 +4333,12 @@ class Internals(BaseInternals):
                 # Angles inside the linear window are kept as ordinary bends;
                 # near-linear ones get dummy/dihedral treatment.
                 if self.atol < new.calc(self.atoms) < np.pi - self.atol:
-                    try:
-                        self.add_angle(new)
-                    except DuplicateInternalError:
-                        pass
+                    self._ignore_duplicate(self.add_angle, new)
                 else:
                     self.forbid_angle(new)
                     linear.append((b1, b2))
             if linear:
-                if len(jbonds) == 2:
-                    self._add_linear_bend_dummy(j, jbonds, *jbonds)
-                else:
-                    dummy_added = False
-                    for b1, b2 in linear:
-                        for b3 in jbonds:
-                            if b3 in (b1, b2):
-                                continue
-                            ordered = (
-                                (int(b1.indices[1]), b1.kwargs['ncvecs'][0]),
-                                (int(b3.indices[1]), b3.kwargs['ncvecs'][0]),
-                                (int(b2.indices[1]), b2.kwargs['ncvecs'][0]),
-                            )
-                            if not self._improper_dihedral_well_defined(
-                                j, ordered
-                            ):
-                                continue
-                            indices = (
-                                b1.indices[1], j, b3.indices[1], b2.indices[1]
-                            )
-                            ncvecs = (
-                                -b1.kwargs['ncvecs'][0],
-                                b3.kwargs['ncvecs'][0],
-                                b2.kwargs['ncvecs'][0] - b3.kwargs['ncvecs'][0]
-                            )
-                            try:
-                                self.add_dihedral(indices, ncvecs)
-                            except DuplicateInternalError:
-                                pass
-                            break
-                        else:
-                            # No existing third bond gives two well-defined
-                            # dihedral planes. Fall back to the dummy linear
-                            # bend machinery instead of adding an undefined
-                            # improper with NaN derivatives.
-                            if not dummy_added:
-                                self._add_linear_bend_dummy(
-                                    j, jbonds, b1, b2
-                                )
-                                dummy_added = True
-                            continue
+                self._add_linear_angle_replacements(j, jbonds, linear)
 
     def _add_linear_bend_dummy(self, j, jbonds, b1, b2):
         """Add the dummy-coordinate representation for a linear bend."""
@@ -4386,22 +4367,13 @@ class Internals(BaseInternals):
             self._invalidate_structure()
 
         dbond = Bond((j, self.dinds[j]))
-        try:
-            self.cons.fix_bond(dbond, replace_ok=False)
-        except DuplicateInternalError:
-            pass
-        try:
-            self.add_bond(dbond)
-        except DuplicateInternalError:
-            pass
+        self._ignore_duplicate(self.cons.fix_bond, dbond, replace_ok=False)
+        self._ignore_duplicate(self.add_bond, dbond)
 
         # Fix one dummy angle. For linear O1-C-O2, the two dummy angles are
         # supplementary, so constraining both over-constrains real atoms.
         dangle1 = b1 + dbond
-        try:
-            self.cons.fix_angle(dangle1, replace_ok=False)
-        except DuplicateInternalError:
-            pass
+        self._ignore_duplicate(self.cons.fix_angle, dangle1, replace_ok=False)
 
         if b2.indices[1] == j:
             b2 = b2.reverse()
@@ -4409,10 +4381,7 @@ class Internals(BaseInternals):
             (self.dinds[j], b2.indices[1]), b2.kwargs['ncvecs']
         )
         dangle3 = dbond + dbond2
-        try:
-            self.add_dihedral(dangle1 + dangle3)
-        except DuplicateInternalError:
-            pass
+        self._ignore_duplicate(self.add_dihedral, dangle1 + dangle3)
         self.add_dummy_to_internals(j)
         self.cons.add_dummy_to_internals(j)
 
@@ -4421,10 +4390,7 @@ class Internals(BaseInternals):
             assert new.indices[1] == j
             angle = new.calc(self.all_atoms)
             if self.atol < angle < np.pi - self.atol:
-                try:
-                    self.add_angle(new)
-                except DuplicateInternalError:
-                    pass
+                self._ignore_duplicate(self.add_angle, new)
             else:
                 self.forbid_angle(new)
 
@@ -4459,10 +4425,7 @@ class Internals(BaseInternals):
                     )
                 ):
                     continue
-                try:
-                    self.add_dihedral(new)
-                except DuplicateInternalError:
-                    continue
+                self._ignore_duplicate(self.add_dihedral, new)
 
         # Second, add improper dihedrals for atoms with 3 or 4 neighbors that don't
         # have any proper dihedral passing through them. This is needed because:

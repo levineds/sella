@@ -1314,32 +1314,23 @@ class InternalPES(PES):
             return None
 
         natoms = self.int.natoms
-        parent_of = {
-            int(dummy): int(parent)
-            for parent, dummy in enumerate(self.int.dinds)
-            if dummy >= 0
-        }
-        if len(parent_of) != len(self.dummies):
+        parent_of = self._linear_bend_dummy_parent_map()
+        if parent_of is None:
             return None
 
         bond_rec = {}
         angle_rec = {}
-        for name in self.cons._names:
-            for active, kind in zip(self.cons._active[name],
-                                    self.cons._kind[name]):
-                if not active:
-                    continue
-                if kind != 'eq' or name not in ('bonds', 'angles'):
-                    return None
+        if not self._linear_bend_dummy_constraints_are_projectable():
+            return None
 
         for coord, active, target in zip(self.cons.internals['bonds'],
                                          self.cons._active['bonds'],
                                          self.cons._targets['bonds']):
             if not active:
                 continue
-            ids = np.asarray(coord.indices, dtype=int)
-            dummies = ids[ids >= natoms]
-            reals = ids[ids < natoms]
+            ids, reals, dummies = self._split_real_dummy_ids(
+                coord.indices, natoms
+            )
             if len(dummies) != 1 or len(reals) != 1:
                 return None
             dummy = int(dummies[0])
@@ -1353,8 +1344,7 @@ class InternalPES(PES):
                                          self.cons._targets['angles']):
             if not active:
                 continue
-            ids = np.asarray(coord.indices, dtype=int)
-            dummies = ids[ids >= natoms]
+            ids, _, dummies = self._split_real_dummy_ids(coord.indices, natoms)
             if len(dummies) != 1 or ids[1] >= natoms:
                 return None
             dummy = int(dummies[0])
@@ -1375,6 +1365,29 @@ class InternalPES(PES):
              angle_rec[dummy][0], angle_rec[dummy][1], angle_rec[dummy][2])
             for dummy in sorted(bond_rec)
         ]
+
+    def _linear_bend_dummy_parent_map(self):
+        parent_of = {
+            int(dummy): int(parent)
+            for parent, dummy in enumerate(self.int.dinds)
+            if dummy >= 0
+        }
+        if len(parent_of) != len(self.dummies):
+            return None
+        return parent_of
+
+    def _linear_bend_dummy_constraints_are_projectable(self):
+        for name in self.cons._names:
+            for active, kind in zip(self.cons._active[name],
+                                    self.cons._kind[name]):
+                if active and (kind != 'eq' or name not in ('bonds', 'angles')):
+                    return False
+        return True
+
+    @staticmethod
+    def _split_real_dummy_ids(indices, natoms):
+        ids = np.asarray(indices, dtype=int)
+        return ids, ids[ids < natoms], ids[ids >= natoms]
 
     def _project_linear_bend_dummies(self, target_tol=1e-7,
                                      safety_limit=0.05):
