@@ -145,6 +145,21 @@ def _MS_BFGS(B, S, Y):
 
 
 def _MS_TS_BFGS(B, S, Y, lams, vecs):
+    if S.shape[1] == 1:
+        s = S[:, 0]
+        y = Y[:, 0]
+        J = y - B @ s
+        absBS = vecs @ (np.abs(lams) * (vecs.T @ s))
+        X = (s @ y) * y + (s @ absBS) * absBS
+        XS = X @ s
+        if XS == 0.0:
+            logger.debug("TS-BFGS singular rank-one update, falling back to PSB")
+            return _MS_PSB(B, S, Y)
+        U = X / XS
+        JTS = J @ s
+        return (np.outer(U, J) + np.outer(J, U)
+                - JTS * np.outer(U, U))
+
     J = Y - B @ S
     X1 = S.T @ Y @ Y.T
     absBS = vecs @ (np.abs(lams[:, np.newaxis]) * (vecs.T @ S))

@@ -1210,6 +1210,36 @@ class TestRigidFragments:
         atoms.calc = LennardJones()
         return atoms
 
+    def _make_seeded_triclinic_water_crystal(self, seed, nwaters=3):
+        """Create a deterministic skewed molecular crystal from a seed."""
+        rng = np.random.RandomState(seed)
+        cell = np.array([
+            [5.8, 0.0, 0.0],
+            [0.8 + 0.15 * rng.rand(), 5.6, 0.0],
+            [0.5 + 0.15 * rng.rand(), 0.7 + 0.15 * rng.rand(), 6.0],
+        ])
+        frac_centers = np.array([
+            [0.20, 0.22, 0.22],
+            [0.58, 0.34, 0.50],
+            [0.34, 0.70, 0.42],
+            [0.76, 0.68, 0.75],
+        ])
+        water = molecule('H2O')
+        water.positions -= water.positions.mean(axis=0)
+
+        atoms = Atoms()
+        for frac in frac_centers[:nwaters]:
+            mol = water.copy()
+            for axis in ['x', 'y', 'z']:
+                mol.rotate(rng.rand() * 360.0, axis, center=(0, 0, 0))
+            mol.positions += frac @ cell
+            atoms += mol
+
+        atoms.set_cell(cell)
+        atoms.pbc = True
+        atoms.calc = LennardJones()
+        return atoms
+
     def _cell_gradient_fd(self, pes, delta=1e-6):
         """Compute cell DOF gradient via central finite differences."""
         _, g = pes.eval()
@@ -1257,6 +1287,50 @@ class TestRigidFragments:
             pes.set_x(x_deformed)
 
         g_cell, g_cell_numeric = self._cell_gradient_fd(pes)
+        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
+
+    @pytest.mark.parametrize("seed", [0, 7, 19])
+    def test_seeded_triclinic_cell_gradient_matches_fd(self, seed):
+        """Rigid-fragment cell gradients should survive varied skewed cells."""
+        atoms = self._make_seeded_triclinic_water_crystal(seed)
+        internals = Internals(atoms, allow_fragments=True)
+        pes = CellInternalPES(atoms, internals, rigid_fragments=True)
+        assert pes.rigid_fragments is True
+        assert len(pes.fragment_groups) == 3
+
+        # Move away from the construction point so the FD sweep samples the
+        # real cell-update path, including rigid rotations under shear.
+        x = pes.get_x().copy()
+        rng = np.random.RandomState(seed + 100)
+        x[pes.n_internal:] += 0.02 * rng.normal(size=pes.n_cell_dof)
+        pes.set_x(x)
+
+        g_cell, g_cell_numeric = self._cell_gradient_fd(pes, delta=1e-5)
+        assert np.abs(g_cell).max() > 1e-4
+        assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
+
+    def test_masked_rigid_fragment_cell_gradient_matches_fd(self):
+        """A sparse cell mask must use the same rigid cell derivative."""
+        atoms = self._make_seeded_triclinic_water_crystal(seed=23)
+        internals = Internals(atoms, allow_fragments=True)
+        cell_mask = np.array([
+            [True, False, True],
+            [False, True, False],
+            [True, False, True],
+        ])
+        pes = CellInternalPES(
+            atoms,
+            internals,
+            rigid_fragments=True,
+            cell_mask=cell_mask,
+        )
+        assert pes.n_cell_dof == np.count_nonzero(cell_mask)
+
+        x = pes.get_x().copy()
+        x[pes.n_internal:] += np.linspace(-0.015, 0.015, pes.n_cell_dof)
+        pes.set_x(x)
+
+        g_cell, g_cell_numeric = self._cell_gradient_fd(pes, delta=1e-5)
         assert_allclose(g_cell, g_cell_numeric, atol=1e-4, rtol=1e-3)
 
     def test_intramolecular_geometry_preserved_after_cell_step(self):
