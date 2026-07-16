@@ -2217,14 +2217,16 @@ class TestDummyAtomCellHandling:
         x0 = pes.get_x().copy()
         pes.get_g()
         dummy_rows = pes._dummy_containing_coord_rows()
+        aux_rows = pes._dummy_auxiliary_projection_filter_rows()
         dih0 = pes._dummy_dihedral_values()
 
         dx_initial, dx_final, _ = pes.set_x(x0)
 
         assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
         assert_allclose(dx_initial, 0.0, atol=1e-14)
-        assert_allclose(dx_final, 0.0, atol=1e-12)
         assert len(dummy_rows) > 0
+        assert len(aux_rows) > 0
+        assert_allclose(dx_final[list(aux_rows)], 0.0, atol=1e-12)
         ddih = pes._wrapped_angle_delta(pes._dummy_dihedral_values(), dih0)
         assert_allclose(ddih, 0.0, atol=1e-8)
 

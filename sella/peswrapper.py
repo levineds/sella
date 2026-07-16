@@ -1362,6 +1362,32 @@ class InternalPES(PES):
                 row += 1
         return tuple(sorted(set(rows)))
 
+    def _dummy_auxiliary_projection_filter_rows(self):
+        natoms = self.int.natoms
+        records = self._linear_bend_dummy_projection_records()
+        aux_coords = ()
+        if records is not None:
+            aux_coords = tuple(
+                coord
+                for (_, _, bond_coord, _, angle_coord, _, _) in records
+                for coord in (bond_coord, angle_coord)
+            )
+        rows = []
+        row = 0
+        for name in self.int._names:
+            for coord, active in zip(self.int.internals[name],
+                                     self.int._active[name]):
+                if not active:
+                    continue
+                if (name in ('translations', 'rotations')
+                        and np.any(np.asarray(coord.indices) >= natoms)):
+                    rows.append(row)
+                elif (name in ('bonds', 'angles')
+                      and any(coord == aux_coord for aux_coord in aux_coords)):
+                    rows.append(row)
+                row += 1
+        return tuple(sorted(set(rows)))
+
     @staticmethod
     def _wrapped_angle_delta(after, before):
         return (after - before + np.pi) % (2 * np.pi) - np.pi
@@ -1400,6 +1426,7 @@ class InternalPES(PES):
             np.cos(theta) * axis + np.sin(theta) * azimuth
         )
         positions[dummy] = positions[parent] + dummy_shift + new_vec
+
         if np.linalg.norm(positions[dummy] - old_pos,
                           ord=np.inf) > safety_limit:
             positions[dummy] = old_pos
@@ -1539,13 +1566,18 @@ class InternalPES(PES):
         if dummy_dihedrals0.size:
             ddih = self._wrapped_angle_delta(dummy_dihedrals1,
                                              dummy_dihedrals0)
+            if not np.all(np.isfinite(ddih)):
+                self.dummies.positions[:] = old_dpos
+                return None
             self._last_linear_dummy_projection_ddih = float(
                 np.linalg.norm(ddih, ord=np.inf)
             )
         else:
             self._last_linear_dummy_projection_ddih = 0.0
         self._last_linear_dummy_projection_mode = 'cone'
-        self._last_projection_filter_rows = self._dummy_containing_coord_rows()
+        self._last_projection_filter_rows = (
+            self._dummy_auxiliary_projection_filter_rows()
+        )
         return True
 
     def get_x(self):

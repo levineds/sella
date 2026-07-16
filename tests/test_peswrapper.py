@@ -123,6 +123,59 @@ def test_internal_df_pred_matches_projected_hessian_formula():
     np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
 
 
+def test_linear_dummy_projection_accounts_extra_dummy_dihedral():
+    """Projection changes to non-auxiliary dummy dihedrals must reach BFGS."""
+    from ase import Atoms
+    from ase.calculators.lj import LennardJones
+
+    atoms = Atoms(
+        'OCOH',
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.16, 0.0, 0.0],
+            [2.32, 0.0, 0.0],
+            [4.0, 1.7, 0.9],
+        ],
+    )
+    atoms.calc = LennardJones()
+
+    internals = Internals(atoms)
+    internals.find_all_bonds()
+    internals.find_all_angles()
+    internals.find_all_dihedrals()
+
+    natoms = internals.natoms
+    extra_dihedral = (natoms, 0, 3, 1)
+    internals.add_dihedral(extra_dihedral)
+
+    pes = InternalPES(atoms, internals, auto_find_internals=False)
+    pes.get_g()
+
+    row = 0
+    extra_row = None
+    for name in pes.int._names:
+        for coord, active in zip(pes.int.internals[name],
+                                 pes.int._active[name]):
+            if not active:
+                continue
+            if name == 'dihedrals' and tuple(coord.indices) == extra_dihedral:
+                extra_row = row
+            row += 1
+    assert extra_row is not None
+
+    pes.dummies.positions += np.array([[8e-4, -1.7e-3, 1.1e-3]])
+    target = pes.get_x().copy()
+
+    dx_initial, dx_final, _ = pes.set_x(target)
+    actual_delta = pes._wrapped_angle_delta(
+        np.array([pes.get_x()[extra_row]]),
+        np.array([target[extra_row]]),
+    )[0]
+
+    np.testing.assert_allclose(dx_initial, 0.0, atol=1e-14)
+    np.testing.assert_allclose(dx_final[extra_row], actual_delta, atol=1e-12)
+
+
 def test_range_space_projector_periodic_rank_deficient():
     """Periodic systems are also column-rank deficient when redundant internals
     (bonds/angles/dihedrals) are used: the intramolecular coordinates fail to
