@@ -9,6 +9,29 @@ from .stepper import get_stepper, BaseStepper, NaiveStepper
 from sella._constants import _LSTSQ_RCOND
 
 
+class _CoordinateSelectionTranspose:
+    def __init__(self, selection):
+        self.selection = selection
+        self.shape = (selection.shape[1], selection.shape[0])
+
+    def __matmul__(self, values):
+        values = np.asarray(values)
+        out = np.zeros((self.shape[0],) + values.shape[1:], dtype=values.dtype)
+        out[self.selection.indices] = values
+        return out
+
+
+class _CoordinateSelection:
+    """Matrix-like selector used by the exact dummy-coordinate fast path."""
+    def __init__(self, indices, dim):
+        self.indices = np.asarray(indices, dtype=int)
+        self.shape = (len(self.indices), dim)
+        self.T = _CoordinateSelectionTranspose(self)
+
+    def __matmul__(self, values):
+        return np.asarray(values)[self.indices]
+
+
 # Classes for restricted step (e.g. trust radius, max atom displacement, etc)
 class BaseRestrictedStep:
     synonyms: List[str] = []
@@ -49,19 +72,34 @@ class BaseRestrictedStep:
             self.stepper = NaiveStepper(dx)
             self.scons[:] *= 0
         else:
-            if self._W_is_identity:
-                self.P = self.pes.get_Ufree().T
+            fast_data = None
+            if self.d1 is None:
+                fast_data = self.pes.get_fast_restricted_step_data(
+                    g, order, stepper, self._W_is_identity
+                )
+            if fast_data is not None:
+                projection, g_step, H_step = fast_data
+                if isinstance(projection, np.ndarray):
+                    self.P = _CoordinateSelection(projection, self.pes.dim)
+                else:
+                    self.P = projection
+                self.stepper = stepper(g_step, H_step, order, d1=None)
             else:
-                self.P = self.pes.get_Ufree().T @ W
-            d1 = self.d1
-            if d1 is not None:
-                d1 = np.linalg.lstsq(self.P.T, d1, rcond=_LSTSQ_RCOND)[0]
-            self.stepper = stepper(
-                self.P @ g,
-                self.pes.get_HL_projected(self.P.T),
-                order,
-                d1=d1,
-            )
+                if self._W_is_identity:
+                    self.P = self.pes.get_Ufree().T
+                else:
+                    self.P = self.pes.get_Ufree().T @ W
+                d1 = self.d1
+                if d1 is not None:
+                    d1 = np.linalg.lstsq(
+                        self.P.T, d1, rcond=_LSTSQ_RCOND
+                    )[0]
+                self.stepper = stepper(
+                    self.P @ g,
+                    self.pes.get_HL_projected(self.P.T),
+                    order,
+                    d1=d1,
+                )
 
         if tol is None:
             tol = 1e-10 if self.stepper.newton_safe else 1e-15

@@ -6,7 +6,7 @@ from ase.build import molecule
 
 import sella.internal as internal_module
 from sella.internal import (
-    Bond, Angle, Dihedral, Displacement, Constraints, Internals
+    Bond, Angle, Dihedral, Displacement, Rotation, Constraints, Internals
 )
 
 
@@ -100,6 +100,78 @@ class TestTRICs:
         # Bi should NOT have rotation ICs
         for rot in ints.internals['rotations']:
             assert len(rot.indices) >= 2, "Rotation IC added to single atom!"
+
+    def test_partial_singleton_constraint_keeps_free_translation_axes(self):
+        atoms = Atoms(
+            'HHe',
+            positions=[[1.0, 1.0, 1.0], [5.0, 5.0, 5.0]],
+            cell=np.eye(3) * 10.0,
+            pbc=True,
+        )
+        constraints = Constraints(atoms)
+        constraints.fix_translation(0, dim=0)
+        internals = Internals(
+            atoms, cons=constraints, allow_fragments=True
+        )
+
+        internals.find_all_bonds()
+        internals.find_all_angles()
+        internals.find_all_dihedrals()
+
+        translations = {
+            (tuple(coord.indices), coord.kwargs['dim'])
+            for coord in internals.internals['translations']
+        }
+        assert translations == {
+            ((0,), 0), ((0,), 1), ((0,), 2),
+            ((1,), 0), ((1,), 1), ((1,), 2),
+        }
+        assert np.linalg.matrix_rank(internals.jacobian()) == 6
+
+    def test_partial_rotation_constraint_keeps_other_rotation_axes(self):
+        atoms = Atoms(
+            'OH2',
+            positions=[[0.0, 0.0, 0.0], [0.95, 0.0, 0.0],
+                       [0.0, 0.95, 0.0]],
+            cell=np.eye(3) * 8.0,
+            pbc=True,
+        )
+        constraints = Constraints(atoms)
+        constraints.fix_rotation((0, 1, 2), axis=0)
+        internals = Internals(
+            atoms, cons=constraints, allow_fragments=True
+        )
+
+        internals.find_all_bonds()
+        internals.find_all_angles()
+        internals.find_all_dihedrals()
+
+        axes = sorted(
+            coord.kwargs['axis']
+            for coord in internals.internals['rotations']
+        )
+        assert axes == [0, 1, 2]
+        assert np.all(np.isfinite(internals.jacobian()))
+
+    def test_rotation_gradient_initializes_and_refreshes_quaternion(self):
+        atoms = Atoms(
+            'OH2',
+            positions=[[0.0, 0.0, 0.0], [0.95, 0.0, 0.0],
+                       [0.0, 0.95, 0.0]],
+        )
+        indices = (0, 1, 2)
+        refpos = atoms.positions.copy()
+        rotation = Rotation(indices, 0, refpos)
+
+        gradient0 = rotation.calc_gradient(atoms)
+        assert np.all(np.isfinite(gradient0))
+
+        atoms.positions[1] += [0.03, 0.02, 0.01]
+        atoms.positions[2] += [-0.01, 0.04, -0.02]
+        gradient = rotation.calc_gradient(atoms)
+        fresh = Rotation(indices, 0, refpos).calc_gradient(atoms)
+
+        np.testing.assert_allclose(gradient, fresh, atol=1e-12, rtol=1e-12)
 
     def test_tric_scale_parameter(self):
         """Test that scale parameter affects bond detection."""
@@ -709,6 +781,35 @@ class TestFindAllBondsIdempotent:
                 dummies=dummies,
                 dinds=np.array([-1, 0, -1], dtype=np.int32),
             )
+
+    def test_dummy_constraint_dedup_keeps_metadata_aligned(self):
+        atoms = self._linear_co2()
+        dummies = Atoms('X', positions=[[2.0, 3.0, 0.0]])
+        dinds = np.array([-1, 3, -1], dtype=np.int32)
+        cons = Constraints(atoms, dummies=dummies, dinds=dinds)
+        cons.fix_translation((1,), dim=0, target=1.0)
+        cons.fix_translation((1, 3), dim=0, target=1.0)
+
+        cons.add_dummy_to_internals(1)
+
+        assert len(cons.internals['translations']) == 1
+        assert len(cons._active['translations']) == 1
+        assert cons._targets['translations'] == [1.0]
+        assert cons._kind['translations'] == ['eq']
+
+    def test_dummy_constraint_dedup_rejects_conflicting_targets(self):
+        atoms = self._linear_co2()
+        dummies = Atoms('X', positions=[[2.0, 3.0, 0.0]])
+        dinds = np.array([-1, 3, -1], dtype=np.int32)
+        cons = Constraints(atoms, dummies=dummies, dinds=dinds)
+        cons.fix_translation((1,), dim=0, target=1.0)
+        cons.fix_translation((1, 3), dim=0, target=2.0)
+
+        with pytest.raises(
+            internal_module.DuplicateConstraintError,
+            match='conflicting constraints',
+        ):
+            cons.add_dummy_to_internals(1)
 
 
 class TestPeriodicConstraintUnwrap:

@@ -12,6 +12,7 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from ase.constraints import FixAtoms, FixBondLength
 
 from sella import Sella
+from sella.optimize.restricted_step import MaxInternalStep
 from sella.peswrapper import (
     InternalPES, CellInternalPES, CellCartesianPES, _logm_3x3
 )
@@ -2100,6 +2101,28 @@ class TestRigidFragmentsSurvivesRebuild:
         self._force_bad_internals_rebuild(opt)
         assert opt.pes.rigid_fragments == detected
 
+    def test_explicit_constraints_survive_rebuild(self):
+        atoms = make_water_crystal()
+        atoms.calc = LennardJones()
+        constraints = Constraints(atoms)
+        constraints.fix_bond((0, 1))
+        target = constraints.targets.copy()
+
+        opt = Sella(
+            atoms,
+            order=0,
+            internal=True,
+            optimize_cell=True,
+            allow_fragments=True,
+            constraints=constraints,
+            exact_geodesic=False,
+            logfile=None,
+        )
+        self._force_bad_internals_rebuild(opt)
+
+        assert opt.pes.cons.nbonds == 1
+        assert_allclose(opt.pes.cons.targets, target, atol=0.0, rtol=0.0)
+
 
 class TestDummyAtomCellHandling:
     """Cell steps must carry linear-angle dummy atoms along with real atoms.
@@ -2204,38 +2227,152 @@ class TestDummyAtomCellHandling:
         # The whole point: dummies restored exactly, not left displaced.
         assert_allclose(pes.dummies.positions, dpos0, atol=1e-12)
 
-    def test_linear_dummy_projection_avoids_full_basis(self, monkeypatch):
+    def test_linear_dummy_constraints_remain_in_optimizer_basis(self):
         pes = Sella(self._two_linear_co2(), order=0, internal=True,
                     optimize_cell=True, allow_fragments=True,
                     rigid_fragments=True, logfile=None).pes
         assert len(pes.dummies) >= 1
         assert pes.cons.nint > 0
-        drdx, Ucons, _, _ = pes._compute_basis_int()
-        assert drdx.shape[0] == 0
-        assert Ucons.shape[1] == 0
+        drdx, Ucons, Unred, Ufree_fast = pes._compute_basis_int()
+        assert drdx.shape[0] == 2 * len(pes.dummies)
+        assert Ucons.shape[1] == 2 * len(pes.dummies)
+        assert Ufree_fast is Unred
 
+        pes.get_g()
+        step = pes.get_Ucons().T @ pes.get_Ufree()
+        assert_allclose(step, 0.0, atol=1e-12)
+
+    def test_linear_dummy_cone_repairs_large_displacement(self):
+        pes = Sella(self._two_linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True,
+                    rigid_fragments=True, logfile=None).pes
         apos0 = pes.atoms.positions.copy()
-        pes.dummies.positions += np.array([1e-3, -2e-3, 1.5e-3])
+        pes.dummies.positions += np.array([0.15, -0.105, 0.045])
         assert np.linalg.norm(pes.cons.residual(), ord=np.inf) > 1e-7
-
-        def fail_basis(*args, **kwargs):
-            raise AssertionError("linear dummy projection used full basis")
-
-        monkeypatch.setattr(pes, "_compute_basis_int", fail_basis)
         assert pes._project_to_constraints()
 
         assert_allclose(pes.atoms.positions, apos0, atol=1e-12)
         assert np.linalg.norm(pes.cons.residual(), ord=np.inf) < 1e-7
 
-    def test_linear_dummy_residual_is_auxiliary_for_convergence(self):
+    def test_linear_dummy_residual_remains_visible_to_convergence(self):
         pes = Sella(self._two_linear_co2(), order=0, internal=True,
                     optimize_cell=True, allow_fragments=True,
                     rigid_fragments=True, logfile=None).pes
         assert pes._linear_bend_dummy_projection_records() is not None
 
-        pes.dummies.positions += np.array([1e-3, -2e-3, 1.5e-3])
-        assert np.linalg.norm(pes.get_res()) > 1e-5
-        assert_allclose(np.linalg.norm(pes.get_convergence_res()), 0.0)
+        pes.dummies.positions += np.array([0.15, -0.105, 0.045])
+        assert np.linalg.norm(pes.get_res(), ord=np.inf) > 0.1
+        assert_allclose(pes.get_convergence_res(), pes.get_res())
+
+        converged, _, cmax_actual, _ = pes.converged(
+            1e100, smax=1e100, cmax=1e-5
+        )
+        assert not converged
+        assert cmax_actual > 0.1
+
+    def test_linear_dummy_auxiliaries_are_constrained_out_of_optimizer_step(self):
+        atoms = self._linear_co2(cell_diag=10.0)
+        atoms.calc = SinglePointCalculator(
+            atoms,
+            energy=0.0,
+            forces=np.array([
+                [0.00, 0.25, 0.08],
+                [0.03, -0.04, 0.02],
+                [-0.05, 0.10, -0.07],
+            ]),
+            stress=np.zeros(6),
+        )
+        opt = Sella(
+            atoms,
+            order=0,
+            internal=True,
+            optimize_cell=True,
+            allow_fragments=True,
+            rigid_fragments=True,
+            exact_geodesic=False,
+            logfile=None,
+        )
+        pes = opt.pes
+        records = pes._linear_bend_dummy_projection_records()
+        assert records is not None
+
+        # The cone bond and angle remain available to the geometry integrator,
+        # but the optimizer step is projected onto their null space. Before
+        # the fix, these asymmetric forces requested motion in both directions.
+        auxiliaries = [
+            (name, coord)
+            for record in records
+            for name, coord in (('bonds', record[2]),
+                                ('angles', record[4]))
+        ]
+        for name, auxiliary in auxiliaries:
+            matches = [
+                active
+                for coord, active in zip(pes.int.internals[name],
+                                         pes.int._active[name])
+                if coord == auxiliary
+            ]
+            assert matches
+            assert all(matches)
+
+        step, _ = opt._predict_step()
+        auxiliary_rows = pes._linear_dummy_auxiliary_optimizer_rows()
+        assert len(auxiliary_rows) == 2
+        assert_allclose(step[list(auxiliary_rows)], 0.0, atol=1e-12)
+
+        x0 = pes.get_x().copy()
+        _, dx_final, _ = pes.set_x(x0 + step)
+        actual = pes.wrap_dx(pes.get_x() - x0)
+        assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
+        assert_allclose(actual[list(auxiliary_rows)], 0.0, atol=1e-10)
+        assert_allclose(dx_final[list(auxiliary_rows)],
+                        actual[list(auxiliary_rows)], atol=2e-7)
+
+    @pytest.mark.parametrize('order', [0, 1])
+    @pytest.mark.filterwarnings(
+        'ignore:Saddle point optimizations with eig=False'
+    )
+    def test_fast_linear_dummy_step_matches_dense_constrained_step(self,
+                                                                   order):
+        def make_optimizer():
+            atoms = self._linear_co2(cell_diag=10.0)
+            atoms.calc = SinglePointCalculator(
+                atoms,
+                energy=0.0,
+                forces=np.array([
+                    [0.00, 0.25, 0.08],
+                    [0.03, -0.04, 0.02],
+                    [-0.05, 0.10, -0.07],
+                ]),
+                stress=np.zeros(6),
+            )
+            return Sella(
+                atoms,
+                order=order,
+                eig=False,
+                internal=True,
+                optimize_cell=(order == 0),
+                allow_fragments=True,
+                exact_geodesic=False,
+                logfile=None,
+                **({'rigid_fragments': True} if order == 0 else {}),
+            )
+
+        fast = make_optimizer()
+        dense = make_optimizer()
+        rng = np.random.default_rng(7)
+        A = rng.normal(size=(fast.pes.dim, fast.pes.dim))
+        H = A.T @ A / fast.pes.dim + np.diag(
+            np.linspace(0.2, 2.0, fast.pes.dim)
+        )
+        fast.pes.set_H(H, initialized=True)
+        dense.pes.set_H(H, initialized=True)
+
+        dense.pes._linear_bend_dummy_projection_records = lambda: None
+        fast_step, _ = fast._predict_step()
+        dense_step, _ = dense._predict_step()
+
+        assert_allclose(fast_step, dense_step, atol=1e-12, rtol=1e-12)
 
     def test_linear_dummy_projection_filters_projection_only_dummy_rows(self):
         pes = Sella(self._two_linear_co2(), order=0, internal=True,
@@ -2247,7 +2384,7 @@ class TestDummyAtomCellHandling:
         x0 = pes.get_x().copy()
         pes.get_g()
         dummy_rows = pes._dummy_containing_coord_rows()
-        aux_rows = pes._dummy_auxiliary_projection_filter_rows()
+        aux_rows = pes._dummy_projection_gauge_filter_rows()
         dih0 = pes._dummy_dihedral_values()
 
         dx_initial, dx_final, _ = pes.set_x(x0)
@@ -2272,6 +2409,12 @@ class TestDummyAtomCellHandling:
         internals.add_dihedral(extra_dihedral)
         pes = InternalPES(atoms, internals, auto_find_internals=False)
         pes.get_g()
+        _, _, Unred, Ufree = pes._compute_basis_int()
+        assert Ufree is Unred
+        assert pes._fast_dummy_redundant_projection() is not None
+        assert_allclose(
+            pes.get_Ucons().T @ pes.get_Ufree(), 0.0, atol=1e-12
+        )
 
         extra_row = None
         row = 0
@@ -2284,7 +2427,7 @@ class TestDummyAtomCellHandling:
                         extra_row = row
                     row += 1
         assert extra_row is not None
-        aux_rows = pes._dummy_auxiliary_projection_filter_rows()
+        aux_rows = pes._dummy_projection_gauge_filter_rows()
         assert extra_row not in aux_rows
 
         pes.dummies.positions += np.array([[8e-4, -1.7e-3, 1.1e-3]])
@@ -2302,6 +2445,94 @@ class TestDummyAtomCellHandling:
         assert_allclose(dx_final[list(aux_rows)], 0.0, atol=1e-12)
         assert_allclose(dx_final[extra_row], actual_delta, atol=1e-10)
 
+    def test_redundant_full_rank_dummy_step_matches_dense_basis(self):
+        def make_pes():
+            atoms = self._linear_co2(cell_diag=10.0)
+            base = Sella(
+                atoms,
+                order=0,
+                internal=True,
+                allow_fragments=True,
+                logfile=None,
+            ).pes
+            internals = base.int.copy()
+            internals.add_bond((0, 2))
+            return InternalPES(
+                atoms,
+                internals,
+                auto_find_internals=False,
+            )
+
+        fast = make_pes()
+        dense = make_pes()
+        dense._linear_bend_dummy_projection_records = lambda: None
+
+        Q, R = fast._get_jacobian_qr()
+        assert Q.shape[0] > Q.shape[1]
+        assert R.shape[0] == R.shape[1]
+        assert fast._linear_bend_dummy_projection_records() is not None
+
+        rng = np.random.default_rng(21)
+        A = rng.normal(size=(fast.dim, fast.dim))
+        H = A.T @ A / fast.dim + np.diag(
+            np.linspace(0.2, 2.0, fast.dim)
+        )
+        fast.set_H(H, initialized=True)
+        dense.set_H(H, initialized=True)
+        fast.get_g()
+        dense.get_g()
+
+        assert fast.curr['Ufree'] is fast.curr['Unred']
+        assert fast._fast_dummy_redundant_projection() is not None
+        fast_step, _ = MaxInternalStep(fast, 0, 0.1).get_s()
+        dense_step, _ = MaxInternalStep(dense, 0, 0.1).get_s()
+
+        assert_allclose(fast_step, dense_step, atol=1e-12, rtol=1e-12)
+        assert_allclose(fast.get_drdx() @ fast_step, 0.0, atol=1e-12)
+
+    def test_small_linear_bend_moves_geometry_without_projection(self):
+        pes = Sella(
+            self._mostly_linear_hoh(),
+            order=0,
+            internal=True,
+            allow_fragments=True,
+            exact_geodesic=False,
+            logfile=None,
+        ).pes
+        pes.get_g()
+        fixed_rows = set(pes._linear_dummy_auxiliary_optimizer_rows())
+        natoms = pes.int.natoms
+        free_angle = None
+        row = 0
+        for name in pes.int._names:
+            for coord, active in zip(pes.int.internals[name],
+                                     pes.int._active[name]):
+                if not active:
+                    continue
+                if (name == 'angles' and row not in fixed_rows
+                        and np.any(np.asarray(coord.indices) >= natoms)):
+                    free_angle = row
+                row += 1
+        assert free_angle is not None
+
+        x0 = pes.get_x().copy()
+        apos0 = pes.atoms.positions.copy()
+        dpos0 = pes.dummies.positions.copy()
+        target = x0.copy()
+        target[free_angle] += 1e-3
+
+        pes._set_x_ode(target)
+
+        assert np.linalg.norm(pes.atoms.positions - apos0) > 1e-4
+        assert np.linalg.norm(pes.dummies.positions - dpos0) > 1e-4
+        assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
+        assert not pes._project_to_constraints()
+        assert_allclose(
+            pes.wrap_dx(pes.get_x() - x0)[free_angle],
+            1e-3,
+            atol=1e-9,
+        )
+
     def test_near_linear_hoh_bend_rows_are_accounted(self):
         def make_pes():
             return Sella(
@@ -2316,7 +2547,7 @@ class TestDummyAtomCellHandling:
 
         def dummy_rows(pes):
             natoms = pes.int.natoms
-            aux_rows = set(pes._dummy_auxiliary_projection_filter_rows())
+            aux_rows = set(pes._linear_dummy_auxiliary_optimizer_rows())
             rows = []
             row = 0
             for name in pes.int._names:
@@ -2338,7 +2569,7 @@ class TestDummyAtomCellHandling:
             row for row, name, has_dummy, is_aux in rows
             if name == 'dihedrals' and has_dummy and not is_aux
         ]
-        aux_rows = list(pes._dummy_auxiliary_projection_filter_rows())
+        aux_rows = list(pes._dummy_projection_gauge_filter_rows())
         assert len(free_angles) == 1
         assert len(free_dihedrals) == 1
         assert len(aux_rows) > 0
@@ -2366,6 +2597,13 @@ class TestDummyAtomCellHandling:
             assert_allclose(dx_initial[row], 1e-3, atol=1e-12)
             assert_allclose(dx_final[row], 1e-3, atol=1e-8)
             assert_allclose(dx_final[list(aux_rows)], 0.0, atol=1e-10)
+            other = (free_dihedrals[0]
+                     if row == free_angles[0] else free_angles[0])
+            assert_allclose(
+                pes.wrap_dx(pes.get_x() - x0)[other],
+                0.0,
+                atol=1e-8,
+            )
 
     def test_linear_dummy_projection_preserves_requested_dummy_rows(self):
         pes = Sella(self._two_linear_co2(), order=0, internal=True,
@@ -2384,6 +2622,29 @@ class TestDummyAtomCellHandling:
 
         assert_allclose(dx_final[list(dummy_rows)],
                         requested[list(dummy_rows)], atol=1e-12)
+
+    @pytest.mark.parametrize("auxiliary_index", [0, 1])
+    def test_linear_dummy_projection_reports_undone_auxiliary_request(
+        self, auxiliary_index
+    ):
+        pes = Sella(self._linear_co2(), order=0, internal=True,
+                    optimize_cell=True, allow_fragments=True,
+                    rigid_fragments=True, logfile=None).pes
+        pes.get_g()
+        auxiliary_rows = pes._linear_dummy_auxiliary_optimizer_rows()
+        assert len(auxiliary_rows) == 2
+        row = auxiliary_rows[auxiliary_index]
+
+        x0 = pes.get_x().copy()
+        target = x0.copy()
+        target[row] += 1e-3
+        dx_initial, dx_final, _ = pes.set_x(target)
+        actual = pes.wrap_dx(pes.get_x() - x0)
+
+        assert_allclose(dx_initial[row], 1e-3, atol=1e-12)
+        assert_allclose(actual[row], 0.0, atol=1e-12)
+        assert_allclose(dx_final[row], actual[row], atol=1e-9)
+        assert np.linalg.norm(pes.get_res(), ord=np.inf) < 1e-7
 
 
 class TestRestrictedAtomicStepCellDOF:
@@ -2483,6 +2744,44 @@ class TestCartesianCellTrustRadiusAdapts:
             seen.add(round(opt.delta_cell, 6))
         # delta_cell must have changed from its frozen initial value.
         assert len(seen) > 1, f"delta_cell never adapted (stuck at {delta_cell0})"
+
+
+class TestIndependentCellTrustRadii:
+    @staticmethod
+    def _optimizer():
+        atoms = make_water_crystal()
+        atoms.calc = LennardJones()
+        return Sella(
+            atoms,
+            order=0,
+            internal=True,
+            optimize_cell=True,
+            allow_fragments=True,
+            exact_geodesic=False,
+            logfile=None,
+        )
+
+    def test_rejected_cell_only_step_preserves_internal_radius(self):
+        opt = self._optimizer()
+        delta0 = opt.delta
+        delta_cell0 = opt.delta_cell
+        step = np.zeros(opt.pes.dim)
+        step[opt.pes.n_coords:] = 0.02
+
+        opt._update_trust_radius(1e-3, step, 0.02)
+
+        assert opt.delta == delta0
+        assert opt.delta_cell == delta_cell0 * opt.sigma_dec
+
+    def test_rejected_mixed_step_still_shrinks_internal_radius(self):
+        opt = self._optimizer()
+        step = np.zeros(opt.pes.dim)
+        step[0] = 0.02
+        step[opt.pes.n_coords:] = 0.01
+
+        opt._update_trust_radius(1e-3, step, 0.02)
+
+        assert opt.delta == 0.02 * opt.sigma_dec
 
 
 if __name__ == '__main__':

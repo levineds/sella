@@ -124,6 +124,44 @@ def _split_cons_subspace(drdxnred, tol_factor=1e-6):
     return Q[:, :ncons], Q[:, ncons:]
 
 
+def _constraint_normal_subspace(drdxnred):
+    """Economy-size orthonormal basis for independent constraint normals."""
+    Q, R, _ = qr(
+        drdxnred.T, mode='economic', pivoting=True, check_finite=False
+    )
+    ncons = drdxnred.shape[0]
+    if (Q.shape[1] != ncons
+            or not np.all(np.isfinite(R))
+            or np.any(np.diag(R) == 0.0)):
+        return None
+    return Q
+
+
+class _LowRankTangentProjectionTranspose:
+    def __init__(self, projection):
+        self.projection = projection
+        self.shape = (projection.shape[1], projection.shape[0])
+
+    def __matmul__(self, values):
+        return self.projection.basis @ self.projection.project(values)
+
+
+class _LowRankTangentProjection:
+    """Matrix-like ``T @ U.T`` without materializing the tangent projector."""
+    def __init__(self, basis, normals):
+        self.basis = basis
+        self.normals = normals
+        self.shape = (basis.shape[1], basis.shape[0])
+        self.T = _LowRankTangentProjectionTranspose(self)
+
+    def project(self, values):
+        values = np.asarray(values)
+        return values - self.normals @ (self.normals.T @ values)
+
+    def __matmul__(self, values):
+        return self.project(self.basis.T @ values)
+
+
 def _svd_rank(s, rtol=1e-6):
     """Numerical rank from a singular-value spectrum, relative to the largest.
 
@@ -546,6 +584,9 @@ class PES:
         n = U.shape[1]
         return ApproximateHessian(n, 0, Bproj, self.H.update_method, self.H.symm)
 
+    def get_fast_restricted_step_data(self, g, order, stepper, W_is_identity):
+        return None
+
     # Getters for constraints and their derivatives
     def get_res(self):
         return self.cons.residual()
@@ -643,6 +684,8 @@ class PES:
         if basis is None:
             basis = self._calc_basis()
         drdx, Ucons, Unred, Ufree = basis
+        self.curr.pop('Ufree_materialized', None)
+        self.curr.pop('fast_dummy_redundant_projection', None)
         self.curr['drdx'] = drdx
         self.curr['Ucons'] = Ucons
         self.curr['Unred'] = Unred
@@ -1280,8 +1323,9 @@ class InternalPES(PES):
         the pseudoinverse), so real atoms only move when the
         constraint *requires* it (e.g. ``FixBondLengths``).
 
-        ``safety_limit`` caps ``|dx_cart|_inf`` per iteration. If the
-        Newton step would exceed it, we bail and accept the partial
+        For the general constraint path, ``safety_limit`` caps
+        ``|dx_cart|_inf`` per iteration. If the Newton step would exceed it,
+        we bail and accept the partial
         residual — the alternative (damped re-iteration) was tested
         and found to *increase* opt step counts (~+30%) on the tier1+2
         benchmarks because the partial corrections accumulate as
@@ -1299,7 +1343,6 @@ class InternalPES(PES):
         self._last_linear_dummy_projection_mode = None
         moved = self._project_linear_bend_dummies(
             target_tol=target_tol,
-            safety_limit=safety_limit,
         )
         if moved is not None:
             return moved
@@ -1308,33 +1351,29 @@ class InternalPES(PES):
         n_dummy = 3 * len(self.dummies)
         moved = False
 
-        self._force_linear_dummy_constraint_basis = True
-        try:
-            for _ in range(max_iter):
-                r = self.cons.residual()
-                if np.linalg.norm(r, ord=np.inf) < target_tol:
-                    return moved
+        for _ in range(max_iter):
+            r = self.cons.residual()
+            if np.linalg.norm(r, ord=np.inf) < target_tol:
+                return moved
 
-                # _compute_basis_int returns (drdx, Ucons, Unred, Ufree) for the
-                # internal-only block (no cell DOF). drdx is ncons × n_int in
-                # IC space; Ucons is n_int × ncons'.
-                drdx, Ucons, _, _ = self._compute_basis_int()
-                if Ucons.shape[1] == 0:
-                    return moved  # no constraint subspace — nothing to project
+            # _compute_basis_int returns (drdx, Ucons, Unred, Ufree) for the
+            # internal-only block (no cell DOF). drdx is ncons × n_int in
+            # IC space; Ucons is n_int × ncons'.
+            drdx, Ucons, _, _ = self._compute_basis_int()
+            if Ucons.shape[1] == 0:
+                return moved  # no constraint subspace — nothing to project
 
-                s, *_ = np.linalg.lstsq(drdx @ Ucons, -r, rcond=_LSTSQ_RCOND)
-                dq_int = Ucons @ s                       # IC-space step (n_int,)
-                dx = self._get_Binv() @ dq_int            # Cartesian (n_cart,)
+            s, *_ = np.linalg.lstsq(drdx @ Ucons, -r, rcond=_LSTSQ_RCOND)
+            dq_int = Ucons @ s                       # IC-space step (n_int,)
+            dx = self._get_Binv() @ dq_int            # Cartesian (n_cart,)
 
-                if np.linalg.norm(dx, ord=np.inf) > safety_limit:
-                    return moved  # would override optimizer's step — bail
+            if np.linalg.norm(dx, ord=np.inf) > safety_limit:
+                return moved  # would override optimizer's step — bail
 
-                self.atoms.positions += dx[:n_real].reshape(-1, 3)
-                if n_dummy > 0:
-                    self.dummies.positions += dx[n_real:n_real + n_dummy].reshape(-1, 3)
-                moved = True
-        finally:
-            self._force_linear_dummy_constraint_basis = False
+            self.atoms.positions += dx[:n_real].reshape(-1, 3)
+            if n_dummy > 0:
+                self.dummies.positions += dx[n_real:n_real + n_dummy].reshape(-1, 3)
+            moved = True
 
         return moved
 
@@ -1362,16 +1401,8 @@ class InternalPES(PES):
                 row += 1
         return tuple(sorted(set(rows)))
 
-    def _dummy_auxiliary_projection_filter_rows(self):
+    def _dummy_projection_gauge_filter_rows(self):
         natoms = self.int.natoms
-        records = self._linear_bend_dummy_projection_records()
-        aux_coords = ()
-        if records is not None:
-            aux_coords = tuple(
-                coord
-                for (_, _, bond_coord, _, angle_coord, _, _) in records
-                for coord in (bond_coord, angle_coord)
-            )
         rows = []
         row = 0
         for name in self.int._names:
@@ -1382,11 +1413,33 @@ class InternalPES(PES):
                 if (name in ('translations', 'rotations')
                         and np.any(np.asarray(coord.indices) >= natoms)):
                     rows.append(row)
-                elif (name in ('bonds', 'angles')
-                      and any(coord == aux_coord for aux_coord in aux_coords)):
-                    rows.append(row)
                 row += 1
         return tuple(sorted(set(rows)))
+
+    def _linear_dummy_auxiliary_optimizer_rows(self):
+        records = self._linear_bend_dummy_projection_records()
+        if records is None:
+            return ()
+        auxiliaries = {
+            name: tuple(
+                record[index]
+                for record in records
+            )
+            for name, index in (('bonds', 2), ('angles', 4))
+        }
+        rows = []
+        row = 0
+        for name in self.int._names:
+            for coord, active in zip(self.int.internals[name],
+                                     self.int._active[name]):
+                if not active:
+                    continue
+                if (name in auxiliaries
+                        and any(coord == auxiliary
+                                for auxiliary in auxiliaries[name])):
+                    rows.append(row)
+                row += 1
+        return tuple(rows)
 
     @staticmethod
     def _wrapped_angle_delta(after, before):
@@ -1395,10 +1448,9 @@ class InternalPES(PES):
     @staticmethod
     def _project_one_linear_dummy_on_cone(positions, cell, dummy, parent,
                                           length, angle_coord, theta,
-                                          dummy_is_first, safety_limit):
+                                          dummy_is_first):
         ids = np.asarray(angle_coord.indices, dtype=int)
         tvecs = angle_coord.kwargs['ncvecs'] @ cell
-        old_pos = positions[dummy].copy()
 
         if dummy_is_first:
             neighbor_vec = positions[ids[2]] - positions[parent] + tvecs[1]
@@ -1426,11 +1478,6 @@ class InternalPES(PES):
             np.cos(theta) * axis + np.sin(theta) * azimuth
         )
         positions[dummy] = positions[parent] + dummy_shift + new_vec
-
-        if np.linalg.norm(positions[dummy] - old_pos,
-                          ord=np.inf) > safety_limit:
-            positions[dummy] = old_pos
-            return False
         return True
 
     def _linear_bend_dummy_projection_records(self):
@@ -1510,21 +1557,12 @@ class InternalPES(PES):
                     return False
         return True
 
-    def get_convergence_res(self):
-        res = self.get_res()
-        if res.size == 0:
-            return res
-        if self._linear_bend_dummy_projection_records() is None:
-            return res
-        return res[:0]
-
     @staticmethod
     def _split_real_dummy_ids(indices, natoms):
         ids = np.asarray(indices, dtype=int)
         return ids, ids[ids < natoms], ids[ids >= natoms]
 
-    def _project_linear_bend_dummies(self, target_tol=1e-7,
-                                     safety_limit=0.05):
+    def _project_linear_bend_dummies(self, target_tol=1e-7):
         """Project linear-bend dummy constraints without a full IC basis.
 
         A linear-bend dummy contributes exactly two active constraints: the
@@ -1552,7 +1590,7 @@ class InternalPES(PES):
 
             if not self._project_one_linear_dummy_on_cone(
                 all_positions, cell, dummy, parent, length, angle_coord,
-                theta, dummy_is_first, safety_limit,
+                theta, dummy_is_first,
             ):
                 self.dummies.positions[:] = old_dpos
                 return None
@@ -1576,7 +1614,7 @@ class InternalPES(PES):
             self._last_linear_dummy_projection_ddih = 0.0
         self._last_linear_dummy_projection_mode = 'cone'
         self._last_projection_filter_rows = (
-            self._dummy_auxiliary_projection_filter_rows()
+            self._dummy_projection_gauge_filter_rows()
         )
         return True
 
@@ -1634,6 +1672,107 @@ class InternalPES(PES):
         # dr/dq = dr/dx dx/dq
         return PES.get_drdx(self) @ self._get_Binv()
 
+    def _fast_dummy_selection_indices(self):
+        if self.curr.get('Ufree') is not self.curr.get('Unred'):
+            return None
+        Unred = self.curr.get('Unred')
+        if Unred is None or Unred.shape[0] != Unred.shape[1]:
+            return None
+        Ucons = self.curr.get('Ucons')
+        if Ucons is None or Ucons.shape[1] == 0:
+            return None
+        auxiliary = np.flatnonzero(np.any(Ucons != 0.0, axis=1))
+        mask = np.ones(self.dim, dtype=bool)
+        mask[auxiliary] = False
+        return np.flatnonzero(mask)
+
+    def _fast_dummy_redundant_projection(self):
+        cached = self.curr.get('fast_dummy_redundant_projection')
+        if cached is not None:
+            return cached
+        if self.curr.get('Ufree') is not self.curr.get('Unred'):
+            return None
+        Unred = self.curr.get('Unred')
+        Ucons = self.curr.get('Ucons')
+        if (Unred is None or Unred.shape[0] == Unred.shape[1]
+                or Ucons is None or Ucons.shape[1] == 0):
+            return None
+        normals = Unred.T @ Ucons
+        projection = _LowRankTangentProjection(Unred, normals)
+        self.curr['fast_dummy_redundant_projection'] = projection
+        return projection
+
+    def get_Ufree(self):
+        self._update(False)
+        indices = self._fast_dummy_selection_indices()
+        projection = self._fast_dummy_redundant_projection()
+        if indices is None and projection is None:
+            return self.curr['Ufree']
+        cached = self.curr.get('Ufree_materialized')
+        if cached is None:
+            if indices is not None:
+                cached = np.eye(self.dim)[:, indices]
+            else:
+                drdxnred = self.curr['drdx'] @ self.curr['Unred']
+                _, Vfree = _split_cons_subspace(drdxnred)
+                cached = self.curr['Unred'] @ Vfree
+            self.curr['Ufree_materialized'] = cached
+        return cached
+
+    def _project_free_vector(self, vector):
+        self._update(False)
+        indices = self._fast_dummy_selection_indices()
+        projection = self._fast_dummy_redundant_projection()
+        if indices is None and projection is None:
+            Ufree = self.curr['Ufree']
+            return Ufree @ (Ufree.T @ vector)
+        if projection is not None:
+            return projection.T @ (projection @ vector)
+        projected = np.zeros_like(vector)
+        projected[indices] = np.asarray(vector)[indices]
+        return projected
+
+    def get_fast_restricted_step_data(self, g, order, stepper, W_is_identity):
+        self._update(False)
+        indices = self._fast_dummy_selection_indices()
+        projection = self._fast_dummy_redundant_projection()
+        if (not W_is_identity
+                or getattr(stepper, '__name__', '') != 'QuasiNewton'):
+            return None
+
+        if indices is not None:
+            if not getattr(self.H, '_cpu_current', True):
+                return None
+            # Each certified constraint is literally q_aux - target, so its
+            # Hessian with respect to q is zero. Computing get_Hc() would only
+            # form and cancel Cartesian chain-rule terms.
+            H = self.H.asarray()[np.ix_(indices, indices)].copy()
+            P = indices
+            g_step = np.asarray(g)[indices]
+        elif projection is not None and order == 0:
+            Unred = projection.basis
+            H_gpu = self.H._get_B_gpu()
+            H_B = self.H.B if getattr(self.H, '_cpu_current', True) else None
+            if H_B is None and H_gpu is None:
+                Hred = np.eye(Unred.shape[1])
+            else:
+                Hred = gpu_project(H_B, Unred, H_gpu=H_gpu)
+            C = projection.normals
+            HC = Hred @ C
+            CtHC = C.T @ HC
+            H = (Hred - HC @ C.T - C @ HC.T
+                 + C @ CtHC @ C.T + C @ C.T)
+            H = (H + H.T) / 2.0
+            P = projection
+            g_step = projection @ g
+        else:
+            return None
+
+        H_step = ApproximateHessian(
+            H.shape[0], 0, H, self.H.update_method, self.H.symm
+        )
+        return P, g_step, H_step
+
     def _compute_basis_int(self):
         """Compute the internal-coords-only basis (uncached, fast path).
 
@@ -1643,15 +1782,6 @@ class InternalPES(PES):
         """
         Q, R = self._get_jacobian_qr()
         n_int = Q.shape[0]
-        if (self._linear_bend_dummy_projection_records() is not None
-                and not getattr(self, '_force_linear_dummy_constraint_basis',
-                                False)):
-            # Linear-bend dummy constraints are auxiliary: they only keep each
-            # dummy on its parent bond/angle cone and are enforced exactly after
-            # every step by _project_linear_bend_dummies(). Keeping them in the
-            # optimizer basis would build a dense constrained Ufree for no
-            # physical constraint on the real atoms.
-            return np.zeros((0, n_int)), np.zeros((n_int, 0)), Q, Q
         cons_jac = self.cons.jacobian()
         if cons_jac.shape[0] == 0:
             # No constraints: every non-redundant DOF is free.
@@ -1665,6 +1795,27 @@ class InternalPES(PES):
             # Rank-deficient (SVD-of-R fallback in _get_jacobian_qr).
             drdxnred = cons_jac @ (self._get_Binv() @ Q)
         drdx = drdxnred @ Q.T
+        records = self._linear_bend_dummy_projection_records()
+        if (Q.shape[0] == Q.shape[1]
+                and R.shape[0] == R.shape[1]
+                and records is not None):
+            auxiliary = self._linear_dummy_auxiliary_optimizer_rows()
+            # The records check proves that every active constraint is the
+            # corresponding bond or angle in ``self.int``.  With a square,
+            # full-rank internal Jacobian those coordinates are independent,
+            # so their exact tangent complement is obtained by simply omitting
+            # their coordinate axes.  No geometry-dependent cutoff is needed.
+            if (len(auxiliary) == drdx.shape[0]
+                    and len(set(auxiliary)) == len(auxiliary)
+                    and all(0 <= row < n_int for row in auxiliary)):
+                identity = np.eye(n_int)
+                Ucons = identity[:, np.asarray(auxiliary, dtype=int)]
+                return drdx, Ucons, identity, identity
+        elif records is not None:
+            Vcons = _constraint_normal_subspace(drdxnred)
+            if Vcons is not None:
+                Ucons = Q @ Vcons
+                return drdx, Ucons, Q, Q
         Vcons, Vfree = _split_cons_subspace(drdxnred)
         return drdx, Q @ Vcons, Q, Q @ Vfree
 
@@ -1698,13 +1849,13 @@ class InternalPES(PES):
     def get_projected_forces(self):
         """Returns Nx3 array of atomic forces orthogonal to constraints."""
         g = self.get_g()
-        Ufree = self.get_Ufree()
+        g_projected = self._project_free_vector(g)
         # Use cached jacobian from curr if available
         if 'B' in self.curr and self.curr['B'] is not None:
             B = self.curr['B']
         else:
             B = self.int.jacobian()
-        return -(Ufree @ (Ufree.T @ g) @ B).reshape((-1, 3))
+        return -(g_projected @ B).reshape((-1, 3))
 
     def wrap_dx(self, dx):
         return self.int.wrap(dx)
@@ -3029,8 +3180,9 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         # (U @ U.T) @ g which materializes a (n_int, n_int) intermediate.
         g = self.get_g()
         g_internal = g[:self.n_internal]
-        Ufree_int = self.curr['Ufree'][:self.n_internal, :self.curr['Ufree'].shape[1] - self.n_cell_dof]
-        g_proj = Ufree_int @ (Ufree_int.T @ g_internal)
+        g_atomic = np.zeros_like(g)
+        g_atomic[:self.n_internal] = g_internal
+        g_proj = self._project_free_vector(g_atomic)[:self.n_internal]
 
         # Convert to Cartesian for force norm
         B = self.int.jacobian()
@@ -3053,14 +3205,11 @@ class CellInternalPES(_CellPESMixin, InternalPES):
         """Returns Nx3 array of atomic forces orthogonal to constraints."""
         g = self.get_g()
         g_internal = g[:self.n_internal]
-        Ufree = self.get_Ufree()
-        # Drop the trailing cell-DOF columns (as converged() does) so the
-        # projection is over atomic DOF only. These columns are zero in the
-        # internal-coordinate rows, so this does not change the result; it just
-        # keeps the two methods consistent.
-        Ufree_int = Ufree[:self.n_internal, :Ufree.shape[1] - self.n_cell_dof]
+        g_atomic = np.zeros_like(g)
+        g_atomic[:self.n_internal] = g_internal
+        g_projected = self._project_free_vector(g_atomic)[:self.n_internal]
         B = self.int.jacobian()
-        return -(Ufree_int @ (Ufree_int.T @ g_internal) @ B).reshape((-1, 3))
+        return -(g_projected @ B).reshape((-1, 3))
 
     def get_Hc(self):
         """Get constraint Hessian extended for cell DOF.

@@ -1304,28 +1304,35 @@ class Rotation(Coordinate):
             return False
         return True
 
-    def calc(self, atoms: Atoms) -> float:
-        pos = np.asarray(atoms.positions[self.indices], dtype=np.float64)
+    def _stabilized_quaternion(self, pos: np.ndarray) -> np.ndarray:
         dx = pos - pos.mean(0)
         refpos = self.kwargs['refpos']
         F = _build_F_matrix_np(dx, refpos)
         q = _stabilize_quaternion(F, self.q_prev)
         self.q_prev = q
+        return q
+
+    def calc(self, atoms: Atoms) -> float:
+        pos = np.asarray(atoms.positions[self.indices], dtype=np.float64)
+        q = self._stabilized_quaternion(pos)
         axis = self.kwargs['axis']
         return float(2.0 * q[axis + 1] * _asinc_np(q[0]))
 
     def calc_gradient(self, atoms: Atoms) -> np.ndarray:
         pos = np.asarray(atoms.positions[self.indices], dtype=np.float64)
         refpos = self.kwargs['refpos']
-        jac = _rotation_3axis_jacobian_np(pos, refpos, self.q_prev)
+        q = self._stabilized_quaternion(pos)
+        jac = _rotation_3axis_jacobian_np(pos, refpos, q)
         return jac[self.kwargs['axis']]
 
     def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
+        pos = np.asarray(atoms.positions[self.indices], dtype=np.float64)
+        q = self._stabilized_quaternion(pos)
         return _rotation_hessian_np(
-            atoms.positions[self.indices],
+            pos,
             self.kwargs['axis'],
             self.kwargs['refpos'],
-            q_stable=self.q_prev,
+            q_stable=q,
         )
 
 
@@ -3068,19 +3075,44 @@ class BaseInternals:
         assert didx >= 0
         npos = len(self.all_positions)
 
-        def dedupe(coords, active):
+        def dedupe(name, coords, active):
+            targets_by_name = getattr(self, '_targets', None)
+            kinds_by_name = getattr(self, '_kind', None)
+            has_metadata = targets_by_name is not None
+            if has_metadata:
+                targets = targets_by_name[name]
+                kinds = kinds_by_name[name]
+            else:
+                targets = kinds = None
+
             new_coords = []
             new_active = []
+            new_targets = []
+            new_kinds = []
             changed = len(coords) != len(active)
-            for coord, is_active in zip(coords, active):
+            for i, (coord, is_active) in enumerate(zip(coords, active)):
                 try:
                     existing = new_coords.index(coord)
                 except ValueError:
                     new_coords.append(coord)
                     new_active.append(is_active)
+                    if has_metadata:
+                        new_targets.append(targets[i])
+                        new_kinds.append(kinds[i])
                 else:
+                    if has_metadata and (
+                        new_kinds[existing] != kinds[i]
+                        or not np.isclose(new_targets[existing], targets[i])
+                    ):
+                        raise DuplicateConstraintError(
+                            'Dummy expansion produced duplicate coordinates '
+                            'with conflicting constraints.'
+                        )
                     new_active[existing] = new_active[existing] or is_active
                     changed = True
+            if has_metadata:
+                targets_by_name[name] = new_targets
+                kinds_by_name[name] = new_kinds
             return new_coords, new_active, changed
 
         changed = False
@@ -3095,7 +3127,7 @@ class BaseInternals:
             else:
                 translations.append(trans)
         translations, trans_active, trans_deduped = dedupe(
-            translations, self._active['translations']
+            'translations', translations, self._active['translations']
         )
         self.internals['translations'] = translations
         self._active['translations'] = trans_active
@@ -3114,7 +3146,7 @@ class BaseInternals:
                     continue
             rotations.append(rot)
         rotations, rot_active, rot_deduped = dedupe(
-            rotations, self._active['rotations']
+            'rotations', rotations, self._active['rotations']
         )
         self.internals['rotations'] = rotations
         self._active['rotations'] = rot_active
@@ -3628,15 +3660,11 @@ class Internals(BaseInternals):
         TRICs that already exist instead of raising DuplicateInternalError --
         mirroring the duplicate handling on fragment-welding bonds.
         """
-        try:
-            self.add_translation(group)
-        except DuplicateInternalError:
-            pass
+        for dim in range(3):
+            self._ignore_duplicate(self.add_translation, group, dim)
         if with_rotation and len(group) >= 2:
-            try:
-                self.add_rotation(group)
-            except DuplicateInternalError:
-                pass
+            for axis in range(3):
+                self._ignore_duplicate(self.add_rotation, group, axis)
 
     @staticmethod
     def _internal_key(coord: 'Internal') -> tuple:

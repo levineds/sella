@@ -155,6 +155,9 @@ class Sella(Optimizer):
 
         self.peskwargs = kwargs.copy()
         self.user_internal = internal
+        self.user_constraints = (
+            constraints.copy() if constraints is not None else None
+        )
         self.initialize_pes(
             atoms,
             trajectory,
@@ -413,7 +416,13 @@ class Sella(Optimizer):
 
         smag_int, smag_cell = self._cell_trust_components(s, smag)
         if rho < 1. / self.rho_dec or rho > self.rho_dec:
-            self.delta = max(smag_int * self.sigma_dec, self.delta_min)
+            component_tol = (
+                32 * np.finfo(float).eps * max(1.0, abs(float(smag)))
+            )
+            if smag_int > component_tol:
+                self.delta = max(
+                    smag_int * self.sigma_dec, self.delta_min
+                )
             if smag_cell > 0:
                 self.delta_cell = max(
                     self.delta_cell * self.sigma_dec, self.delta_min
@@ -440,12 +449,16 @@ class Sella(Optimizer):
         cell_mask, exp_cell_factor, scalar_pressure = (
             self._bad_internal_cell_kwargs()
         )
+        constraints = (
+            None if self.user_constraints is None
+            else self.user_constraints.copy()
+        )
         self.initialize_pes(
             atoms=self.pes.atoms,
             trajectory=self.pes.traj,
             order=self.ord,
             eta=self.pes.eta,
-            constraints=self.constraints,
+            constraints=constraints,
             v0=None,  # TODO: use leftmost eigenvector from old H
             internal=self.user_internal,
             hessian_function=self.pes.hessian_function,
