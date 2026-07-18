@@ -173,6 +173,74 @@ class TestTRICs:
 
         np.testing.assert_allclose(gradient, fresh, atol=1e-12, rtol=1e-12)
 
+    def test_near_degenerate_rotation_gradient_uses_stabilized_subspace(self):
+        bend = 1e-6
+        refpos = np.array([
+            [-2.0, 0.0, 0.0],
+            [-0.5, bend, 0.0],
+            [0.7, -0.7 * bend, 0.2 * bend],
+            [1.8, 0.0, 0.0],
+        ])
+        theta = 0.2
+        rotation_matrix = np.array([
+            [np.cos(theta), -np.sin(theta), 0.0],
+            [np.sin(theta), np.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        positions = refpos @ rotation_matrix.T
+        positions[1] += bend * np.array([0.01, -0.02, 0.03])
+        atoms = Atoms('H4', positions=positions)
+        rotation = Rotation((0, 1, 2, 3), 0, refpos)
+        rotation.calc(atoms)
+        q0 = rotation.q_prev.copy()
+        analytic = rotation.calc_gradient(atoms)
+
+        delta = 1e-9
+        numeric = np.zeros_like(analytic)
+        for i in range(4):
+            for j in range(3):
+                values = []
+                for sign in (1.0, -1.0):
+                    displaced = atoms.copy()
+                    displaced.positions[i, j] += sign * delta
+                    trial = Rotation((0, 1, 2, 3), 0, refpos)
+                    trial.q_prev = q0.copy()
+                    values.append(trial.calc(displaced))
+                numeric[i, j] = (values[0] - values[1]) / (2 * delta)
+
+        np.testing.assert_allclose(analytic, numeric, atol=1e-6, rtol=1e-5)
+
+    def test_partial_rotation_hvp_refreshes_stabilized_quaternion(self):
+        atoms = Atoms(
+            'OH2',
+            positions=[[0.0, 0.0, 0.0], [0.95, 0.0, 0.0],
+                       [0.0, 0.95, 0.0]],
+        )
+        internals = Internals(atoms)
+        internals.add_rotation((0, 1, 2), axis=0)
+        coord = internals.internals['rotations'][0]
+        coord.calc(internals.light_atoms)
+        old_q = coord.q_prev.copy()
+
+        atoms.positions[:] = np.array([
+            [0.1, -0.2, 0.3],
+            [0.8, 0.5, -0.1],
+            [-0.4, 0.7, 0.2],
+        ])
+        tangent = np.arange(9, dtype=float) / 7.0 - 0.5
+
+        expected_coord = coord.copy()
+        expected_coord.q_prev = old_q
+        hessian = np.asarray(
+            expected_coord.calc_hessian(internals.light_atoms)
+        ).reshape(9, 9)
+        expected = hessian @ tangent
+        actual = internals.hessian_rdot(tangent)
+        if hasattr(actual, 'toarray'):
+            actual = actual.toarray()
+
+        np.testing.assert_allclose(actual[0], expected, atol=1e-11, rtol=1e-11)
+
     def test_tric_scale_parameter(self):
         """Test that scale parameter affects bond detection."""
         atoms = Atoms(

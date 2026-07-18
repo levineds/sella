@@ -117,7 +117,7 @@ class QuasiNewton(BaseStepper):
         denom = self.L + alpha * self.ones
         sproj = self.Vg / denom
         s = -self.V @ sproj
-        dsda = self.V @ (sproj / denom)
+        dsda = self.V @ (self.ones * sproj / denom)
         return s, dsda
 
 
@@ -149,8 +149,9 @@ class RationalFunctionOptimization(BaseStepper):
             [self.H.asarray(), self.g[:, np.newaxis]],
             [self.g, 0]
         ])
+        self._interior_full_step = None
 
-    def get_s(self, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_eigenstep(self, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
         A = self.A * alpha
         A[:-1, :-1] *= alpha
         L, V = _eigh_symmetric(A)
@@ -185,7 +186,7 @@ class RationalFunctionOptimization(BaseStepper):
         L1 = np.delete(L, idx)
 
         # Regularize eigenvalue differences: clamp small values while preserving sign
-        L_diff = L1 - L[idx]
+        L_diff = L[idx] - L1
         L_diff = np.where(L_diff >= 0,
                          np.maximum(L_diff, 1e-12),
                          np.minimum(L_diff, -1e-12))
@@ -197,6 +198,18 @@ class RationalFunctionOptimization(BaseStepper):
                 + (alpha / denom) * dVda[:-1]
                 - (V[:-1, idx] * alpha / denom**2) * dVda[-1])
         return s, dsda
+
+    def get_s(self, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+        # At an interior order the eigenvalue branch selected from the
+        # alpha=0 degenerate augmented matrix need not approach a zero step.
+        # Use the full RFO direction and a continuous linear restriction;
+        # the extremal orders used by minimum RFO and PRFO retain the usual
+        # RFO homotopy below.
+        if 0 < self.order < len(self.g):
+            if self._interior_full_step is None:
+                self._interior_full_step = self._get_eigenstep(1.0)[0]
+            return alpha * self._interior_full_step, self._interior_full_step
+        return self._get_eigenstep(alpha)
 
 
 class PartitionedRationalFunctionOptimization(RationalFunctionOptimization):

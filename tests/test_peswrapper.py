@@ -6,7 +6,7 @@ from ase.build import molecule
 from ase.calculators.emt import EMT
 
 from sella.peswrapper import PES, InternalPES, CellInternalPES, \
-    _range_space_projector
+    _range_space_projector, _rigid_motion_nullspace
 from sella.internal import Internals
 
 @pytest.mark.parametrize("name,traj,cons",
@@ -95,6 +95,30 @@ def test_range_space_projector_exercises_rank_deficient_input():
     assert rank < min(B.shape)
 
 
+@pytest.mark.parametrize("axis", range(3))
+def test_linear_rigid_motion_nullspace_spans_true_modes(axis):
+    """A zero axial rotation must not displace a later transverse mode."""
+    positions = np.zeros((3, 3))
+    positions[:, axis] = [-1.0, 0.0, 2.0]
+
+    modes = []
+    for dim in range(3):
+        mode = np.zeros_like(positions)
+        mode[:, dim] = 1.0
+        modes.append(mode.ravel())
+    rel = positions - positions.mean(axis=0)
+    for rotation_axis in np.eye(3):
+        modes.append(np.cross(rotation_axis, rel).ravel())
+    modes = np.column_stack(modes)
+
+    expected = modes @ np.linalg.pinv(modes)
+    actual_modes = _rigid_motion_nullspace(positions)
+    actual = actual_modes @ actual_modes.T
+
+    assert actual_modes.shape == (9, 5)
+    np.testing.assert_allclose(actual, expected, atol=1e-12)
+
+
 def test_internal_df_pred_matches_projected_hessian_formula():
     """Trust prediction must match the explicit nonredundant projection.
 
@@ -174,6 +198,60 @@ def test_linear_dummy_projection_accounts_extra_dummy_dihedral():
 
     np.testing.assert_allclose(dx_initial, 0.0, atol=1e-14)
     np.testing.assert_allclose(dx_final[extra_row], actual_delta, atol=1e-12)
+
+
+def test_independent_rectangular_dummy_jacobian_keeps_tangent_directions():
+    """Dense dummy normals need low-rank projection even with square Q."""
+    from ase import Atoms
+    from ase.calculators.lj import LennardJones
+    from sella.optimize.restricted_step import MaxInternalStep
+
+    def make_pes():
+        atoms = Atoms(
+            'OCOH',
+            positions=[
+                [0.0, 0.0, 0.0],
+                [1.16, 0.0, 0.0],
+                [2.32, 0.0, 0.0],
+                [3.10, 0.8, 0.2],
+            ],
+        )
+        atoms.calc = LennardJones()
+        return InternalPES(
+            atoms, Internals(atoms), auto_find_internals=True
+        )
+
+    pes = make_pes()
+    dense = make_pes()
+    dense._linear_bend_dummy_projection_records = lambda: None
+
+    Q, R = pes._get_jacobian_qr()
+    assert Q.shape[0] == Q.shape[1]
+    assert R.shape[0] != R.shape[1]
+
+    rng = np.random.default_rng(29)
+    A = rng.normal(size=(pes.dim, pes.dim))
+    H = A.T @ A / pes.dim + np.eye(pes.dim)
+    pes.set_H(H, initialized=True)
+    dense.set_H(H, initialized=True)
+    pes.get_g()
+    dense.get_g()
+
+    Ufree = pes.get_Ufree()
+    drdx = pes.get_drdx()
+
+    assert Ufree.shape == (pes.dim, pes.dim - pes.cons.nint)
+    np.testing.assert_allclose(Ufree.T @ Ufree, np.eye(Ufree.shape[1]),
+                               atol=1e-12)
+    np.testing.assert_allclose(drdx @ Ufree, 0.0, atol=1e-12)
+    assert pes._fast_dummy_selection_indices() is None
+    assert pes._fast_dummy_redundant_projection() is not None
+
+    fast_step, _ = MaxInternalStep(pes, 0, 0.1).get_s()
+    dense_step, _ = MaxInternalStep(dense, 0, 0.1).get_s()
+    np.testing.assert_allclose(fast_step, dense_step, atol=1e-11,
+                               rtol=1e-11)
+    assert np.linalg.norm(fast_step) > 1e-8
 
 
 def test_range_space_projector_periodic_rank_deficient():

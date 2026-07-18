@@ -624,7 +624,7 @@ class Translation(Coordinate):
 # eigenvalue (a degenerate top eigenspace, e.g. 2-atom / linear fragments), the
 # gap is treated as zero so the 1/gap term in the eigenvector-derivative
 # pseudoinverse is dropped rather than blowing up.
-_ROT_EIG_GAP_TOL = 1e-14
+_ROT_EIG_GAP_TOL = 1e-10
 # |q0 - 1| below which the rotation is treated as ~identity: asinc =
 # arccos(x)/sqrt(1-x^2) and its derivatives switch to their Taylor expansion
 # instead of the (removable) singularity at x = 1.
@@ -715,7 +715,7 @@ def _stabilize_quaternion_from_eigh(ws, vecs, q_prev):
     """Compute branch-stable quaternion from pre-computed eigendecomposition."""
     if q_prev is None:
         q_prev = np.array([1.0, 0.0, 0.0, 0.0])
-    top_mask = (ws[-1] - ws) < 1e-10
+    top_mask = (ws[-1] - ws) < _ROT_EIG_GAP_TOL
     top_vecs = vecs[:, top_mask]
     coeffs = top_vecs.T @ q_prev
     q = top_vecs @ coeffs
@@ -2709,8 +2709,9 @@ class BaseInternals:
                     v_sub = v_atoms[idx]
                     axis = coord.kwargs['axis']
                     refpos = coord.kwargs['refpos']
+                    q = coord._stabilized_quaternion(pos)
                     hvp = _rotation_hvp_closed(pos, axis, refpos, v_sub,
-                                               q_stable=coord.q_prev)
+                                               q_stable=q)
                     rot_closed_results.append((hvp, idx))
 
         for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active):
@@ -2866,8 +2867,9 @@ class BaseInternals:
                     v_sub = v_atoms[idx]
                     axis = coord.kwargs['axis']
                     refpos = coord.kwargs['refpos']
+                    q = coord._stabilized_quaternion(pos)
                     hvp = _rotation_hvp_closed(pos, axis, refpos, v_sub,
-                                               q_stable=coord.q_prev)
+                                               q_stable=q)
                     rot_closed_results.append((hvp, idx))
 
         # Now collect results with device_get and scatter into output

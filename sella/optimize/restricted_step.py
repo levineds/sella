@@ -120,7 +120,7 @@ class BaseRestrictedStep:
 
         s, val, dval = self.eval(alpha)
         if val < self.delta:
-            assert val > 0.
+            assert val >= 0.
             return s, val
         err = val - self.delta
 

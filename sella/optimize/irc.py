@@ -150,7 +150,6 @@ class IRC(Optimizer):
                 (g1m_proj * self.sqrtm).reshape((-1, 3)), axis=1
             ).max()
 
-            g1m /= np.linalg.norm(g1m)
             if bound_clip and fmax < self.fmax_inner:
                 break
             elif self.converged():

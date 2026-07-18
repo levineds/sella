@@ -97,7 +97,7 @@ def rayleigh_ritz(A, gamma, P, B=None, v0=None, vref=None, vreftol=0.99,
         for seeking, (rinorm, thetai) in enumerate(zip(Rnorm, lams)):
             # Take the first Ritz value that is not converged, and use it
             # to extend V
-            if V.shape[1] == 1 or rinorm >= gamma * np.abs(thetai):
+            if rinorm > gamma * np.abs(thetai):
                 ri = R[:, seeking]
                 thetai = lams[seeking]
                 break

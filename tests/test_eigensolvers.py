@@ -69,3 +69,19 @@ def test_rayleigh_ritz(dim, order, eta, threepoint, gamma, method, maxiter):
     v0 = rng.normal(size=dim)
     rayleigh_ritz(H, gamma, np.eye(dim), method=method, v0=v0,
                   maxiter=maxiter, vref=np.linalg.eigh(h)[1][:, 0])
+
+
+@pytest.mark.parametrize(
+    "diagonal",
+    [np.array([0.0, 1.0, 2.0]), np.zeros(3), np.array([-1.0, 0.0, 2.0])],
+)
+def test_rayleigh_ritz_accepts_exact_zero_residual(diagonal):
+    A = np.diag(diagonal)
+    lams, vecs, avecs = rayleigh_ritz(A, 0.1, np.eye(3), method='jd0')
+
+    assert np.all(np.isfinite(lams))
+    assert np.all(np.isfinite(vecs))
+    np.testing.assert_allclose(A @ vecs, avecs, atol=1e-14)
+    np.testing.assert_allclose(
+        avecs - vecs * lams[np.newaxis, :], 0.0, atol=1e-14
+    )

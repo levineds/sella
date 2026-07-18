@@ -211,7 +211,9 @@ def _rigid_motion_nullspace(positions, tol=1e-10):
         modes.append(np.cross(axis, rel).ravel())
 
     Z0 = np.column_stack(modes)
-    Qz, Rz = np.linalg.qr(Z0, mode='reduced')
+    Qz, Rz, _ = qr(
+        Z0, mode='economic', pivoting=True, check_finite=False
+    )
     diag = np.abs(np.diag(Rz))
     if diag.size == 0 or diag[0] == 0:
         return np.empty((3 * n, 0), dtype=np.float64)
@@ -1681,7 +1683,11 @@ class InternalPES(PES):
         Ucons = self.curr.get('Ucons')
         if Ucons is None or Ucons.shape[1] == 0:
             return None
-        auxiliary = np.flatnonzero(np.any(Ucons != 0.0, axis=1))
+        auxiliary = np.argmax(np.abs(Ucons), axis=0)
+        indexed_normals = np.eye(self.dim)[:, auxiliary]
+        if (len(np.unique(auxiliary)) != Ucons.shape[1]
+                or not np.array_equal(Ucons, indexed_normals)):
+            return None
         mask = np.ones(self.dim, dtype=bool)
         mask[auxiliary] = False
         return np.flatnonzero(mask)
@@ -1694,8 +1700,8 @@ class InternalPES(PES):
             return None
         Unred = self.curr.get('Unred')
         Ucons = self.curr.get('Ucons')
-        if (Unred is None or Unred.shape[0] == Unred.shape[1]
-                or Ucons is None or Ucons.shape[1] == 0):
+        if (Unred is None or Ucons is None or Ucons.shape[1] == 0
+                or self._fast_dummy_selection_indices() is not None):
             return None
         normals = Unred.T @ Ucons
         projection = _LowRankTangentProjection(Unred, normals)
