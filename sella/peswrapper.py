@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 from sella._constants import _LSTSQ_RCOND
 
 
+_LINEAR_DUMMY_PROJECTION_TOL = 1e-7
+
+
 def _hessian_matvec(H, v):
     if hasattr(H, 'matvec'):
         return H.matvec(v)
@@ -211,6 +214,17 @@ def _rigid_motion_nullspace(positions, tol=1e-10):
         modes.append(np.cross(axis, rel).ravel())
 
     Z0 = np.column_stack(modes)
+    Qz, Rz = np.linalg.qr(Z0, mode='reduced')
+    diag = np.abs(np.diag(Rz))
+    if diag.size == 0 or diag[0] == 0:
+        return np.empty((3 * n, 0), dtype=np.float64)
+    rank = int(np.sum(diag > tol * diag[0]))
+    if rank == len(diag):
+        return Qz
+
+    # Collinear and otherwise rank-deficient geometries can place a dependent
+    # rotation before an independent one. Pivot only that uncommon case so the
+    # returned leading columns still span every valid rigid motion.
     Qz, Rz, _ = qr(
         Z0, mode='economic', pivoting=True, check_finite=False
     )
@@ -687,6 +701,7 @@ class PES:
             basis = self._calc_basis()
         drdx, Ucons, Unred, Ufree = basis
         self.curr.pop('Ufree_materialized', None)
+        self.curr.pop('fast_dummy_selection_indices', None)
         self.curr.pop('fast_dummy_redundant_projection', None)
         self.curr['drdx'] = drdx
         self.curr['Ucons'] = Ucons
@@ -764,6 +779,26 @@ class PES:
         Vs = Hproj.Vs
         AVs = Hproj.AVs
 
+        # A dense escape restart can sample two directions and continue from
+        # their linear combination. Rank-reveal the accumulated numerical
+        # secants before the multi-secant update so an exact dependence does
+        # not make S.T @ S singular. Keep original sample pairs rather than
+        # rotating finite-difference data through an SVD.
+        if Hproj.requires_secant_rank_cleanup and Vs.shape[1] > 1:
+            _, R_samples, piv = qr(
+                Vs, mode='economic', pivoting=True, check_finite=False
+            )
+            diagonal = np.abs(np.diag(R_samples))
+            cutoff = (
+                max(Vs.shape) * np.finfo(Vs.dtype).eps * diagonal[0]
+                if len(diagonal) and diagonal[0] > 0 else 0.0
+            )
+            rank = int(np.sum(diagonal > cutoff))
+            if rank < Vs.shape[1]:
+                keep = np.asarray(piv[:rank], dtype=int)
+                Vs = Vs[:, keep]
+                AVs = AVs[:, keep]
+
         # Re-calculate Ritz vectors
         Atilde = Vs.T @ symmetrize_Y(Vs, AVs, symm=2) - Vs.T @ Hc @ Vs
         _, X = eigh(Atilde)
@@ -789,7 +824,7 @@ class PES:
         conv = (fmax1 < fmax) and (cmax1 < cmax)
         return conv, fmax1, cmax1
 
-    def wrap_dx(self, dx):
+    def wrap_dx(self, dx, origin=None):
         return dx
 
     def get_df_pred(self, dx, g, H):
@@ -1107,7 +1142,8 @@ class InternalPES(PES):
         self.dummies.positions = dpos0
 
     def _iterative_residual_rms(self, target):
-        residual = self.wrap_dx(target - self.get_x())
+        current = self.get_x()
+        residual = self.wrap_dx(target - current, origin=current)
         rms = np.linalg.norm(residual) / np.sqrt(len(residual))
         return residual, rms
 
@@ -1153,11 +1189,12 @@ class InternalPES(PES):
 
     def _iterative_final_result(self, target, x0, dx_initial, g0):
         """Return the realized step only if the final residual avoids ODE fallback."""
-        final_residual = self.wrap_dx(target - self.get_x())
+        current = self.get_x()
+        final_residual = self.wrap_dx(target - current, origin=current)
         final_rms = np.linalg.norm(final_residual) / np.sqrt(len(dx_initial))
         if final_rms > 1e-6:
             return None
-        dx_final = self.get_x() - x0
+        dx_final = self.wrap_dx(current - x0, origin=x0)
         g_final = self.int.jacobian() @ g0
         return dx_initial, dx_final, g_final
 
@@ -1170,7 +1207,7 @@ class InternalPES(PES):
         pos0 = self.atoms.positions.copy()
         dpos0 = self.dummies.positions.copy()
         x0 = self.get_x()
-        dx_initial = target - x0
+        dx_initial = self.wrap_dx(target - x0, origin=x0)
 
         # Get initial gradient in Cartesian space.
         g0 = self._get_Binv() @ self.curr.get('g', np.zeros_like(dx_initial))
@@ -1210,7 +1247,8 @@ class InternalPES(PES):
         Uses LSODA to integrate the geodesic equation for reliable convergence
         on large or ill-conditioned steps.
         """
-        dx = self.wrap_dx(target - self.get_x())
+        x0 = self.get_x()
+        dx = self.wrap_dx(target - x0, origin=x0)
         t0 = 0.
         Binv = self._get_Binv()
         self._ode_Binv = Binv
@@ -1283,23 +1321,19 @@ class InternalPES(PES):
         """
         if not proj_moved:
             return dx_int_final
-        delta_proj = self.int.calc() - q_after_ode
-        dih_start = (self.int.ntrans + self.int.nbonds
-                     + self.int.nangles)
-        dih_end = dih_start + self.int.ndihedrals
-        if dih_end > dih_start:
-            delta_proj[dih_start:dih_end] = (
-                (delta_proj[dih_start:dih_end] + np.pi)
-                % (2 * np.pi) - np.pi
-            )
+        delta_proj = self.wrap_dx(
+            self.int.calc() - q_after_ode, origin=q_after_ode
+        )
         filter_rows = getattr(self, '_last_projection_filter_rows', ())
         if filter_rows:
             delta_proj[np.asarray(filter_rows, dtype=int)] = 0.0
             self._last_projection_filter_rows = ()
         return dx_int_final + delta_proj
 
-    def _project_to_constraints(self, target_tol=1e-7, max_iter=8,
-                                safety_limit=0.05):
+    def _project_to_constraints(
+        self, target_tol=_LINEAR_DUMMY_PROJECTION_TOL, max_iter=8,
+        safety_limit=0.05,
+    ):
         """Newton projection onto the constraint manifold (IC null-space).
 
         Drives ``cons.residual()`` to zero with corrections that, to
@@ -1564,7 +1598,9 @@ class InternalPES(PES):
         ids = np.asarray(indices, dtype=int)
         return ids, ids[ids < natoms], ids[ids >= natoms]
 
-    def _project_linear_bend_dummies(self, target_tol=1e-7):
+    def _project_linear_bend_dummies(
+        self, target_tol=_LINEAR_DUMMY_PROJECTION_TOL,
+    ):
         """Project linear-bend dummy constraints without a full IC basis.
 
         A linear-bend dummy contributes exactly two active constraints: the
@@ -1675,38 +1711,64 @@ class InternalPES(PES):
         return PES.get_drdx(self) @ self._get_Binv()
 
     def _fast_dummy_selection_indices(self):
-        if self.curr.get('Ufree') is not self.curr.get('Unred'):
-            return None
+        key = 'fast_dummy_selection_indices'
+        if key in self.curr:
+            return self.curr[key]
+
+        indices = None
         Unred = self.curr.get('Unred')
-        if Unred is None or Unred.shape[0] != Unred.shape[1]:
-            return None
         Ucons = self.curr.get('Ucons')
-        if Ucons is None or Ucons.shape[1] == 0:
-            return None
-        auxiliary = np.argmax(np.abs(Ucons), axis=0)
-        indexed_normals = np.eye(self.dim)[:, auxiliary]
-        if (len(np.unique(auxiliary)) != Ucons.shape[1]
-                or not np.array_equal(Ucons, indexed_normals)):
-            return None
-        mask = np.ones(self.dim, dtype=bool)
-        mask[auxiliary] = False
-        return np.flatnonzero(mask)
+        if (self.curr.get('Ufree') is Unred
+                and Unred is not None
+                and Unred.shape[0] == Unred.shape[1]
+                and Ucons is not None
+                and Ucons.shape[1] > 0):
+            auxiliary = np.argmax(np.abs(Ucons), axis=0)
+            indexed_normals = np.eye(self.dim)[:, auxiliary]
+            if (len(np.unique(auxiliary)) == Ucons.shape[1]
+                    and np.array_equal(Ucons, indexed_normals)):
+                mask = np.ones(self.dim, dtype=bool)
+                mask[auxiliary] = False
+                indices = np.flatnonzero(mask)
+
+        self.curr[key] = indices
+        return indices
 
     def _fast_dummy_redundant_projection(self):
-        cached = self.curr.get('fast_dummy_redundant_projection')
-        if cached is not None:
-            return cached
-        if self.curr.get('Ufree') is not self.curr.get('Unred'):
-            return None
+        key = 'fast_dummy_redundant_projection'
+        if key in self.curr:
+            return self.curr[key]
+
+        projection = None
         Unred = self.curr.get('Unred')
         Ucons = self.curr.get('Ucons')
-        if (Unred is None or Ucons is None or Ucons.shape[1] == 0
-                or self._fast_dummy_selection_indices() is not None):
-            return None
-        normals = Unred.T @ Ucons
-        projection = _LowRankTangentProjection(Unred, normals)
-        self.curr['fast_dummy_redundant_projection'] = projection
+        if (self.curr.get('Ufree') is Unred
+                and Unred is not None
+                and Ucons is not None
+                and Ucons.shape[1] > 0
+                and self._fast_dummy_selection_indices() is None):
+            normals = Unred.T @ Ucons
+            projection = _LowRankTangentProjection(Unred, normals)
+        self.curr[key] = projection
         return projection
+
+    def get_scons(self):
+        # Certified linear-dummy constraints are restored by the cone
+        # projection after each geometry step. Avoid a least-squares solve for
+        # a correction that is already below that projection's target.
+        if len(self.dummies):
+            self._update(False)
+            fast_dummy = (
+                self._fast_dummy_selection_indices() is not None
+                or self._fast_dummy_redundant_projection() is not None
+            )
+            if fast_dummy:
+                residual = self.get_res()
+                if (residual.size == 0
+                        or np.linalg.norm(residual, ord=np.inf)
+                        < _LINEAR_DUMMY_PROJECTION_TOL):
+                    return np.zeros(self.dim)
+        return super().get_scons()
 
     def get_Ufree(self):
         self._update(False)
@@ -1739,12 +1801,13 @@ class InternalPES(PES):
         return projected
 
     def get_fast_restricted_step_data(self, g, order, stepper, W_is_identity):
+        if (not W_is_identity
+                or getattr(stepper, '__name__', '') != 'QuasiNewton'
+                or len(self.dummies) == 0):
+            return None
         self._update(False)
         indices = self._fast_dummy_selection_indices()
         projection = self._fast_dummy_redundant_projection()
-        if (not W_is_identity
-                or getattr(stepper, '__name__', '') != 'QuasiNewton'):
-            return None
 
         if indices is not None:
             if not getattr(self.H, '_cpu_current', True):
@@ -1863,8 +1926,8 @@ class InternalPES(PES):
             B = self.int.jacobian()
         return -(g_projected @ B).reshape((-1, 3))
 
-    def wrap_dx(self, dx):
-        return self.int.wrap(dx)
+    def wrap_dx(self, dx, origin=None):
+        return self.int.wrap(dx, origin=origin)
 
     # x setter aux functions
     def _q_ode(self, t, y):
@@ -2711,7 +2774,9 @@ class CellInternalPES(_CellPESMixin, InternalPES):
     def _cell_target_parts(self, target, x0):
         """Split target into optimizer-requested internal and cell steps."""
         q0 = x0[:self.n_internal]
-        dq = target[:self.n_internal] - q0
+        dq = self.wrap_dx(
+            target[:self.n_internal] - q0, origin=q0
+        )
         cell_target = target[self.n_internal:]
         cell_params0 = self._masked_cell_params()
         return dq, cell_target, cell_params0
@@ -2884,7 +2949,7 @@ class CellInternalPES(_CellPESMixin, InternalPES):
     def _set_x_ode_internal(self, q_target: np.ndarray):
         """ODE-based stepper for internal coords only (cell already updated)."""
         x0 = self.int.calc()
-        dx = self.wrap_dx(q_target - x0)
+        dx = self.wrap_dx(q_target - x0, origin=x0)
         t0 = 0.
         Binv = self._get_Binv()
         self._ode_Binv = Binv

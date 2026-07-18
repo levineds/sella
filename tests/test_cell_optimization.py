@@ -2241,6 +2241,11 @@ class TestDummyAtomCellHandling:
         pes.get_g()
         step = pes.get_Ucons().T @ pes.get_Ufree()
         assert_allclose(step, 0.0, atol=1e-12)
+        assert_allclose(pes.get_scons(), 0.0, atol=0.0)
+
+        pes.dummies.positions += np.array([1e-3, -2e-3, 1.5e-3])
+        pes._update_basis()
+        assert np.linalg.norm(pes.get_scons()) > 0.0
 
     def test_linear_dummy_cone_repairs_large_displacement(self):
         pes = Sella(self._two_linear_co2(), order=0, internal=True,
@@ -2734,6 +2739,24 @@ class TestCartesianCellTrustRadiusAdapts:
     cell steps hit the cap. The split now applies to CellCartesianPES too
     (via pes.n_coords).
     """
+
+    def test_atomic_component_uses_max_atom_displacement(self):
+        atoms = Atoms(
+            'H2', positions=[[0, 0, 0], [1, 0, 0]],
+            cell=np.eye(3) * 5.0, pbc=True,
+        )
+        atoms.calc = LennardJones()
+        opt = Sella(
+            atoms, order=0, internal=False, optimize_cell=True,
+            logfile=None,
+        )
+        step = np.zeros(opt.pes.dim)
+        step[:6] = [3.0, 4.0, 0.0, 0.0, 0.0, 2.0]
+
+        smag_atomic, smag_cell = opt._cell_trust_components(step, 5.0)
+
+        assert smag_atomic == pytest.approx(5.0)
+        assert smag_cell == 0.0
 
     def test_delta_cell_adapts_cartesian(self):
         # Compressed cell -> large stress -> cell steps large enough to move

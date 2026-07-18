@@ -3,6 +3,7 @@ import pytest
 import numpy as np
 from ase import Atoms
 from ase.build import molecule
+from scipy.spatial.transform import Rotation as SciPyRotation
 
 import sella.internal as internal_module
 from sella.internal import (
@@ -60,6 +61,131 @@ def test_get_internal(name: str) -> None:
 
 class TestTRICs:
     """Tests for Translation-Rotation Internal Coordinates (TRICs)."""
+
+    @pytest.mark.parametrize(
+        "origin,target",
+        [
+            (
+                np.array([np.pi - 0.05, 0.0, 0.0]),
+                np.array([-np.pi + 0.05, 0.0, 0.0]),
+            ),
+            (
+                np.array([np.pi - 0.05, 0.0, 0.0]),
+                np.array([0.0, np.pi - 0.05, 0.0]),
+            ),
+            (
+                np.array([2.8, 0.2, 0.0]),
+                np.array([-0.1, -2.9, 0.3]),
+            ),
+        ],
+    )
+    def test_rotation_wrap_preserves_target_orientation(self, origin, target):
+        atoms = Atoms('H3', positions=[[0, 0, 0], [1, 0, 0], [0, 1, 0]])
+        internals = Internals(atoms)
+        internals.add_rotation((0, 1, 2))
+
+        wrapped = internals.wrap(target - origin, origin=origin)
+        represented_target = origin + wrapped
+        expected = SciPyRotation.from_rotvec(target).as_matrix()
+        actual = SciPyRotation.from_rotvec(represented_target).as_matrix()
+
+        np.testing.assert_allclose(actual, expected, atol=1e-12)
+        assert np.linalg.norm(wrapped) <= np.linalg.norm(target - origin)
+
+    def test_diatomic_rotation_hvp_after_cumulative_rotation(self):
+        atoms = Atoms(
+            'H2', positions=[[-0.37, 0.0, 0.0], [0.37, 0.0, 0.0]],
+            cell=np.eye(3) * 8.0, pbc=True,
+        )
+        internals = Internals(atoms, allow_fragments=True)
+        internals.find_all_bonds()
+        internals.find_all_angles()
+        internals.find_all_dihedrals()
+
+        reference = atoms.positions.copy()
+        axis = np.array([0.3, 0.7, 0.2])
+        axis /= np.linalg.norm(axis)
+        center = np.array([3.0, 2.0, 1.0])
+        for angle in np.linspace(0.0, 2.5, 26):
+            rotation = SciPyRotation.from_rotvec(axis * angle).as_matrix()
+            atoms.positions = reference @ rotation.T + center
+            internals.jacobian()
+
+        tangent = np.arange(internals.ndof, dtype=float) - 2.5
+        tangent /= np.linalg.norm(tangent)
+        hessians = np.asarray(internals.hessian())
+        expected_hvp = np.einsum('nij,j->ni', hessians, tangent)
+        analytic = internals.hessian_rdot(tangent)
+        if hasattr(analytic, 'toarray'):
+            analytic = analytic.toarray()
+        np.testing.assert_allclose(
+            analytic, expected_hvp, atol=2e-8, rtol=2e-8
+        )
+
+        positions = atoms.positions.copy()
+        quaternions = [
+            coord.q_prev.copy()
+            for coord in internals.internals['rotations']
+        ]
+
+        direction = tangent.reshape(-1, 3)
+        delta_hessian = 1e-4
+        for coord, quaternion in zip(
+            internals.internals['rotations'], quaternions
+        ):
+            coord.q_prev = quaternion.copy()
+            hessian = np.asarray(
+                coord.calc_hessian(internals.light_atoms)
+            ).reshape(internals.ndof, internals.ndof)
+            values = []
+            for sign in (1.0, 0.0, -1.0):
+                displaced = atoms.copy()
+                displaced.positions = positions + sign * delta_hessian * direction
+                trial = coord.copy()
+                trial.q_prev = quaternion.copy()
+                values.append(trial.calc(displaced))
+            numeric_curvature = (
+                values[0] - 2 * values[1] + values[2]
+            ) / delta_hessian**2
+            analytic_curvature = tangent @ hessian @ tangent
+
+            np.testing.assert_allclose(hessian, hessian.T, atol=1e-12)
+            np.testing.assert_allclose(
+                analytic_curvature, numeric_curvature,
+                atol=2e-6, rtol=2e-6,
+            )
+
+    def test_near_degenerate_rotation_hessian_stays_bounded(self):
+        bend = 1e-6
+        refpos = np.array([
+            [-2.0, 0.0, 0.0],
+            [-0.5, bend, 0.0],
+            [0.7, -0.7 * bend, 0.2 * bend],
+            [1.8, 0.0, 0.0],
+        ])
+        theta = 0.2
+        rotation_matrix = np.array([
+            [np.cos(theta), -np.sin(theta), 0.0],
+            [np.sin(theta), np.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        positions = refpos @ rotation_matrix.T
+        positions[1] += bend * np.array([0.01, -0.02, 0.03])
+        atoms = Atoms('H4', positions=positions)
+        internals = Internals(atoms)
+        for axis in range(3):
+            internals.add_rotation(Rotation((0, 1, 2, 3), axis, refpos))
+
+        tangent = np.arange(internals.ndof, dtype=float) - 5.5
+        tangent /= np.linalg.norm(tangent)
+        hessians = np.asarray(internals.hessian())
+        expected = np.einsum('nij,j->ni', hessians, tangent)
+        actual = internals.hessian_rdot(tangent)
+        if hasattr(actual, 'toarray'):
+            actual = actual.toarray()
+
+        assert np.linalg.norm(hessians) < 1.0
+        np.testing.assert_allclose(actual, expected, atol=2e-8, rtol=2e-8)
 
     def test_tric_single_atom_fragment(self):
         """Test TRICs with a single-atom fragment (should not raise assertion).

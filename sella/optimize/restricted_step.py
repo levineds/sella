@@ -73,7 +73,9 @@ class BaseRestrictedStep:
             self.scons[:] *= 0
         else:
             fast_data = None
-            if self.d1 is None:
+            dummies = getattr(self.pes, 'dummies', None)
+            if (self.d1 is None and dummies is not None
+                    and len(dummies) > 0):
                 fast_data = self.pes.get_fast_restricted_step_data(
                     g, order, stepper, self._W_is_identity
                 )

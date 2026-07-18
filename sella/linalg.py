@@ -21,6 +21,7 @@ class NumericalHessian(LinearOperator):
         self.threepoint = threepoint
         self.calls = 0
         self.Uproj = Uproj
+        self.requires_secant_rank_cleanup = False
 
         self.ntrue = len(self.x0)
 

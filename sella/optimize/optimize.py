@@ -405,7 +405,14 @@ class Sella(Optimizer):
         # so each trust radius adapts independently. The boundary is n_coords
         # (n_internal for CellInternalPES, n_cart for CellCartesianPES).
         n_coord = self.pes.n_coords
-        smag_int = np.max(np.abs(s[:n_coord])) if n_coord > 0 else 0
+        coord_step = np.asarray(s[:n_coord])
+        if (n_coord > 0 and isinstance(self.pes, CellCartesianPES)
+                and issubclass(self.rs, RestrictedAtomicStep)):
+            smag_int = np.linalg.norm(
+                coord_step.reshape((-1, 3)), axis=1
+            ).max()
+        else:
+            smag_int = np.max(np.abs(coord_step)) if n_coord > 0 else 0
         smag_cell = np.max(np.abs(s[n_coord:])) if len(s) > n_coord else 0
         return smag_int, smag_cell
 

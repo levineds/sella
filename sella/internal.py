@@ -625,6 +625,9 @@ class Translation(Coordinate):
 # gap is treated as zero so the 1/gap term in the eigenvector-derivative
 # pseudoinverse is dropped rather than blowing up.
 _ROT_EIG_GAP_TOL = 1e-10
+# Cartesian displacement used only for finite-difference second derivatives
+# in a genuinely degenerate quaternion eigenspace (normally a diatomic).
+_ROT_DEGENERATE_FD_STEP = 2e-6
 # |q0 - 1| below which the rotation is treated as ~identity: asinc =
 # arccos(x)/sqrt(1-x^2) and its derivatives switch to their Taylor expansion
 # instead of the (removable) singularity at x = 1.
@@ -834,7 +837,10 @@ def _apply_dF(Prefpos, vec, N):
         # dFtop[d] = 0 (already)
 
         # result[:, :, d, 0] = dRtr * v0 + dFtop @ v3
-        result[:, :, d, 0] = dRtr * v0 + np.einsum('bni,bi->bn', dFtop, v3)
+        result[:, :, d, 0] = (
+            dRtr * v0[:, None]
+            + np.einsum('bni,bi->bn', dFtop, v3)
+        )
 
         # result[:, :, d, 1:] = dFtop * v0 + (-dRtr*I + dR + dR.T) @ v3
         for i_ax in range(3):
@@ -847,6 +853,175 @@ def _apply_dF(Prefpos, vec, N):
     if single:
         return result[0]
     return result
+
+
+def _rotation_expmap_jacobian_from_dq(q, dq):
+    """Map quaternion derivatives to three rotation-vector derivatives."""
+    q0 = q[:, 0]
+    asinc_val = np.empty_like(q0)
+    regular = q0 < 0.97
+    if np.any(regular):
+        q0r = q0[regular]
+        asinc_val[regular] = (
+            np.arccos(q0r) / np.sqrt(np.maximum(1.0 - q0r**2, 1e-30))
+        )
+    if np.any(~regular):
+        y = q0[~regular] - 1.0
+        asinc_val[~regular] = (
+            1.0 - y / 3 + 2 * y**2 / 15 - 2 * y**3 / 35
+            + 8 * y**4 / 315 - 8 * y**5 / 693
+            + 16 * y**6 / 3003 - 16 * y**7 / 6435
+            + 128 * y**8 / 109395 - 128 * y**9 / 230945
+        )
+
+    dasinc = np.zeros_like(q0)
+    near_identity = np.abs(q0 - 1.0) < _ROT_NEAR_IDENTITY_TOL
+    ynear = q0[near_identity] - 1.0
+    dasinc[near_identity] = -1.0 / 3 + 4 * ynear / 15
+    regular_deriv = (~near_identity) & (np.abs(q0) < 1.0 - 1e-12)
+    if np.any(regular_deriv):
+        q0r = q0[regular_deriv]
+        s2 = 1.0 - q0r**2
+        s = np.sqrt(s2)
+        ac = np.arccos(q0r)
+        dasinc[regular_deriv] = -1.0 / s2 + q0r * ac / (s * s2)
+
+    jac = np.empty((len(q), 3, dq.shape[1]))
+    for axis in range(3):
+        jac[:, axis] = 2 * (
+            dq[:, :, axis + 1] * asinc_val[:, None]
+            + q[:, axis + 1, None] * dasinc[:, None] * dq[:, :, 0]
+        )
+    return jac
+
+
+def _rotation_jacobian_fixed_gauge_batched(
+    pos, refpos, q_reference, top_count,
+):
+    """Jacobian of the fixed-gauge top-eigenspace projection.
+
+    The usual simple-eigenvector derivative is insufficient in a degenerate
+    top eigenspace: away from the base point, the fixed reference quaternion
+    need not lie in the new eigenspace. Differentiating the spectral projector
+    first keeps the value, Jacobian, and Hessian on one local gauge chart.
+    """
+    pos = np.asarray(pos, dtype=np.float64)
+    refpos = np.asarray(refpos, dtype=np.float64)
+    q_reference = np.asarray(q_reference, dtype=np.float64)
+    n_batch, n, _ = pos.shape
+    ws, vecs = np.linalg.eigh(_build_F_matrices_np(pos, refpos))
+    top = np.arange(4 - top_count, 4)
+    bottom = np.arange(0, 4 - top_count)
+
+    top_vecs = vecs[:, :, top]
+    projected = np.squeeze(
+        top_vecs @ (top_vecs.swapaxes(1, 2) @ q_reference[:, :, None]), -1
+    )
+    projected_norm = np.linalg.norm(projected, axis=1)
+    q = projected / projected_norm[:, None]
+
+    pref = refpos - refpos.mean(axis=1, keepdims=True)
+    dz = np.zeros((n_batch, 3 * n, 4))
+    for a in top:
+        ua = vecs[:, :, a]
+        dFua = _apply_dF(pref, ua, n).reshape(n_batch, 3 * n, 4)
+        ua_ref = np.sum(ua * q_reference, axis=1)
+        for b in bottom:
+            ub = vecs[:, :, b]
+            coefficient = (
+                np.einsum('bmi,bi->bm', dFua, ub)
+                / (ws[:, a] - ws[:, b])[:, None]
+            )
+            direction = (
+                ub * ua_ref[:, None]
+                + ua * np.sum(ub * q_reference, axis=1)[:, None]
+            )
+            dz += coefficient[:, :, None] * direction[:, None, :]
+
+    dq = dz - np.sum(dz * q[:, None, :], axis=2)[:, :, None] * q[:, None, :]
+    dq /= projected_norm[:, None, None]
+    jac = _rotation_expmap_jacobian_from_dq(q, dq)
+    return jac.reshape(n_batch, 3, n, 3)
+
+
+def _rotation_jacobian_with_fixed_gauge(
+    pos, refpos, q_reference, top_count,
+):
+    return _rotation_jacobian_fixed_gauge_batched(
+        pos[None], refpos[None], q_reference[None], top_count,
+    )[0]
+
+
+def _rotation_hvp_degenerate_fd_batched(
+    pos, refpos, tangent, q_reference, top_count,
+):
+    """Fixed-gauge degenerate HVP, batched over equal-sized fragments."""
+    tangent_norm = np.linalg.norm(tangent.reshape(len(tangent), -1), axis=1)
+    out = np.zeros((len(pos), 3) + pos.shape[1:])
+    moving = tangent_norm > 0
+    if not np.any(moving):
+        return out
+
+    pos_m = pos[moving]
+    ref_m = refpos[moving]
+    tangent_m = tangent[moving]
+    q_m = q_reference[moving]
+    norm_m = tangent_norm[moving]
+    scale = np.maximum(
+        np.sqrt(np.mean(ref_m * ref_m, axis=(1, 2))), 1.0
+    )
+    delta_t = _ROT_DEGENERATE_FD_STEP * scale / norm_m
+    displacement = delta_t[:, None, None] * tangent_m
+    jac_plus = _rotation_jacobian_fixed_gauge_batched(
+        pos_m + displacement, ref_m, q_m, top_count,
+    )
+    jac_minus = _rotation_jacobian_fixed_gauge_batched(
+        pos_m - displacement, ref_m, q_m, top_count,
+    )
+    out[moving] = (
+        (jac_plus - jac_minus) / (2 * delta_t[:, None, None, None])
+    )
+    return out
+
+
+def _rotation_hvp_degenerate_fd(
+    pos, refpos, tangent, q_reference, top_count,
+):
+    return _rotation_hvp_degenerate_fd_batched(
+        pos[None], refpos[None], tangent[None], q_reference[None], top_count,
+    )[0]
+
+
+def _rotation_3axis_hessian_degenerate_fd(
+    pos, refpos, q_reference, top_count,
+):
+    """Symmetric fixed-gauge Hessians for all three rotation components."""
+    n = len(pos)
+    ncart = 3 * n
+    scale = max(np.sqrt(np.mean(refpos * refpos)), 1.0)
+    delta = _ROT_DEGENERATE_FD_STEP * scale
+    pos_batch = np.repeat(pos[None], 2 * ncart, axis=0)
+    flat = pos_batch.reshape(2 * ncart, ncart)
+    columns = np.arange(ncart)
+    flat[columns, columns] += delta
+    flat[ncart + columns, columns] -= delta
+    ref_batch = np.repeat(refpos[None], 2 * ncart, axis=0)
+    q_batch = np.repeat(q_reference[None], 2 * ncart, axis=0)
+    jac = _rotation_jacobian_fixed_gauge_batched(
+        pos_batch, ref_batch, q_batch, top_count,
+    )
+    column_derivatives = (jac[:ncart] - jac[ncart:]) / (2 * delta)
+    hessian = column_derivatives.reshape(ncart, 3, ncart).transpose(1, 2, 0)
+    hessian = 0.5 * (hessian + hessian.swapaxes(1, 2))
+    return hessian.reshape(3, n, 3, n, 3)
+
+
+def _rotation_hessian_degenerate_fd(
+    pos, axis, refpos, q_reference, top_count,
+):
+    return _rotation_3axis_hessian_degenerate_fd(
+        pos, refpos, q_reference, top_count,
+    )[axis]
 
 
 
@@ -876,6 +1051,11 @@ def _rotation_hessian_single(pos, axis, refpos, q_stable=None,
         c = vecs[:, -1]
         if c[0] < 0:
             c = -c
+    if ws[-1] - ws[-2] <= _ROT_EIG_GAP_TOL:
+        top_count = int(np.sum(ws[-1] - ws <= _ROT_EIG_GAP_TOL))
+        return _rotation_hessian_degenerate_fd(
+            pos, axis, refpos, c, top_count
+        )
     gaps = ws - ws[-1]
     safe_inv = np.where(np.abs(gaps) > _ROT_EIG_GAP_TOL, 1.0 / np.where(np.abs(gaps) > _ROT_EIG_GAP_TOL, gaps, 1.0), 0.0)
 
@@ -948,7 +1128,18 @@ def _rotation_hessian_single(pos, axis, refpos, q_stable=None,
 
 def _rotation_hvp_closed(pos, axis, refpos, tangent, q_stable=None):
     """HVP for a single rotation using the closed-form Hessian."""
-    hess = _rotation_hessian_single(pos, axis, refpos, q_stable=q_stable)
+    dx = pos - pos.mean(0)
+    ws, vecs = np.linalg.eigh(_build_F_matrix_np(dx, refpos))
+    if q_stable is None:
+        q_stable = _stabilize_quaternion_from_eigh(ws, vecs, None)
+    if ws[-1] - ws[-2] <= _ROT_EIG_GAP_TOL:
+        top_count = int(np.sum(ws[-1] - ws <= _ROT_EIG_GAP_TOL))
+        return _rotation_hvp_degenerate_fd(
+            pos, refpos, tangent, q_stable, top_count
+        )[axis]
+    hess = _rotation_hessian_single(
+        pos, axis, refpos, q_stable=q_stable, ws=ws, vecs=vecs
+    )
     return np.einsum('aibj,bj->ai', hess, tangent)
 
 
@@ -1183,6 +1374,38 @@ def _rotation_3axis_hvp_batched_closed(pos_pad, ref_pad, mask, v_pad,
                 c = vecs[:, :, -1]
                 sign = np.where(c[:, 0] >= 0, 1.0, -1.0)
                 c *= sign[:, None]
+
+        degenerate = ws[:, -1] - ws[:, -2] <= _ROT_EIG_GAP_TOL
+        if np.any(degenerate):
+            top_counts = np.ones(n_batch, dtype=int)
+            top_counts[degenerate] = np.sum(
+                ws[degenerate, -1, None] - ws[degenerate]
+                <= _ROT_EIG_GAP_TOL,
+                axis=1,
+            )
+            for top_count in np.unique(top_counts[degenerate]):
+                local = np.flatnonzero(
+                    degenerate & (top_counts == top_count)
+                )
+                fragment_indices = idx[local]
+                hvp[fragment_indices, :, :nr, :] = (
+                    _rotation_hvp_degenerate_fd_batched(
+                        pos_group[local], ref_group[local], v_group[local],
+                        c[local], int(top_count),
+                    )
+                )
+
+            nondegenerate = np.flatnonzero(~degenerate)
+            if len(nondegenerate) == 0:
+                continue
+            idx = idx[nondegenerate]
+            pos_group = pos_group[nondegenerate]
+            ref_group = ref_group[nondegenerate]
+            v_group = v_group[nondegenerate]
+            ws = ws[nondegenerate]
+            vecs = vecs[nondegenerate]
+            c = c[nondegenerate]
+            n_batch = len(nondegenerate)
 
         gaps = ws - ws[:, -1:]
         safe_inv = np.where(
@@ -2375,15 +2598,32 @@ class BaseInternals:
             n = len(frag_indices[fi])
             pos_frag = np.asarray(pos_pad[fi, :n], dtype=np.float64)
             ref_frag = np.asarray(ref_pad[fi, :n], dtype=np.float64)
-            for axis, rot_idx in enumerate(slot):
-                if ws_all is not None and vecs_all is not None:
-                    h = _rotation_hessian_single(
-                        pos_frag, axis, ref_frag, q_stable=qs[fi],
-                        ws=ws_all[fi], vecs=vecs_all[fi],
+            if ws_all is not None and vecs_all is not None:
+                ws = ws_all[fi]
+                vecs = vecs_all[fi]
+            else:
+                ws, vecs = np.linalg.eigh(
+                    _build_F_matrix_np(
+                        pos_frag - pos_frag.mean(0), ref_frag
                     )
-                else:
-                    h = _rotation_hessian_single(pos_frag, axis, ref_frag,
-                                                 q_stable=qs[fi])
+                )
+            top_count = int(np.sum(
+                ws[-1] - ws <= _ROT_EIG_GAP_TOL
+            ))
+            if top_count > 1:
+                hessians = _rotation_3axis_hessian_degenerate_fd(
+                    pos_frag, ref_frag, qs[fi], top_count,
+                )
+                for axis, rot_idx in enumerate(slot):
+                    out[rot_idx] = (
+                        frag_indices[fi], hessians[axis]
+                    )
+                continue
+            for axis, rot_idx in enumerate(slot):
+                h = _rotation_hessian_single(
+                    pos_frag, axis, ref_frag, q_stable=qs[fi],
+                    ws=ws, vecs=vecs,
+                )
                 out[rot_idx] = (frag_indices[fi], h)
         return out
 
@@ -2927,7 +3167,7 @@ class BaseInternals:
             )
         return out[:row]
 
-    def wrap(self, vec: np.ndarray) -> np.ndarray:
+    def wrap(self, vec: np.ndarray, origin: np.ndarray = None) -> np.ndarray:
         """Wraps an internal coord. displacement vector into a valid domain."""
         start = 0
         for name in self._names:
@@ -2936,16 +3176,18 @@ class BaseInternals:
             if name == 'dihedrals':
                 vec[start:start + n] = (vec[start:start + n] + np.pi) % (2 * np.pi) - np.pi
             elif name == 'rotations' and n > 0:
-                self._wrap_rotation_diff(vec, start, active)
+                self._wrap_rotation_diff(vec, start, active, origin=origin)
             start += n
         return vec
 
-    def _wrap_rotation_diff(self, vec, rot_start, active=None):
-        """Wrap rotation coordinate differences along rotation axis.
+    def _wrap_rotation_diff(self, vec, rot_start, active=None, origin=None):
+        """Wrap rotation differences using an equivalent target rotation.
 
-        The exponential map has period 2π along the rotation axis
-        direction. For each fragment's 3 rotation components, find the
-        minimum-image difference by adding/subtracting 2π * v̂.
+        A rotation vector ``target`` is equivalent to
+        ``target + 2π k target/|target|``.  Select the equivalent target that
+        is closest to ``origin``.  Wrapping along the displacement direction
+        is only valid when the two rotations share an axis and can change the
+        represented orientation for general rotations.
         """
         rotations = self.internals['rotations']
         if not rotations:
@@ -2972,22 +3214,16 @@ class BaseInternals:
             # Get the 3-component rotation difference vector
             idx = [rot_start + local_index[i] for i in active_indices]
             v = vec[idx].copy()
-            vnorm = np.linalg.norm(v)
-            if vnorm < 1e-10:
+            base = np.zeros(3) if origin is None else np.asarray(origin)[idx]
+            target = base + v
+            target_norm = np.linalg.norm(target)
+            if target_norm < 1e-10:
                 continue
-            vh = v / vnorm
-            # Try adding/subtracting 2π along v̂ to minimize |v|
-            best_v = v.copy()
-            best_d2 = np.dot(v, v)
-            for direction in [1, -1]:
-                vt = v.copy()
-                while True:
-                    vt += direction * 2 * np.pi * vh
-                    d2 = np.dot(vt, vt)
-                    if d2 >= best_d2:
-                        break
-                    best_v = vt.copy()
-                    best_d2 = d2
+            axis = target / target_norm
+            k0 = int(np.rint(-np.dot(v, axis) / (2 * np.pi)))
+            candidates = [v + 2 * np.pi * k * axis
+                          for k in (k0 - 1, k0, k0 + 1)]
+            best_v = min(candidates, key=lambda candidate: candidate @ candidate)
             vec[idx] = best_v
 
     def __iter__(self) -> Iterator[Coordinate]:
@@ -3232,7 +3468,8 @@ class Constraints(BaseInternals):
 
     def residual(self) -> np.ndarray:
         """Calculates the constraint residual vector."""
-        res = self.wrap(self.calc() - self.targets)
+        targets = self.targets
+        res = self.wrap(self.calc() - targets, origin=targets)
         if self.ignore_rotation and self.nrotations:
             res[-self.nrotations:] = 0.
         return res
