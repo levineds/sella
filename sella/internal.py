@@ -3102,7 +3102,7 @@ class BaseInternals:
                 else:
                     if has_metadata and (
                         new_kinds[existing] != kinds[i]
-                        or not np.isclose(new_targets[existing], targets[i])
+                        or new_targets[existing] != targets[i]
                     ):
                         raise DuplicateConstraintError(
                             'Dummy expansion produced duplicate coordinates '

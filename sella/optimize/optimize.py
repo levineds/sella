@@ -423,7 +423,7 @@ class Sella(Optimizer):
                 self.delta = max(
                     smag_int * self.sigma_dec, self.delta_min
                 )
-            if smag_cell > 0:
+            if smag_cell > component_tol:
                 self.delta_cell = max(
                     self.delta_cell * self.sigma_dec, self.delta_min
                 )

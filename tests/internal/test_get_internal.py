@@ -811,6 +811,20 @@ class TestFindAllBondsIdempotent:
         ):
             cons.add_dummy_to_internals(1)
 
+    def test_dummy_constraint_dedup_rejects_close_conflicting_targets(self):
+        atoms = self._linear_co2()
+        dummies = Atoms('X', positions=[[2.0, 3.0, 0.0]])
+        dinds = np.array([-1, 3, -1], dtype=np.int32)
+        cons = Constraints(atoms, dummies=dummies, dinds=dinds)
+        cons.fix_translation((1,), dim=0, target=1.0)
+        cons.fix_translation((1, 3), dim=0, target=1.0 + 1e-8)
+
+        with pytest.raises(
+            internal_module.DuplicateConstraintError,
+            match='conflicting constraints',
+        ):
+            cons.add_dummy_to_internals(1)
+
 
 class TestPeriodicConstraintUnwrap:
     """Periodic constraints must survive allow_fragments unwrapping."""

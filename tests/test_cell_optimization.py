@@ -2448,6 +2448,16 @@ class TestDummyAtomCellHandling:
     def test_redundant_full_rank_dummy_step_matches_dense_basis(self):
         def make_pes():
             atoms = self._linear_co2(cell_diag=10.0)
+            atoms.calc = SinglePointCalculator(
+                atoms,
+                energy=0.0,
+                forces=np.array([
+                    [0.00, 0.25, 0.08],
+                    [0.03, -0.04, 0.02],
+                    [-0.05, 0.10, -0.07],
+                ]),
+                stress=np.zeros(6),
+            )
             base = Sella(
                 atoms,
                 order=0,
@@ -2782,6 +2792,17 @@ class TestIndependentCellTrustRadii:
         opt._update_trust_radius(1e-3, step, 0.02)
 
         assert opt.delta == 0.02 * opt.sigma_dec
+
+    def test_rejected_internal_only_step_preserves_cell_radius(self):
+        opt = self._optimizer()
+        delta_cell0 = opt.delta_cell
+        step = np.zeros(opt.pes.dim)
+        step[0] = 0.02
+        step[opt.pes.n_coords:] = np.finfo(float).eps
+
+        opt._update_trust_radius(1e-3, step, 0.02)
+
+        assert opt.delta_cell == delta_cell0
 
 
 if __name__ == '__main__':
