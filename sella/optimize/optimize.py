@@ -15,6 +15,7 @@ from .restricted_step import get_restricted_step, MaxInternalStep, \
     RestrictedAtomicStep
 from sella.peswrapper import PES, InternalPES, CellInternalPES, CellCartesianPES
 from sella.internal import Internals, Constraints
+from sella._threads import configure_compute
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ class Sella(Optimizer):
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
         exact_geodesic: bool = None,
+        max_cpu_threads: Optional[int] = None,
         **kwargs
     ):
         """Initialize Sella optimizer.
@@ -121,7 +123,23 @@ class Sella(Optimizer):
             - 3: Refine full internal Hessian (2 * n_internal force calls, expensive!)
         save_hessian : str, optional
             Path to save the initial Hessian as .npy file for analysis.
+        max_cpu_threads : int, optional
+            Cap on CPU threads used by all CPU math (OpenBLAS/LAPACK + torch)
+            for this process. Sella is CPU-BLAS bound, so when running several
+            Sella processes on one machine (e.g. sharing a single GPU card),
+            leaving this unset lets every process grab all cores and
+            oversubscribe the CPU. Set it to about ``cpu_count // n_processes``
+            so the launcher can partition CPU resources. Applied at construction
+            and process-wide. None (default) leaves library defaults untouched.
+            For a launcher that wants to set this before building any Sella
+            object, call ``sella.configure_compute(max_cpu_threads=...)``
+            directly. GPU sharing is not handled here (CUDA exposes no runtime
+            GPU-thread cap); use CUDA MPS or the launcher.
         """
+        # Cap CPU threads first, before any heavy BLAS work (Hessian
+        # refinement, internal-coordinate setup) runs in initialize_pes.
+        configure_compute(max_cpu_threads=max_cpu_threads)
+
         if order == 0:
             default = _default_kwargs['minimum']
         else:
