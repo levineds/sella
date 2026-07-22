@@ -1,0 +1,82 @@
+[
+  {
+    "mol": "QQQAUG",
+    "n_atoms": 23,
+    "filename": "QQQAUG_23.cif",
+    "source_parquet": "QQQAUG.parquet",
+    "selection": "converged == True and n_atoms == n_atoms, sample(n=1, random_state=42)",
+    "source_converged_rows": 7500
+  },
+  {
+    "mol": "BISMEV",
+    "n_atoms": 40,
+    "filename": "BISMEV_40.cif",
+    "source_parquet": "BISMEV.parquet",
+    "selection": "converged == True and n_atoms == n_atoms, sample(n=1, random_state=42)",
+    "source_converged_rows": 35997
+  },
+  {
+    "mol": "BEDMIG",
+    "n_atoms": 60,
+    "filename": "BEDMIG_60.cif",
+    "source_parquet": "BEDMIG.parquet",
+    "selection": "converged == True and n_atoms == n_atoms, sample(n=1, random_state=42)",
+    "source_converged_rows": 37475
+  },
+  {
+    "mol": "BISMEV",
+    "n_atoms": 80,
+    "filename": "BISMEV_80.cif",
+    "source_parquet": "BISMEV.parquet",
+    "selection": "converged == True and n_atoms == n_atoms, sample(n=1, random_state=42)",
+    "source_converged_rows": 35637
+  },
+  {
+    "mol": "SUTHAZ",
+    "n_atoms": 100,
+    "filename": "SUTHAZ_100.cif",
+    "source_parquet": "SUTHAZ.parquet",
+    "selection": "converged == True and n_atoms == n_atoms, sample(n=1, random_state=42)",
+    "source_converged_rows": 36875
+  },
+  {
+    "mol": "AJEYAQ",
+    "n_atoms": 120,
+    "filename": "AJEYAQ_120.cif",
+    "source_parquet": "AJEYAQ.parquet",
+    "selection": "converged == True and n_atoms == n_atoms, sample(n=1, random_state=42)",
+    "source_converged_rows": 47338
+  },
+  {
+    "mol": "HXACAN",
+    "n_atoms": 160,
+    "filename": "HXACAN_160.cif",
+    "source_parquet": "HXACAN.parquet",
+    "selection": "converged == True and n_atoms == n_atoms, sample(n=1, random_state=42)",
+    "source_converged_rows": 13613
+  },
+  {
+    "mol": "YEXGEQ",
+    "n_atoms": 192,
+    "filename": "YEXGEQ_192.cif",
+    "source_parquet": "YEXGEQ.parquet",
+    "selection": "converged == True and n_atoms == n_atoms, sample(n=1, random_state=42)",
+    "source_converged_rows": 35085
+  },
+  {
+    "mol": "PAPTUX",
+    "n_atoms": 248,
+    "filename": "PAPTUX_248.cif",
+    "source_parquet": "PAPTUX.parquet",
+    "selection": "converged == True and n_atoms == n_atoms, sample(n=1, random_state=42)",
+    "source_converged_rows": 35135
+  },
+  {
+    "mol": "BEQGIN",
+    "n_atoms": 400,
+    "filename": "BEQGIN_400.cif",
+    "source_parquet": "BEQGIN.parquet",
+    "selection": "converged == True and n_atoms == n_atoms, sample(n=1, random_state=42)",
+    "source_converged_rows": 34732
+  }
+]

@@ -13,8 +13,13 @@ production job durations rather than only against a 15-step microbenchmark.
 
 The optional prewarm phase runs first to populate one-time per-machine caches
 such as JAX's persistent compilation cache and TorchInductor's disk cache.
+The 10 benchmark systems are packaged as CIFs under benchmarks/data/systems;
+pass --parquet-dir only if you want to resample from the original parquet data.
 
 Typical use:
+
+    # Fresh-machine setup helper:
+    bash benchmarks/setup_backend_bench_uv.sh
 
     source ~/fc_env/bin/activate
     python /home/levineds/sella/benchmarks/backend_startup_perstep.py \
@@ -38,12 +43,8 @@ import time
 from typing import Any
 
 
-DEFAULT_PARQUET_DIR = "/checkpoint/ocp/levineds/csp_parquets/tier2_parquet"
-DEFAULT_SNAPSHOT = (
-    "/home/levineds/.cache/fairchem/models--facebook--UMA/snapshots/"
-    "38529caa2c51a9a8a0d71f0b56b79ac33bc9eceb"
-)
-DEFAULT_CHECKPOINT = f"{DEFAULT_SNAPSHOT}/checkpoints/uma-s-1p1.pt"
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data" / "systems"
+DEFAULT_MODEL = "uma-s-1p1"
 DEFAULT_SYSTEMS = [
     ("QQQAUG", 23),
     ("BISMEV", 40),
@@ -194,8 +195,8 @@ def run_worker(args: argparse.Namespace, *, variant: str, path: Path,
         "--variant", variant,
         "--mol", mol,
         "--n-atoms", str(n_atoms),
-        "--parquet-dir", args.parquet_dir,
-        "--checkpoint", args.checkpoint,
+        "--data-dir", args.data_dir,
+        "--model", args.model,
         "--warmup-steps", str(args.warmup_steps),
         "--timed-steps", str(args.timed_steps),
         "--prewarm-steps", str(args.prewarm_steps),
@@ -203,6 +204,10 @@ def run_worker(args: argparse.Namespace, *, variant: str, path: Path,
         "--complete-fmax", str(args.complete_fmax),
         "--complete-max-steps", str(args.complete_max_steps),
     ]
+    if args.parquet_dir:
+        cmd.extend(["--parquet-dir", args.parquet_dir])
+    if args.checkpoint:
+        cmd.extend(["--checkpoint", args.checkpoint])
     result = subprocess.run(
         cmd,
         env=env,
@@ -354,26 +359,53 @@ def write_outputs(results: list[dict[str, Any]], args: argparse.Namespace) -> No
 def worker_main(args: argparse.Namespace) -> None:
     import gc
     import importlib
-    from io import StringIO
     import warnings
 
     warnings.filterwarnings("ignore")
 
-    import pandas as pd
     import torch
     from ase.io import read
     from fairchem.core import FAIRChemCalculator
-    from fairchem.core.calculate.pretrained_mlip import load_predict_unit
-
-    predictor = load_predict_unit(
-        args.checkpoint, "default", None, "cuda", None, None
+    from fairchem.core.calculate.pretrained_mlip import (
+        get_predict_unit,
+        load_predict_unit,
     )
-    df = pd.read_parquet(f"{args.parquet_dir}/{args.mol}.parquet")
-    conv = df[(df["converged"] == True) & (df["n_atoms"] == args.n_atoms)]
-    if len(conv) == 0:
-        raise RuntimeError(f"no rows for {args.mol}:{args.n_atoms}")
-    row = conv.sample(n=1, random_state=42).iloc[0]
-    atoms = read(StringIO(row["cif"]), format="cif")
+
+    if args.checkpoint:
+        predictor = load_predict_unit(
+            args.checkpoint, "default", None, "cuda", None, None
+        )
+        model_source = args.checkpoint
+    else:
+        predictor = get_predict_unit(
+            args.model, "default", None, "cuda"
+        )
+        model_source = args.model
+    if args.parquet_dir:
+        from io import StringIO
+
+        import pandas as pd
+
+        df = pd.read_parquet(
+            Path(args.parquet_dir) / f"{args.mol}.parquet"
+        )
+        conv = df[(df["converged"] == True) & (df["n_atoms"] == args.n_atoms)]
+        if len(conv) == 0:
+            raise RuntimeError(f"no rows for {args.mol}:{args.n_atoms}")
+        row = conv.sample(n=1, random_state=42).iloc[0]
+        atoms = read(StringIO(row["cif"]), format="cif")
+        system_source = str(
+            Path(args.parquet_dir) / f"{args.mol}.parquet"
+        )
+    else:
+        cif_path = (
+            Path(args.data_dir).expanduser()
+            / f"{args.mol}_{args.n_atoms}.cif"
+        )
+        if not cif_path.exists():
+            raise RuntimeError(f"missing packaged CIF: {cif_path}")
+        atoms = read(str(cif_path), format="cif")
+        system_source = str(cif_path)
     calc = FAIRChemCalculator(predictor, task_name="omc")
     atoms.calc = calc
     atoms.get_potential_energy()
@@ -395,6 +427,8 @@ def worker_main(args: argparse.Namespace) -> None:
             "n_atoms": args.n_atoms,
             "mode": "prewarm",
             "sella_file": sella_mod.__file__,
+            "system_source": system_source,
+            "model_source": model_source,
         }
         print("BENCH_JSON " + json.dumps(out, sort_keys=True), flush=True)
         return
@@ -429,10 +463,12 @@ def worker_main(args: argparse.Namespace) -> None:
             "complete_init_s": t_init - t_import,
             "complete_run_s": t_done - t_init,
             "sella_file": sella_mod.__file__,
+            "system_source": system_source,
+            "model_source": model_source,
         }
         print("BENCH_JSON " + json.dumps(out, sort_keys=True), flush=True)
 
-        del calc, dyn, predictor, atoms, df
+        del calc, dyn, predictor, atoms
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -479,10 +515,12 @@ def worker_main(args: argparse.Namespace) -> None:
         "timed_s": timed_s,
         "steps_completed": dyn.nsteps,
         "sella_file": sella_mod.__file__,
+        "system_source": system_source,
+        "model_source": model_source,
     }
     print("BENCH_JSON " + json.dumps(out, sort_keys=True), flush=True)
 
-    del calc, dyn, predictor, atoms, df
+    del calc, dyn, predictor, atoms
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -507,8 +545,30 @@ def main() -> None:
     parser.add_argument("--jax-ref", default="HEAD")
     parser.add_argument("--torch-path", default=str(repo_root()))
     parser.add_argument("--worktree-dir", default="/tmp")
-    parser.add_argument("--parquet-dir", default=DEFAULT_PARQUET_DIR)
-    parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
+    parser.add_argument(
+        "--data-dir",
+        default=str(DEFAULT_DATA_DIR),
+        help="Directory of packaged MOL_N.cif benchmark systems.",
+    )
+    parser.add_argument(
+        "--parquet-dir",
+        default=os.environ.get("SELLA_BENCH_PARQUET_DIR"),
+        help=(
+            "Optional parquet directory. When set, the worker samples the "
+            "same random_state=42 row from MOL.parquet instead of using "
+            "packaged CIFs."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("SELLA_FAIRCHEM_MODEL", DEFAULT_MODEL),
+        help="FairChem pretrained model name to download/cache.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=os.environ.get("SELLA_FAIRCHEM_CHECKPOINT"),
+        help="Optional local FairChem checkpoint path. Overrides --model.",
+    )
     parser.add_argument("--systems", default="all",
                         help="all, or comma-separated MOL:N_ATOMS entries")
     parser.add_argument("--variants", default=",".join(DEFAULT_VARIANTS))
