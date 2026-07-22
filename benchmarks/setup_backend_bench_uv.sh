@@ -212,21 +212,28 @@ sync_checkout() {
     fi
 }
 
-build_extensions() {
+prepare_checkout() {
     local label="$1"
     local dir="$2"
     local python_bin="$3"
 
-    echo "building Sella extensions for $label"
+    if PYTHONPATH="$dir" "$python_bin" -c 'import sella.eigensolvers'; then
+        echo "verified $label: $dir"
+        return
+    fi
+    if [[ ! -f "$dir/setup.py" ]]; then
+        echo "$label cannot be imported and has no setup.py: $dir" >&2
+        exit 1
+    fi
+
+    echo "building extensions required by $label"
     (
         cd "$dir"
         "$python_bin" setup.py build_ext --inplace
     )
     PYTHONPATH="$dir" "$python_bin" - <<'PY'
 import sella
-import sella.force_match
-import sella.utilities.blas
-import sella.utilities.math
+import sella.eigensolvers
 print(f"verified {sella.__file__}")
 PY
 }
@@ -347,8 +354,8 @@ fi
 prefetch_model "$PYTHON_BIN"
 
 if [[ "$BUILD_EXTENSIONS" -eq 1 ]]; then
-    build_extensions "JAX baseline" "$JAX_DIR" "$PYTHON_BIN"
-    build_extensions "PyTorch port" "$TORCH_DIR" "$PYTHON_BIN"
+    prepare_checkout "JAX baseline" "$JAX_DIR" "$PYTHON_BIN"
+    prepare_checkout "PyTorch port" "$TORCH_DIR" "$PYTHON_BIN"
 fi
 
 print_benchmark_command "$PYTHON_BIN"

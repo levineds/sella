@@ -115,10 +115,7 @@ def import_check(path: Path, env: dict[str, str]) -> bool:
         [
             sys.executable,
             "-c",
-            (
-                "import sella; import sella.force_match; "
-                "import sella.utilities.blas; import sella.utilities.math"
-            ),
+            "import sella; import sella.eigensolvers",
         ],
         env=check_env,
         check=False,
@@ -126,13 +123,13 @@ def import_check(path: Path, env: dict[str, str]) -> bool:
     return result.returncode == 0
 
 
-def ensure_extensions(path: Path, env: dict[str, str]) -> None:
+def ensure_importable(path: Path, env: dict[str, str]) -> None:
     if import_check(path, env):
         return
     setup_py = path / "setup.py"
     if not setup_py.exists():
-        raise RuntimeError(f"{path} cannot import extensions and has no setup.py")
-    print(f"building Cython extensions in {path}", flush=True)
+        raise RuntimeError(f"cannot import Sella from {path}")
+    print(f"building extensions required by {path}", flush=True)
     result = run(
         [sys.executable, "setup.py", "build_ext", "--inplace"],
         cwd=path,
@@ -142,9 +139,9 @@ def ensure_extensions(path: Path, env: dict[str, str]) -> None:
     if result.returncode != 0:
         print(result.stdout)
         print(result.stderr, file=sys.stderr)
-        raise RuntimeError(f"extension build failed in {path}")
+        raise RuntimeError(f"project build failed in {path}")
     if not import_check(path, env):
-        raise RuntimeError(f"{path} still cannot import extensions after build")
+        raise RuntimeError(f"cannot import Sella from {path} after build")
 
 
 def short_ref(ref: str) -> str:
@@ -155,7 +152,7 @@ def short_ref(ref: str) -> str:
 def ensure_jax_worktree(args: argparse.Namespace, env: dict[str, str]) -> Path:
     if args.jax_path:
         path = Path(args.jax_path).expanduser().resolve()
-        ensure_extensions(path, env)
+        ensure_importable(path, env)
         return path
 
     ref = args.jax_ref
@@ -171,7 +168,7 @@ def ensure_jax_worktree(args: argparse.Namespace, env: dict[str, str]) -> Path:
             print(result.stdout)
             print(result.stderr, file=sys.stderr)
             raise RuntimeError("failed to create JAX baseline worktree")
-    ensure_extensions(path, env)
+    ensure_importable(path, env)
     return path.resolve()
 
 
@@ -592,7 +589,7 @@ def main() -> None:
     env = os.environ.copy()
     torch_path = Path(args.torch_path).expanduser().resolve()
     jax_path = ensure_jax_worktree(args, env)
-    ensure_extensions(torch_path, env)
+    ensure_importable(torch_path, env)
 
     systems = parse_systems(args.systems)
     variants = parse_variants(args.variants)
