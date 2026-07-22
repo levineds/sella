@@ -17,7 +17,6 @@ classifiers = [
   "Natural Language :: English",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3.9",
-  "Programming Language :: Cython",
   "Topic :: Scientific/Engineering :: Chemistry",
   "Topic :: Scientific/Engineering :: Mathematics",
   "Topic :: Scientific/Engineering :: Physics",
@@ -34,10 +33,6 @@ dependencies = [
 requires = [
   "setuptools >= 74.1.0, < 82",
   "setuptools-scm >= 8.0",
-  "wheel",
-  "cython >= 0.29.23",
-  "numpy >= 1.14.0",
-  "scipy >= 1.1.0, < 1.15",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -48,13 +43,6 @@ test = ["pytest"]
 where = ["."]
 include = ["sella*"]
 
-#[tool.setuptools]
-#ext-modules = [
-#  {name = "sella.force_match", sources = ["sella/force_match.pyx"]},
-#  {name = "sella.utilities.blas", sources = ["sella/utilities/blas.pyx"]},
-#  {name = "sella.utilities.math", sources = ["sella/utilities/math.pyx"]},
-#]
-
 [tool.setuptools_scm]
 # Version will be determined from git tags
 # Fallback version for when git is not available (e.g., in sdist)
@@ -63,21 +51,6 @@ fallback_version = "0.0.0"
 [tool.uv.extra-build-dependencies]
 sella = ["setuptools"]
 
-[tool.cibuildwheel]
-skip = [
-  # skip pypy
-  "pp*",
-  # skip 32-bit archs
-  "*-win32",
-  "*-manylinux_i686",
-  # skip musllinux
-  "*-musllinux*",
-]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
-
-[tool.cython]
-compile_time_env = {}
-compiler_directives = { language_level = 3, wraparound = false, cdivision = true }
