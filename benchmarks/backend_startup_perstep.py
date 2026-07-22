@@ -60,11 +60,10 @@ DEFAULT_SYSTEMS = [
 VARIANT_ENVS = {
     "jax": {},
     "torch_eager": {"SELLA_TORCH_COMPILE": "0"},
-    "torch_hvp": {"SELLA_TORCH_COMPILE": "hvp"},
     "torch_compile": {"SELLA_TORCH_COMPILE": "all"},
 }
-DEFAULT_VARIANTS = ["jax", "torch_eager", "torch_hvp", "torch_compile"]
-PREWARM_VARIANTS = {"jax", "torch_hvp", "torch_compile"}
+DEFAULT_VARIANTS = ["jax", "torch_eager", "torch_compile"]
+PREWARM_VARIANTS = {"jax", "torch_compile"}
 
 
 def repo_root() -> Path:
