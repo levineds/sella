@@ -4,6 +4,7 @@ from typing import (
 )
 from itertools import product, combinations, permutations
 from functools import partialmethod
+import os
 import warnings
 
 from scipy import sparse
@@ -17,13 +18,111 @@ from ase.constraints import (
     FixConstraint, FixAtoms, FixCom, FixBondLengths, FixCartesian, FixInternals
 )
 
-import jax.numpy as jnp
-from jax import jit, grad, jacfwd, jacrev, vmap, jvp, device_get
+import torch
+from torch.func import (
+    grad as torch_grad,
+    jacfwd as torch_jacfwd,
+    jacrev as torch_jacrev,
+    jvp as torch_jvp,
+    vmap as torch_vmap,
+)
 
 from sella.linalg import (
     SparseInternalJacobian, SparseInternalHessian, SparseInternalHessians,
     SparseInternalHessiansSkeleton
 )
+
+
+_TORCH_DTYPE = torch.float64
+_TORCH_DEVICE = torch.device('cpu')
+# torch.compile improves repeated batched autodiff kernels, but its per-process
+# startup cost dominates typical short optimizer runs. Keep it opt-in.
+_TORCH_COMPILE_MODE = os.environ.get('SELLA_TORCH_COMPILE', '0').lower()
+_TORCH_COMPILE_ALL = _TORCH_COMPILE_MODE in {'1', 'true', 'yes', 'on', 'all'}
+_TORCH_COMPILE_HVP = (
+    _TORCH_COMPILE_ALL or _TORCH_COMPILE_MODE in {'hvp', 'hvp-only'}
+)
+if _TORCH_COMPILE_ALL or _TORCH_COMPILE_HVP:
+    try:
+        import torch._dynamo as _torch_dynamo
+        _torch_compile_cache_size = int(
+            os.environ.get('SELLA_TORCH_COMPILE_CACHE_SIZE', '64')
+        )
+        _torch_dynamo.config.cache_size_limit = max(
+            _torch_dynamo.config.cache_size_limit, _torch_compile_cache_size
+        )
+        _torch_dynamo.config.recompile_limit = max(
+            _torch_dynamo.config.recompile_limit, _torch_compile_cache_size
+        )
+    except Exception:
+        pass
+
+
+def _as_torch(value):
+    if isinstance(value, torch.Tensor):
+        if value.dtype != _TORCH_DTYPE or value.device != _TORCH_DEVICE:
+            return value.to(dtype=_TORCH_DTYPE, device=_TORCH_DEVICE)
+        return value
+    if isinstance(value, np.ndarray):
+        return torch.as_tensor(value, dtype=_TORCH_DTYPE, device=_TORCH_DEVICE)
+    return value
+
+
+def _torch_args(args, kwargs):
+    return (
+        tuple(_as_torch(arg) for arg in args),
+        {key: _as_torch(val) for key, val in kwargs.items()},
+    )
+
+
+def _torch_function(func):
+    def wrapped(*args, **kwargs):
+        args, kwargs = _torch_args(args, kwargs)
+        return func(*args, **kwargs)
+    return wrapped
+
+
+class _TorchCompileFallback:
+    def __init__(self, func, enabled):
+        self.eager = func
+        self.compiled = None
+        self.disabled = not enabled
+        if not self.disabled and hasattr(torch, 'compile'):
+            try:
+                self.compiled = torch.compile(
+                    func, fullgraph=True, dynamic=False
+                )
+            except Exception as exc:
+                self.disabled = True
+                warnings.warn(
+                    'torch.compile setup failed; using eager torch: '
+                    f'{str(exc).splitlines()[0]}',
+                    RuntimeWarning,
+                )
+
+    def __call__(self, *args, **kwargs):
+        if self.disabled or self.compiled is None:
+            return self.eager(*args, **kwargs)
+        try:
+            return self.compiled(*args, **kwargs)
+        except Exception as exc:
+            self.disabled = True
+            warnings.warn(
+                'torch.compile failed; using eager torch: '
+                f'{str(exc).splitlines()[0]}',
+                RuntimeWarning,
+            )
+            return self.eager(*args, **kwargs)
+
+
+def _compiled_torch_function(func, enabled):
+    return _torch_function(_TorchCompileFallback(func, enabled=enabled))
+
+
+def _to_numpy(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
 
 
 # =============================================================================
@@ -69,91 +168,141 @@ class _DisjointSet:
 
 
 # =============================================================================
-# Vectorized (batched) internal coordinate functions using jax.vmap
+# Vectorized (batched) internal coordinate functions using torch.vmap
 # =============================================================================
 # These compute gradients/hessians for ALL coordinates of a given type at once,
-# avoiding Python loop overhead. JAX's vmap automatically vectorizes over the
+# avoiding Python loop overhead. PyTorch's vmap automatically vectorizes over the
 # batch dimension, providing significant speedup for coordinate calculations.
 # =============================================================================
 
-def _bond_value(pos: jnp.ndarray, tvec: jnp.ndarray) -> float:
+def _bond_value(pos: torch.Tensor, tvec: torch.Tensor) -> torch.Tensor:
     """Bond length: pos shape (2, 3), tvec shape (1, 3)"""
-    return jnp.linalg.norm(pos[1] - pos[0] + tvec[0])
+    return torch.linalg.norm(pos[1] - pos[0] + tvec[0])
 
 
-def _angle_value(pos: jnp.ndarray, tvec: jnp.ndarray) -> float:
+def _angle_value(pos: torch.Tensor, tvec: torch.Tensor) -> torch.Tensor:
     """Angle value: pos shape (3, 3), tvec shape (2, 3)"""
     dx1 = -(pos[1] - pos[0] + tvec[0])
     dx2 = pos[2] - pos[1] + tvec[1]
-    cos_angle = dx1 @ dx2 / (jnp.linalg.norm(dx1) * jnp.linalg.norm(dx2))
+    cos_angle = dx1 @ dx2 / (torch.linalg.norm(dx1) * torch.linalg.norm(dx2))
     # Clamp to avoid NaN from arccos
-    cos_angle = jnp.clip(cos_angle, -1.0, 1.0)
-    return jnp.arccos(cos_angle)
+    cos_angle = torch.clamp(cos_angle, -1.0, 1.0)
+    return torch.arccos(cos_angle)
 
 
-def _dihedral_value(pos: jnp.ndarray, tvec: jnp.ndarray) -> float:
+def _dihedral_value(pos: torch.Tensor, tvec: torch.Tensor) -> torch.Tensor:
     """Dihedral angle: pos shape (4, 3), tvec shape (3, 3)"""
     dx1 = pos[1] - pos[0] + tvec[0]
     dx2 = pos[2] - pos[1] + tvec[1]
     dx3 = pos[3] - pos[2] + tvec[2]
-    numer = dx2 @ jnp.cross(jnp.cross(dx1, dx2), jnp.cross(dx2, dx3))
-    denom = jnp.linalg.norm(dx2) * jnp.cross(dx1, dx2) @ jnp.cross(dx2, dx3)
-    return jnp.arctan2(numer, denom)
+    cross12 = torch.cross(dx1, dx2, dim=0)
+    cross23 = torch.cross(dx2, dx3, dim=0)
+    numer = dx2 @ torch.cross(cross12, cross23, dim=0)
+    denom = torch.linalg.norm(dx2) * (cross12 @ cross23)
+    return torch.atan2(numer, denom)
 
 
 # Batched gradient functions: input shapes (n_coords, n_atoms, 3), (n_coords, n_vecs, 3)
 # Output shapes: (n_coords, n_atoms, 3)
-_bond_grad_batched = jit(vmap(grad(_bond_value, argnums=0), in_axes=(0, 0)))
-_angle_grad_batched = jit(vmap(grad(_angle_value, argnums=0), in_axes=(0, 0)))
-_dihedral_grad_batched = jit(vmap(grad(_dihedral_value, argnums=0), in_axes=(0, 0)))
+_bond_grad_batched = _compiled_torch_function(
+    torch_vmap(torch_grad(_bond_value, argnums=0), in_dims=(0, 0)),
+    enabled=_TORCH_COMPILE_ALL,
+)
+_angle_grad_batched = _compiled_torch_function(
+    torch_vmap(torch_grad(_angle_value, argnums=0), in_dims=(0, 0)),
+    enabled=_TORCH_COMPILE_ALL,
+)
+_dihedral_grad_batched = _compiled_torch_function(
+    torch_vmap(torch_grad(_dihedral_value, argnums=0), in_dims=(0, 0)),
+    enabled=_TORCH_COMPILE_ALL,
+)
 
 # Batched value functions
-_bond_value_batched = jit(vmap(_bond_value, in_axes=(0, 0)))
-_angle_value_batched = jit(vmap(_angle_value, in_axes=(0, 0)))
-_dihedral_value_batched = jit(vmap(_dihedral_value, in_axes=(0, 0)))
+_bond_value_batched = _compiled_torch_function(
+    torch_vmap(_bond_value, in_dims=(0, 0)),
+    enabled=_TORCH_COMPILE_ALL,
+)
+_angle_value_batched = _compiled_torch_function(
+    torch_vmap(_angle_value, in_dims=(0, 0)),
+    enabled=_TORCH_COMPILE_ALL,
+)
+_dihedral_value_batched = _compiled_torch_function(
+    torch_vmap(_dihedral_value, in_dims=(0, 0)),
+    enabled=_TORCH_COMPILE_ALL,
+)
 
 # Batched hessian functions: output shapes (n_coords, n_atoms, 3, n_atoms, 3)
-_bond_hess_batched = jit(vmap(jacfwd(grad(_bond_value, argnums=0), argnums=0), in_axes=(0, 0)))
-_angle_hess_batched = jit(vmap(jacfwd(grad(_angle_value, argnums=0), argnums=0), in_axes=(0, 0)))
-_dihedral_hess_batched = jit(vmap(jacfwd(grad(_dihedral_value, argnums=0), argnums=0), in_axes=(0, 0)))
+_bond_hess_batched = _torch_function(torch_vmap(
+    torch_jacfwd(torch_grad(_bond_value, argnums=0), argnums=0),
+    in_dims=(0, 0),
+))
+_angle_hess_batched = _torch_function(torch_vmap(
+    torch_jacfwd(torch_grad(_angle_value, argnums=0), argnums=0),
+    in_dims=(0, 0),
+))
+_dihedral_hess_batched = _torch_function(torch_vmap(
+    torch_jacfwd(torch_grad(_dihedral_value, argnums=0), argnums=0),
+    in_dims=(0, 0),
+))
 
 # =============================================================================
 # Hessian-vector product (HVP) functions using forward-over-reverse mode
 # =============================================================================
 # These compute H @ v directly without materializing the full Hessian matrix.
-# Uses jvp(grad(f), x, v) which is O(n) instead of O(n²) for forming full Hessian.
+# Uses jvp(grad(f), x, v), avoiding the cost of forming full Hessians.
 # =============================================================================
 
-def _bond_hvp_single(pos: jnp.ndarray, tvec: jnp.ndarray, tangent: jnp.ndarray) -> jnp.ndarray:
+def _bond_hvp_single(
+    pos: torch.Tensor, tvec: torch.Tensor, tangent: torch.Tensor
+) -> torch.Tensor:
     """Compute Hessian @ tangent for a single bond without forming the Hessian."""
     primals = (pos, tvec)
-    tangents = (tangent, jnp.zeros_like(tvec))
-    _, hvp_result = jvp(grad(_bond_value, argnums=0), primals, tangents)
+    tangents = (tangent, torch.zeros_like(tvec))
+    _, hvp_result = torch_jvp(
+        torch_grad(_bond_value, argnums=0), primals, tangents
+    )
     return hvp_result
 
 
-def _angle_hvp_single(pos: jnp.ndarray, tvec: jnp.ndarray, tangent: jnp.ndarray) -> jnp.ndarray:
+def _angle_hvp_single(
+    pos: torch.Tensor, tvec: torch.Tensor, tangent: torch.Tensor
+) -> torch.Tensor:
     """Compute Hessian @ tangent for a single angle without forming the Hessian."""
     primals = (pos, tvec)
-    tangents = (tangent, jnp.zeros_like(tvec))
-    _, hvp_result = jvp(grad(_angle_value, argnums=0), primals, tangents)
+    tangents = (tangent, torch.zeros_like(tvec))
+    _, hvp_result = torch_jvp(
+        torch_grad(_angle_value, argnums=0), primals, tangents
+    )
     return hvp_result
 
 
-def _dihedral_hvp_single(pos: jnp.ndarray, tvec: jnp.ndarray, tangent: jnp.ndarray) -> jnp.ndarray:
+def _dihedral_hvp_single(
+    pos: torch.Tensor, tvec: torch.Tensor, tangent: torch.Tensor
+) -> torch.Tensor:
     """Compute Hessian @ tangent for a single dihedral without forming the Hessian."""
     primals = (pos, tvec)
-    tangents = (tangent, jnp.zeros_like(tvec))
-    _, hvp_result = jvp(grad(_dihedral_value, argnums=0), primals, tangents)
+    tangents = (tangent, torch.zeros_like(tvec))
+    _, hvp_result = torch_jvp(
+        torch_grad(_dihedral_value, argnums=0), primals, tangents
+    )
     return hvp_result
 
 
 # Batched HVP functions: compute H @ v for all coords at once
 # Input shapes: pos (n_coords, n_atoms, 3), tvec (n_coords, n_vecs, 3), tangent (n_coords, n_atoms, 3)
 # Output shapes: (n_coords, n_atoms, 3)
-_bond_hvp_batched = jit(vmap(_bond_hvp_single, in_axes=(0, 0, 0)))
-_angle_hvp_batched = jit(vmap(_angle_hvp_single, in_axes=(0, 0, 0)))
-_dihedral_hvp_batched = jit(vmap(_dihedral_hvp_single, in_axes=(0, 0, 0)))
+_bond_hvp_batched = _compiled_torch_function(
+    torch_vmap(_bond_hvp_single, in_dims=(0, 0, 0)),
+    enabled=_TORCH_COMPILE_HVP,
+)
+_angle_hvp_batched = _compiled_torch_function(
+    torch_vmap(_angle_hvp_single, in_dims=(0, 0, 0)),
+    enabled=_TORCH_COMPILE_HVP,
+)
+_dihedral_hvp_batched = _compiled_torch_function(
+    torch_vmap(_dihedral_hvp_single, in_dims=(0, 0, 0)),
+    enabled=_TORCH_COMPILE_HVP,
+)
 
 
 # =============================================================================
@@ -166,52 +315,71 @@ _dihedral_hvp_batched = jit(vmap(_dihedral_hvp_single, in_axes=(0, 0, 0)))
 # Since tvec = ncvec @ cell, we have d(tvec)/d(cell) = ncvec (Kronecker structure)
 # =============================================================================
 
-def _bond_with_cell(pos: jnp.ndarray, ncvec: jnp.ndarray, cell: jnp.ndarray) -> float:
+def _bond_with_cell(
+    pos: torch.Tensor, ncvec: torch.Tensor, cell: torch.Tensor
+) -> torch.Tensor:
     """Bond length with cell as explicit parameter for autodiff."""
     tvec = ncvec @ cell  # (1, 3) @ (3, 3) -> (1, 3)
-    return jnp.linalg.norm(pos[1] - pos[0] + tvec[0])
+    return torch.linalg.norm(pos[1] - pos[0] + tvec[0])
 
 
-def _angle_with_cell(pos: jnp.ndarray, ncvec: jnp.ndarray, cell: jnp.ndarray) -> float:
+def _angle_with_cell(
+    pos: torch.Tensor, ncvec: torch.Tensor, cell: torch.Tensor
+) -> torch.Tensor:
     """Angle with cell as explicit parameter for autodiff."""
     tvec = ncvec @ cell  # (2, 3) @ (3, 3) -> (2, 3)
     dx1 = -(pos[1] - pos[0] + tvec[0])
     dx2 = pos[2] - pos[1] + tvec[1]
-    cos_angle = dx1 @ dx2 / (jnp.linalg.norm(dx1) * jnp.linalg.norm(dx2))
-    cos_angle = jnp.clip(cos_angle, -1.0, 1.0)
-    return jnp.arccos(cos_angle)
+    cos_angle = dx1 @ dx2 / (torch.linalg.norm(dx1) * torch.linalg.norm(dx2))
+    cos_angle = torch.clamp(cos_angle, -1.0, 1.0)
+    return torch.arccos(cos_angle)
 
 
-def _dihedral_with_cell(pos: jnp.ndarray, ncvec: jnp.ndarray, cell: jnp.ndarray) -> float:
+def _dihedral_with_cell(
+    pos: torch.Tensor, ncvec: torch.Tensor, cell: torch.Tensor
+) -> torch.Tensor:
     """Dihedral angle with cell as explicit parameter for autodiff."""
     tvec = ncvec @ cell  # (3, 3) @ (3, 3) -> (3, 3)
     dx1 = pos[1] - pos[0] + tvec[0]
     dx2 = pos[2] - pos[1] + tvec[1]
     dx3 = pos[3] - pos[2] + tvec[2]
-    numer = dx2 @ jnp.cross(jnp.cross(dx1, dx2), jnp.cross(dx2, dx3))
-    denom = jnp.linalg.norm(dx2) * jnp.cross(dx1, dx2) @ jnp.cross(dx2, dx3)
-    return jnp.arctan2(numer, denom)
+    cross12 = torch.cross(dx1, dx2, dim=0)
+    cross23 = torch.cross(dx2, dx3, dim=0)
+    numer = dx2 @ torch.cross(cross12, cross23, dim=0)
+    denom = torch.linalg.norm(dx2) * (cross12 @ cross23)
+    return torch.atan2(numer, denom)
 
 
 # Single-coordinate cell gradients: output shape (3, 3) for d(coord)/d(cell)
-_bond_cell_grad_single = jit(grad(_bond_with_cell, argnums=2))
-_angle_cell_grad_single = jit(grad(_angle_with_cell, argnums=2))
-_dihedral_cell_grad_single = jit(grad(_dihedral_with_cell, argnums=2))
+_bond_cell_grad_single_torch = torch_grad(_bond_with_cell, argnums=2)
+_angle_cell_grad_single_torch = torch_grad(_angle_with_cell, argnums=2)
+_dihedral_cell_grad_single_torch = torch_grad(_dihedral_with_cell, argnums=2)
+_bond_cell_grad_single = _torch_function(_bond_cell_grad_single_torch)
+_angle_cell_grad_single = _torch_function(_angle_cell_grad_single_torch)
+_dihedral_cell_grad_single = _torch_function(_dihedral_cell_grad_single_torch)
 
 # Batched cell gradients: input (n_coords, n_atoms, 3), (n_coords, n_vecs, 3), (3, 3)
 # Output: (n_coords, 3, 3)
 # Note: cell is NOT batched (same cell for all coords), so in_axes=(0, 0, None)
-_bond_cell_grad_batched = jit(vmap(_bond_cell_grad_single, in_axes=(0, 0, None)))
-_angle_cell_grad_batched = jit(vmap(_angle_cell_grad_single, in_axes=(0, 0, None)))
-_dihedral_cell_grad_batched = jit(vmap(_dihedral_cell_grad_single, in_axes=(0, 0, None)))
+_bond_cell_grad_batched = _compiled_torch_function(
+    torch_vmap(_bond_cell_grad_single_torch, in_dims=(0, 0, None)),
+    enabled=_TORCH_COMPILE_ALL,
+)
+_angle_cell_grad_batched = _compiled_torch_function(
+    torch_vmap(_angle_cell_grad_single_torch, in_dims=(0, 0, None)),
+    enabled=_TORCH_COMPILE_ALL,
+)
+_dihedral_cell_grad_batched = _compiled_torch_function(
+    torch_vmap(_dihedral_cell_grad_single_torch, in_dims=(0, 0, None)),
+    enabled=_TORCH_COMPILE_ALL,
+)
 
 
 # =============================================================================
 # Block size for GPU/SIMD efficiency
 # =============================================================================
 # Padding arrays to multiples of BLOCK_SIZE improves GPU performance through
-# better warp-level parallelism and memory coalescing. Also reduces JAX JIT
-# recompilation when array sizes change.
+# better cache locality and stable PyTorch vmap shapes when array sizes change.
 # =============================================================================
 BLOCK_SIZE = 64
 
@@ -297,15 +465,17 @@ class DuplicateConstraintError(DuplicateInternalError):
 
 
 def _gradient(
-    func: Callable[[jnp.ndarray, jnp.ndarray, jnp.ndarray], float]
-) -> Callable[[jnp.ndarray, jnp.ndarray, jnp.ndarray], jnp.ndarray]:
-    return jit(grad(func, argnums=0))
+    func: Callable[..., torch.Tensor]
+) -> Callable[..., torch.Tensor]:
+    return _torch_function(torch_grad(func, argnums=0))
 
 
 def _hessian(
-    func: Callable[[jnp.ndarray, jnp.ndarray, jnp.ndarray], float]
-) -> Callable[[jnp.ndarray, jnp.ndarray, jnp.ndarray], jnp.ndarray]:
-    return jit(jacfwd(jacrev(func, argnums=0), argnums=0))
+    func: Callable[..., torch.Tensor]
+) -> Callable[..., torch.Tensor]:
+    return _torch_function(
+        torch_jacfwd(torch_jacrev(func, argnums=0), argnums=0)
+    )
 
 
 class Coordinate:
@@ -358,15 +528,15 @@ class Coordinate:
         return new
 
     @staticmethod
-    def _eval0(pos: jnp.ndarray, **kwargs) -> float:
+    def _eval0(pos: torch.Tensor, **kwargs) -> torch.Tensor:
         raise NotImplementedError
 
     @staticmethod
-    def _eval1(pos: jnp.ndarray, **kwargs) -> jnp.ndarray:
+    def _eval1(pos: torch.Tensor, **kwargs) -> torch.Tensor:
         raise NotImplementedError
 
     @staticmethod
-    def _eval2(pos: jnp.ndarray, **kwargs) -> jnp.ndarray:
+    def _eval2(pos: torch.Tensor, **kwargs) -> torch.Tensor:
         raise NotImplementedError
 
     def calc(self, atoms: Atoms) -> float:
@@ -375,12 +545,12 @@ class Coordinate:
         ))
 
     def calc_gradient(self, atoms: Atoms) -> np.ndarray:
-        return np.array(self._eval1(
+        return _to_numpy(self._eval1(
             atoms.positions[self.indices], **self.kwargs
         ))
 
-    def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
-        return np.array(self._eval2(
+    def calc_hessian(self, atoms: Atoms) -> np.ndarray:
+        return _to_numpy(self._eval2(
             atoms.positions[self.indices], **self.kwargs
         ))
 
@@ -518,44 +688,44 @@ class Internal(Coordinate):
 
     @staticmethod
     def _eval0(
-        pos: jnp.ndarray, tvecs: jnp.ndarray
-    ) -> float:
+        pos: torch.Tensor, tvecs: torch.Tensor
+    ) -> torch.Tensor:
         raise NotImplementedError
 
     @staticmethod
     def _eval1(
-        pos: jnp.ndarray, tvecs: jnp.ndarray
-    ) -> jnp.ndarray:
+        pos: torch.Tensor, tvecs: torch.Tensor
+    ) -> torch.Tensor:
         raise NotImplementedError
 
     @staticmethod
     def _eval2(
-        pos: jnp.ndarray, tvecs: jnp.ndarray
-    ) -> jnp.ndarray:
+        pos: torch.Tensor, tvecs: torch.Tensor
+    ) -> torch.Tensor:
         raise NotImplementedError
 
     def calc(self, atoms: Atoms) -> float:
-        tvecs = jnp.asarray(
+        tvecs = np.asarray(
             self.kwargs['ncvecs'] @ atoms.cell, dtype=np.float64
         )
         return float(self._eval0(atoms.positions[self.indices], tvecs))
 
     def calc_gradient(self, atoms: Atoms) -> np.ndarray:
-        tvecs = jnp.asarray(
+        tvecs = np.asarray(
             self.kwargs['ncvecs'] @ atoms.cell, dtype=np.float64
         )
-        return np.array(self._eval1(atoms.positions[self.indices], tvecs))
+        return _to_numpy(self._eval1(atoms.positions[self.indices], tvecs))
 
-    def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
-        tvecs = jnp.asarray(
+    def calc_hessian(self, atoms: Atoms) -> np.ndarray:
+        tvecs = np.asarray(
             self.kwargs['ncvecs'] @ atoms.cell, dtype=np.float64
         )
-        return np.array(self._eval2(atoms.positions[self.indices], tvecs))
+        return _to_numpy(self._eval2(atoms.positions[self.indices], tvecs))
 
     @staticmethod
     def _eval_cell_grad(
-        pos: jnp.ndarray, ncvecs: jnp.ndarray, cell: jnp.ndarray
-    ) -> jnp.ndarray:
+        pos: torch.Tensor, ncvecs: torch.Tensor, cell: torch.Tensor
+    ) -> torch.Tensor:
         """Compute gradient of coordinate with respect to cell matrix.
 
         Must be overridden in subclasses (Bond, Angle, Dihedral).
@@ -569,19 +739,19 @@ class Internal(Coordinate):
         Returns:
             np.ndarray: Shape (3, 3) array of d(coord)/d(cell[i,j])
         """
-        ncvecs = jnp.asarray(self.kwargs['ncvecs'], dtype=np.float64)
-        cell = jnp.asarray(
+        ncvecs = np.asarray(self.kwargs['ncvecs'], dtype=np.float64)
+        cell = np.asarray(
             atoms.cell.array,
             dtype=np.float64
         )
-        pos = jnp.asarray(atoms.positions[self.indices], dtype=np.float64)
-        return np.array(self._eval_cell_grad(pos, ncvecs, cell))
+        pos = np.asarray(atoms.positions[self.indices], dtype=np.float64)
+        return _to_numpy(self._eval_cell_grad(pos, ncvecs, cell))
 
 
 def _translation(
-    pos: jnp.ndarray,
+    pos: torch.Tensor,
     dim: int,
-) -> float:
+) -> torch.Tensor:
     return pos[:, dim].mean()
 
 
@@ -603,12 +773,12 @@ class Translation(Coordinate):
             return False
         return True
 
-    _eval0 = staticmethod(jit(_translation))
+    _eval0 = staticmethod(_torch_function(_translation))
     _eval1 = staticmethod(_gradient(_translation))
     _eval2 = staticmethod(_hessian(_translation))
 
 
-# Nominally, jax.numpy.linalg.eigh supports auto-differentiation,
+# Nominally, autodiff through eigh is supported by the backend,
 # but if any of the eigenvalues are degenerate, the derivatives
 # of *all* eigenvectors will be NaN. Worryingly, this seems to be
 # the case when the molecule in question is sufficiently high-symmetry
@@ -639,7 +809,7 @@ def _rotation_hessian_np(pos, axis, refpos, q_stable=None):
 
     Uses an analytic eigenvector second derivative that handles degenerate
     eigenvalues (linear molecules) via the Moore-Penrose pseudoinverse,
-    avoiding the NaN that JAX autodiff produces in that case.
+    avoiding the NaN that direct autodiff through eigensolvers produces there.
 
     Parameters
     ----------
@@ -1548,7 +1718,7 @@ class Rotation(Coordinate):
         jac = _rotation_3axis_jacobian_np(pos, refpos, q)
         return jac[self.kwargs['axis']]
 
-    def calc_hessian(self, atoms: Atoms) -> jnp.ndarray:
+    def calc_hessian(self, atoms: Atoms) -> np.ndarray:
         pos = np.asarray(atoms.positions[self.indices], dtype=np.float64)
         q = self._stabilized_quaternion(pos)
         return _rotation_hessian_np(
@@ -1560,10 +1730,10 @@ class Rotation(Coordinate):
 
 
 def _displacement(
-    pos: jnp.ndarray,
-    refpos: jnp.ndarray,
-    W: jnp.ndarray
-) -> float:
+    pos: torch.Tensor,
+    refpos: torch.Tensor,
+    W: torch.Tensor
+) -> torch.Tensor:
     dx = (pos - refpos).ravel()
     return dx @ W @ dx
 
@@ -1590,23 +1760,23 @@ class Displacement(Coordinate):
             and np.allclose(self.kwargs['W'], other.kwargs['W'])
         )
 
-    _eval0 = staticmethod(jit(_displacement))
-    _eval1 = staticmethod(jit(_gradient(_displacement)))
-    _eval2 = staticmethod(jit(_hessian(_displacement)))
+    _eval0 = staticmethod(_torch_function(_displacement))
+    _eval1 = staticmethod(_gradient(_displacement))
+    _eval2 = staticmethod(_hessian(_displacement))
 
 
 def _bond(
-    pos: jnp.ndarray,
-    tvecs: jnp.ndarray
-) -> float:
-    return jnp.linalg.norm(
+    pos: torch.Tensor,
+    tvecs: torch.Tensor
+) -> torch.Tensor:
+    return torch.linalg.norm(
         pos[1] - pos[0] + tvecs[0]
     )
 
 
 class Bond(Internal):
     nindices = 2
-    _eval0 = staticmethod(jit(_bond))
+    _eval0 = staticmethod(_torch_function(_bond))
     _eval1 = staticmethod(_gradient(_bond))
     _eval2 = staticmethod(_hessian(_bond))
     _eval_cell_grad = staticmethod(_bond_cell_grad_single)
@@ -1620,40 +1790,42 @@ class Bond(Internal):
 
 
 def _angle(
-    pos: jnp.ndarray,
-    tvecs: jnp.ndarray
-) -> float:
+    pos: torch.Tensor,
+    tvecs: torch.Tensor
+) -> torch.Tensor:
     dx1 = -(pos[1] - pos[0] + tvecs[0])
     dx2 = pos[2] - pos[1] + tvecs[1]
-    cos_angle = dx1 @ dx2 / (jnp.linalg.norm(dx1) * jnp.linalg.norm(dx2))
+    cos_angle = dx1 @ dx2 / (torch.linalg.norm(dx1) * torch.linalg.norm(dx2))
     # Clamp to avoid NaN from arccos due to floating-point errors
-    cos_angle = jnp.clip(cos_angle, -1.0, 1.0)
-    return jnp.arccos(cos_angle)
+    cos_angle = torch.clamp(cos_angle, -1.0, 1.0)
+    return torch.arccos(cos_angle)
 
 
 class Angle(Internal):
     nindices = 3
-    _eval0 = staticmethod(jit(_angle))
+    _eval0 = staticmethod(_torch_function(_angle))
     _eval1 = staticmethod(_gradient(_angle))
     _eval2 = staticmethod(_hessian(_angle))
     _eval_cell_grad = staticmethod(_angle_cell_grad_single)
 
 
 def _dihedral(
-    pos: jnp.ndarray,
-    tvecs: jnp.ndarray
-) -> float:
+    pos: torch.Tensor,
+    tvecs: torch.Tensor
+) -> torch.Tensor:
     dx1 = pos[1] - pos[0] + tvecs[0]
     dx2 = pos[2] - pos[1] + tvecs[1]
     dx3 = pos[3] - pos[2] + tvecs[2]
-    numer = dx2 @ jnp.cross(jnp.cross(dx1, dx2), jnp.cross(dx2, dx3))
-    denom = jnp.linalg.norm(dx2) * jnp.cross(dx1, dx2) @ jnp.cross(dx2, dx3)
-    return jnp.arctan2(numer, denom)
+    cross12 = torch.cross(dx1, dx2, dim=0)
+    cross23 = torch.cross(dx2, dx3, dim=0)
+    numer = dx2 @ torch.cross(cross12, cross23, dim=0)
+    denom = torch.linalg.norm(dx2) * (cross12 @ cross23)
+    return torch.atan2(numer, denom)
 
 
 class Dihedral(Internal):
     nindices = 4
-    _eval0 = staticmethod(jit(_dihedral))
+    _eval0 = staticmethod(_torch_function(_dihedral))
     _eval1 = staticmethod(_gradient(_dihedral))
     _eval2 = staticmethod(_hessian(_dihedral))
     _eval_cell_grad = staticmethod(_dihedral_cell_grad_single)
@@ -1670,8 +1842,8 @@ def make_internal(
     fun: Callable[..., float],
     nindices: int,
     use_jit: bool = True,
-    jac: Callable[..., jnp.ndarray] = None,
-    hess: Callable[..., jnp.ndarray] = None,
+    jac: Callable[..., torch.Tensor] = None,
+    hess: Callable[..., torch.Tensor] = None,
     **kwargs,
 ) -> Type[Coordinate]:
     if jac is None:
@@ -1679,10 +1851,12 @@ def make_internal(
     if hess is None:
         hess = _hessian(fun)
 
-    if use_jit:
-        fun = jit(fun)
-        jac = jit(jac)
-        hess = jit(hess)
+    # Retain the historical ``use_jit`` argument for API compatibility. The
+    # PyTorch backend does not JIT these heterogeneous user callbacks by
+    # default; the wrapper handles NumPy-to-tensor conversion at call time.
+    fun = _torch_function(fun)
+    jac = _torch_function(jac)
+    hess = _torch_function(hess)
 
     def __init__(self, indices):
         # Coordinate.__init__ resets self.kwargs to {}, so install the fixed
@@ -1910,7 +2084,7 @@ class BaseInternals:
 
     @staticmethod
     def _pad_to_block(n: int) -> int:
-        """Round up to a BLOCK_SIZE multiple for stable JAX/GPU batch shapes."""
+        """Round up to a BLOCK_SIZE multiple for stable batched shapes."""
         return ((n + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
 
     @staticmethod
@@ -1936,7 +2110,7 @@ class BaseInternals:
         """Build padded and unpadded arrays for one vectorized coordinate family.
 
         Unpadded arrays are used for result indexing and sparse scatter. Padded
-        arrays are used for JAX batch calls so bonds, angles, and dihedrals keep
+        arrays are used for torch batch calls so bonds, angles, and dihedrals keep
         consistent shapes and avoid recompilation. Padding masks are not stored
         because valid rows are always the leading ``n_actual`` prefix.
         """
@@ -2107,7 +2281,7 @@ class BaseInternals:
             return np.empty(0)
         pos = positions[family.indices_padded]
         values = spec.value_fn(pos, tvecs[f"{spec.key}_padded"])
-        return np.asarray(device_get(values))[:family.n_actual]
+        return _to_numpy(values)[:family.n_actual]
 
     def _compute_batched_tensor_family(self, spec: _BatchedCoordFamily,
                                        family: _BatchedCoordArrays,
@@ -2117,7 +2291,7 @@ class BaseInternals:
             return family.indices, np.empty((0,) + empty_tail)
         pos = positions[family.indices_padded]
         padded = fn(pos, tvecs[f"{spec.key}_padded"])
-        return family.indices, np.asarray(device_get(padded))[:family.n_actual]
+        return family.indices, _to_numpy(padded)[:family.n_actual]
 
     def _compute_batched_values(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, np.ndarray]:
         """Compute all internal coordinate values using vectorized operations.
@@ -2172,11 +2346,11 @@ class BaseInternals:
         """Compute all internal coordinate cell gradients.
 
         Only periodic bond/angle/dihedral coordinates with non-zero ncvecs
-        depend on the cell. The JAX cell object is created lazily so non-periodic
-        batches stay on the fast zero-return path.
+        depend on the cell. The torch cell tensor is created lazily so
+        non-periodic batches stay on the fast zero-return path.
         """
         self._build_batched_arrays()
-        cell_jax = None
+        cell_torch = None
         result = {}
         families = self._batched_family_arrays
 
@@ -2192,18 +2366,18 @@ class BaseInternals:
                 result[key] = np.zeros((n_actual, 3, 3))
                 continue
 
-            if cell_jax is None:
-                cell_jax = jnp.asarray(cell, dtype=np.float64)
-            pos = jnp.asarray(
+            if cell_torch is None:
+                cell_torch = _as_torch(np.asarray(cell, dtype=np.float64))
+            pos = np.asarray(
                 positions[family.indices_padded],
                 dtype=np.float64,
             )
-            ncvecs_padded = jnp.asarray(
+            ncvecs_padded = np.asarray(
                 family.ncvecs_padded,
                 dtype=np.float64,
             )
-            grads = spec.cell_grad_fn(pos, ncvecs_padded, cell_jax)
-            result[key] = np.asarray(device_get(grads))[:n_actual]
+            grads = spec.cell_grad_fn(pos, ncvecs_padded, cell_torch)
+            result[key] = _to_numpy(grads)[:n_actual]
 
         return result
 
@@ -2224,7 +2398,7 @@ class BaseInternals:
             all_coords = []
 
             # Translations are simple coordinate means; compute them directly
-            # instead of dispatching one tiny JAX call per TRIC axis.
+            # instead of dispatching one tiny autodiff call per TRIC axis.
             for coord in self.internals['translations']:
                 idx = coord.indices
                 dim = coord.kwargs['dim']
@@ -2666,7 +2840,7 @@ class BaseInternals:
 
             # Non-batched coords use lightweight atoms. Translation hessians are
             # identically zero (translations are linear in positions), so cache
-            # one zero array per (n,) and reuse — avoids 24+ JAX calls per
+            # one zero array per (n,) and reuse — avoids 24+ autodiff calls per
             # hessian rebuild on systems with TRICs.
             atoms = self.light_atoms
             trans_data = []
@@ -2738,7 +2912,7 @@ class BaseInternals:
         self._cache['hessian_result'] = result
         return result
 
-    def _scatter_batched_family(self, jax_result, active, n_actual,
+    def _scatter_batched_family(self, torch_result, active, n_actual,
                                 all_flat_cols, csr_offset, width,
                                 use_sparse, data, out, row):
         """Scatter one batched bond/angle/dihedral HVP result into the output.
@@ -2746,9 +2920,9 @@ class BaseInternals:
         Extracted verbatim from the three per-family blocks in hessian_rdot;
         returns the advanced output row.
         """
-        if jax_result is None:
+        if torch_result is None:
             return row
-        hvp = np.asarray(device_get(jax_result))
+        hvp = _to_numpy(torch_result)
         if active.all():
             hvp = hvp[:n_actual]
             n_coords = n_actual
@@ -2841,12 +3015,12 @@ class BaseInternals:
             out_row[idx] = hvp
         return off, row + 1
 
-    def _contract_batched_hvp_family(self, jax_result, active, n_actual,
+    def _contract_batched_hvp_family(self, torch_result, active, n_actual,
                                      indices, mat_atoms, out, row):
         """Contract one batched HVP family with dense Cartesian columns."""
-        if jax_result is None:
+        if torch_result is None:
             return row
-        hvp = np.asarray(device_get(jax_result))
+        hvp = _to_numpy(torch_result)
         if active.all():
             hvp = hvp[:n_actual]
             idx = indices
@@ -3058,8 +3232,8 @@ class BaseInternals:
         # out[row:row+n_active_trans] is already zero from the clear
         row += n_active_trans
 
-        # Launch all JAX HVP computations, deferring device_get
-        # This allows JAX to pipeline the computations before we block on transfer
+        # Launch all batched HVP computations before converting tensors back to
+        # NumPy and scattering into the output.
 
         batched_active = (bonds_active, angles_active, dihedrals_active)
         families = self._batched_family_arrays
@@ -3112,7 +3286,7 @@ class BaseInternals:
                                                q_stable=q)
                     rot_closed_results.append((hvp, idx))
 
-        # Now collect results with device_get and scatter into output
+        # Now collect results and scatter into output.
 
         for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active):
             family = families[spec.key]
@@ -3293,16 +3467,16 @@ class BaseInternals:
     def get_principal_rotation_axes(
         self,
         indices: Tuple[int, ...]
-    ) -> jnp.ndarray:
+    ) -> np.ndarray:
         """Calculates the principal axes of rotation of a cluster of atoms."""
         indices = np.asarray(indices, dtype=np.int32)
         pos = self.all_positions
         dx = pos[indices] - pos[indices].mean(0)
         Inertia = (
-            (dx * dx).sum() * jnp.eye(3)
+            (dx * dx).sum() * np.eye(3)
             - (dx[:, None, :] * dx[:, :, None]).sum(0)
         )
-        _, rvecs = jnp.linalg.eigh(Inertia)
+        _, rvecs = np.linalg.eigh(Inertia)
         return rvecs
 
     def add_dummy_to_internals(
@@ -4807,14 +4981,14 @@ class Internals(BaseInternals):
         return spread > 0 and gap / spread < threshold
 
     def _bad_angles(self):
-        """Return angle coordinates near 0 or pi using the padded JAX batch."""
+        """Return angle coordinates near 0 or pi using the padded torch batch."""
         self._build_batched_arrays()
         angles = self._batched_family_arrays['angles']
         if angles.n_actual == 0:
             return []
         tvecs = self._get_cached_tvecs(self.atoms.cell.array)
         angle_pos = self.all_positions[angles.indices_padded]
-        angle_vals_padded = np.asarray(
+        angle_vals_padded = _to_numpy(
             _angle_value_batched(angle_pos, tvecs['angles_padded'])
         )
         angle_vals = angle_vals_padded[:angles.n_actual]

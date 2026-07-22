@@ -33,7 +33,7 @@ _OPENBLAS_SETTERS = (
 )
 
 # Env vars covering the common CPU math backends. Setting these is the only
-# lever for pools not yet loaded (MKL, OMP regions in scipy/JAX) and for any
+# lever for pools not yet loaded (MKL, OMP regions in scipy/torch) and for any
 # child processes the caller spawns; already-loaded OpenBLAS is handled by the
 # runtime setters above.
 _ENV_VARS = (

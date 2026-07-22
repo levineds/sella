@@ -1,12 +1,12 @@
 import numpy as np
-import jax.numpy as jnp
+import torch
 from ase import Atoms
 
 from sella.internal import make_internal
 
 
 def _scaled_distance(pos, scale):
-    return scale * jnp.linalg.norm(pos[1] - pos[0])
+    return scale * torch.linalg.norm(pos[1] - pos[0])
 
 
 def test_make_internal_preserves_kwargs():
