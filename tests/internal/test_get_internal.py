@@ -59,6 +59,69 @@ def test_get_internal(name: str) -> None:
     np.testing.assert_allclose(hess, hess_numer, rtol=1e-7, atol=1e-7)
 
 
+class TestStarImproperDihedrals:
+    @staticmethod
+    def _make_star(coordination, distorted=False, extended=False):
+        phis = np.linspace(0.0, 2.7, coordination)
+        positions = np.zeros((coordination + 1, 3))
+        positions[1:, 0] = np.cos(phis)
+        positions[1:, 1] = np.sin(phis)
+        if distorted:
+            positions[1:, 2] = np.linspace(-0.3, 0.4, coordination) ** 2
+        if extended:
+            positions = np.vstack((positions, [1.0, 1.0, 0.0]))
+
+        atoms = Atoms(
+            ['Xe'] + ['H'] * (len(positions) - 1), positions=positions
+        )
+        internals = Internals(atoms)
+        for neighbor in range(1, coordination + 1):
+            internals.add_bond((0, neighbor))
+        if extended:
+            internals.add_bond((1, coordination + 1))
+        internals.find_all_angles()
+        return internals
+
+    @pytest.mark.parametrize('coordination', [3, 4, 5, 6])
+    def test_planar_star_gets_minimal_full_rank_improper_fan(
+        self, coordination
+    ):
+        internals = self._make_star(coordination)
+        assert internals.nangles == coordination * (coordination - 1) // 2
+
+        internals.find_all_dihedrals()
+
+        assert internals.ndihedrals == coordination - 2
+        rank = np.linalg.matrix_rank(internals.jacobian(), tol=1e-8)
+        assert rank == 3 * (coordination + 1) - 6
+
+    def test_improper_fan_depends_on_graph_not_planarity(self):
+        planar = self._make_star(5)
+        distorted = self._make_star(5, distorted=True)
+
+        planar.find_all_dihedrals()
+        distorted.find_all_dihedrals()
+
+        planar_dihedrals = [
+            tuple(coord.indices) for coord in planar.internals['dihedrals']
+        ]
+        distorted_dihedrals = [
+            tuple(coord.indices) for coord in distorted.internals['dihedrals']
+        ]
+        assert planar_dihedrals == distorted_dihedrals
+        assert len(planar_dihedrals) == 3
+
+    def test_proper_dihedrals_avoid_extra_impropers(self):
+        coordination = 5
+        internals = self._make_star(coordination, extended=True)
+
+        internals.find_all_dihedrals()
+
+        assert internals.ndihedrals == coordination - 1
+        rank = np.linalg.matrix_rank(internals.jacobian(), tol=1e-8)
+        assert rank == 3 * (coordination + 2) - 6
+
+
 class TestTRICs:
     """Tests for Translation-Rotation Internal Coordinates (TRICs)."""
 

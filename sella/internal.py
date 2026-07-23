@@ -4782,10 +4782,18 @@ class Internals(BaseInternals):
             )
         )
 
-    def _add_proper_dihedrals(self) -> None:
-        """Add proper dihedrals created from compatible angle pairs."""
+    def _add_proper_dihedrals(self):
+        """Add proper dihedrals and return the atoms they pass through."""
         edge_to_angles = self._angles_by_bond_edge()
         seen_pairs = set()
+        centers = set()
+        active_keys = {
+            self._internal_key(dihedral)
+            for dihedral, active in zip(
+                self.internals['dihedrals'], self._active['dihedrals']
+            )
+            if active
+        }
         for angles_on_edge in edge_to_angles.values():
             for a1, a2 in combinations(angles_on_edge, 2):
                 pair_key = (id(a1), id(a2))
@@ -4798,18 +4806,12 @@ class Internals(BaseInternals):
                     continue
                 if self._dihedral_is_self_loop(new):
                     continue
-                self._ignore_duplicate(self.add_dihedral, new)
-
-    def _proper_dihedral_centers(self):
-        """Atoms that already have an active proper dihedral passing through them.
-
-        Positions 1 and 2 are the central atoms of a proper dihedral.
-        """
-        centers = set()
-        for d, a in zip(self.internals['dihedrals'], self._active['dihedrals']):
-            if a:
-                centers.add(int(d.indices[1]))
-                centers.add(int(d.indices[2]))
+                key = self._internal_key(new)
+                if self._ignore_duplicate(self.add_dihedral, new):
+                    active_keys.add(key)
+                if key in active_keys:
+                    centers.add(int(new.indices[1]))
+                    centers.add(int(new.indices[2]))
         return centers
 
     def _bond_neighbor_list(self):
@@ -4837,17 +4839,88 @@ class Internals(BaseInternals):
             (-ncvec0, ncvec1, ncvec2 - ncvec1),
         )
 
-    def _add_improper_dihedral_for_center(self, center, neighbors):
-        """Add the first well-defined improper dihedral around ``center``."""
-        for ordered in permutations(neighbors[center], 3):
+    @staticmethod
+    def _neighbor_key(neighbor):
+        atom, ncvec = neighbor
+        return int(atom), tuple(int(x) for x in ncvec)
+
+    def _existing_improper_triples(self, center, center_neighbors):
+        """Return neighbor triples already used by impropers at ``center``."""
+        neighbor_keys = {
+            self._neighbor_key(neighbor) for neighbor in center_neighbors
+        }
+        triples = set()
+        for dihedral, active in zip(
+            self.internals['dihedrals'], self._active['dihedrals']
+        ):
+            if not active:
+                continue
+
+            offsets = np.vstack((
+                np.zeros(3, dtype=np.int32),
+                np.cumsum(dihedral.kwargs['ncvecs'], axis=0),
+            ))
+            for center_pos in (1, 2):
+                if dihedral.indices[center_pos] != center:
+                    continue
+                keys = []
+                for pos, atom in enumerate(dihedral.indices):
+                    if pos == center_pos:
+                        continue
+                    keys.append((
+                        int(atom),
+                        tuple(int(x) for x in (
+                            offsets[pos] - offsets[center_pos]
+                        )),
+                    ))
+                triple = frozenset(keys)
+                if len(triple) == 3 and triple <= neighbor_keys:
+                    triples.add(triple)
+        return triples
+
+    def _ordered_improper_neighbors(self, center, triple):
+        """Choose a numerically valid ordering for one topology-defined triple."""
+        for ordered in permutations(triple):
             if not self._improper_dihedral_well_defined(center, ordered):
                 continue
-            indices, ncvecs = self._improper_dihedral_args(center, ordered)
-            if self._ignore_duplicate(self.add_dihedral, indices, ncvecs):
-                return True
-        return False
+            return ordered
+        return None
 
-    def _add_improper_dihedrals(self) -> None:
+    def _improper_fan(self, center, center_neighbors, existing):
+        """Build a minimal ``degree - 2`` fan of local neighbor triples."""
+        pair_scores = {}
+        for triple in existing:
+            for pair in combinations(triple, 2):
+                pair = frozenset(pair)
+                pair_scores[pair] = pair_scores.get(pair, 0) + 1
+
+        anchor_pairs = list(combinations(range(len(center_neighbors)), 2))
+        anchor_pairs.sort(
+            key=lambda anchors: -pair_scores.get(
+                frozenset(
+                    self._neighbor_key(center_neighbors[i]) for i in anchors
+                ),
+                0,
+            )
+        )
+        for anchors in anchor_pairs:
+            fan = []
+            for other in range(len(center_neighbors)):
+                if other in anchors:
+                    continue
+                triple = tuple(
+                    center_neighbors[i] for i in (*anchors, other)
+                )
+                ordered = self._ordered_improper_neighbors(center, triple)
+                if ordered is None:
+                    break
+                key = frozenset(self._neighbor_key(n) for n in triple)
+                fan.append((key, ordered))
+            else:
+                return fan
+        return None
+
+    def _add_improper_dihedrals(self, proper_centers) -> None:
         """Add fallback improper dihedrals for under-constrained centers.
 
         Improper dihedrals are needed because:
@@ -4855,37 +4928,48 @@ class Internals(BaseInternals):
            out-of-plane motion.
         2. Even if the initial geometry is non-planar, it may planarize during
            optimization.
-        3. Improper dihedrals capture the out-of-plane umbrella mode.
+        3. Improper dihedrals capture the out-of-plane umbrella modes.
 
-        This adds some redundancy, but it keeps the Jacobian well-conditioned
-        for planar systems such as nitrate. To avoid excessive extra internals,
-        impropers are added only when no active proper dihedral already passes
-        through the center atom.
+        A degree-k planar star has k - 2 internal out-of-plane modes that bond
+        and angle derivatives cannot span. Add exactly that many impropers as
+        a fan. The count depends only on the bond graph, so a non-planar star
+        retains the coordinates it would need if it later becomes planar.
+
+        This adds some redundancy away from planarity, but keeps the Jacobian
+        well-conditioned for planar systems such as nitrate. To avoid adding
+        unnecessary coordinates, the fan is omitted when generated proper
+        dihedrals pass through the center, and existing local impropers are
+        reused when completing it. With complete angle enumeration, one
+        proper-capable incident edge generates at least k - 2 distinct proper
+        torsions, so the boolean proper-center test is sufficient here.
         """
-        dihedral_centers = self._proper_dihedral_centers()
         neighbors = self._bond_neighbor_list()
-
         for center in range(self.natoms):
-            # Consider atoms with 3 or 4 neighbors that lack proper dihedrals.
-            # - 3 neighbors: at planar geometries (e.g., NO3, sp2 carbons), the
-            #   3 angles sum to 360°, creating linear dependency.
-            # - 4 neighbors: at square planar geometries (e.g., Pt(II)), the
-            #   4 cis angles sum to 360°, similar issue. For tetrahedral, the
-            #   improper is redundant but harmless (pseudo-inverse handles it).
-            # - 5+ neighbors: rare, and typically have proper dihedrals anyway.
-            if len(neighbors[center]) not in (3, 4):
+            center_neighbors = neighbors[center]
+            if len(center_neighbors) < 3 or center in proper_centers:
                 continue
 
-            # Skip if this atom already has proper dihedrals through it
-            if center in dihedral_centers:
+            existing = self._existing_improper_triples(
+                center, center_neighbors
+            )
+            fan = self._improper_fan(center, center_neighbors, existing)
+            if fan is None:
                 continue
-
-            self._add_improper_dihedral_for_center(center, neighbors)
+            for key, ordered in fan:
+                if key in existing:
+                    continue
+                indices, ncvecs = self._improper_dihedral_args(
+                    center, ordered
+                )
+                if self._ignore_duplicate(
+                    self.add_dihedral, indices, ncvecs
+                ):
+                    existing.add(key)
 
     def find_all_dihedrals(self) -> None:
         """Find proper dihedrals first, then add necessary improper fallbacks."""
-        self._add_proper_dihedrals()
-        self._add_improper_dihedrals()
+        proper_centers = self._add_proper_dihedrals()
+        self._add_improper_dihedrals(proper_centers)
 
     def _improper_dihedral_well_defined(
         self,
@@ -4894,7 +4978,7 @@ class Internals(BaseInternals):
         rel_tol: float = 1e-8,
     ) -> bool:
         """Return True if an improper-dihedral ordering has two valid planes."""
-        pos = self.atoms.positions
+        pos = self.all_positions
         cell = self.atoms.cell.array
         vecs = []
         for neighbor, ncvec in ordered_neighbors:
