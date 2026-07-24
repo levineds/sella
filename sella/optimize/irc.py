@@ -8,6 +8,7 @@ from ase import Atoms
 from ase.io.trajectory import Trajectory, TrajectoryWriter
 from ase.optimize.optimize import Optimizer
 
+from sella._ase_compat import disable_logfile_if_none
 from sella.peswrapper import PES
 from .restricted_step import IRCTrustRegion
 from .stepper import QuasiNewtonIRC
@@ -41,6 +42,7 @@ class IRC(Optimizer):
             trajectory=trajectory,
             master=master,
         )
+        disable_logfile_if_none(self, logfile)
         self.ninner_iter = ninner_iter
         self.irctol = irctol
         self.dx = dx
@@ -171,6 +173,14 @@ class IRC(Optimizer):
         evals = self.pes.H.evals
         return (self.pes.converged(self.fmax)[0]
                 and evals is not None and evals[0] > 0)
+
+    def gradient_converged(self, gradient=None):
+        # ASE >= 3.28's Optimizer.irun checks gradient_converged() rather than
+        # converged(); route it through converged() so the first-step guard
+        # (self.first) and the eigenvalue check still apply. Without this, an
+        # IRC started from a TS with |F| < fmax "converges" before the first
+        # step, never applies the initial displacement, and returns 0 steps.
+        return self.converged()
 
     def get_W(self):
         return np.diag(1. / np.sqrt(np.repeat(self.atoms.get_masses(), 3)))

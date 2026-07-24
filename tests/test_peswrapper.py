@@ -24,20 +24,20 @@ def test_PES(name, traj, cons):
     # users, and we don't need to use a physical PES to test this.
     atoms.calc = EMT()
     for MyPES in [PES, InternalPES]:
-        pes = PES(atoms, trajectory=traj)
+        with PES(atoms, trajectory=traj) as pes:
 
-        pes.kick(0., diag=True, gamma=0.1)
+            pes.kick(0., diag=True, gamma=0.1)
 
-        for i in range(2):
-            pes.kick(-pes.get_g() * 0.01)
+            for i in range(2):
+                pes.kick(-pes.get_g() * 0.01)
 
-        assert pes.H is not None
-        assert not pes.converged(0.)[0]
-        assert pes.converged(1e100)
-        A = pes.get_Ufree().T @ pes.get_Ucons()
-        np.testing.assert_allclose(A, 0, **tol)
+            assert pes.H is not None
+            assert not pes.converged(0.)[0]
+            assert pes.converged(1e100)
+            A = pes.get_Ufree().T @ pes.get_Ucons()
+            np.testing.assert_allclose(A, 0, **tol)
 
-        pes.kick(-pes.get_g() * 0.001, diag=True, gamma=0.1)
+            pes.kick(-pes.get_g() * 0.001, diag=True, gamma=0.1)
 
 
 # NH3/CH4/C2H6/C6H6 are rank-deficient (redundant internals + rigid-body

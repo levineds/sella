@@ -16,6 +16,7 @@ from .restricted_step import get_restricted_step, MaxInternalStep, \
 from sella.peswrapper import PES, InternalPES, CellInternalPES, CellCartesianPES
 from sella.internal import Internals, Constraints
 from sella._threads import configure_compute
+from sella._ase_compat import disable_logfile_if_none, flush_logfile
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +203,7 @@ class Sella(Optimizer):
         Optimizer.__init__(self, atoms, restart=restart,
                            logfile=logfile, trajectory=None,
                            master=master)
+        disable_logfile_if_none(self, logfile)
 
         if delta0 is None:
             delta0 = default['delta0']
@@ -583,7 +585,4 @@ class Sella(Optimizer):
                                "{:>12.4f} {:>12.4f}\n"
                                .format(name, self.nsteps, T, e, fmax, cmax,
                                        self.delta, self.rho))
-        try:
-            self.logfile.flush()
-        except (AttributeError, TypeError):
-            pass
+        flush_logfile(self.logfile)
