@@ -3,6 +3,7 @@ import logging
 
 import numpy as np
 from scipy.linalg import eigh
+from scipy.optimize import brentq
 
 logger = logging.getLogger(__name__)
 
@@ -212,23 +213,188 @@ class RationalFunctionOptimization(BaseStepper):
         return self._get_eigenstep(alpha)
 
 
+class _ExtremalDiagonalRationalFunctionOptimization(BaseStepper):
+    """RFO for a diagonal Hessian when only one extremal root is needed.
+
+    PRFO works in the eigenbasis of the projected Hessian, so both partitioned
+    Hessians are diagonal.  A regular RFO solve nevertheless computes every
+    eigenpair of its augmented matrix at every trust-radius iteration.
+    Small partitions ask LAPACK only for the required extremal pair; large
+    minimization partitions solve the arrowhead secular equation directly.
+    The step derivative follows from differentiating the diagonal RFO
+    equations.
+    """
+
+    alpha0 = RationalFunctionOptimization.alpha0
+    alphamin = RationalFunctionOptimization.alphamin
+    alphamax = RationalFunctionOptimization.alphamax
+    slope = RationalFunctionOptimization.slope
+    newton_safe = RationalFunctionOptimization.newton_safe
+    _secular_min_dim = 50
+
+    def __init__(self, g, eigenvalues, upper):
+        self.eigenvalues = np.asarray(eigenvalues)
+        self.upper = upper
+        self._fallback = None
+        super().__init__(g, H=None, order=len(g) if upper else 0)
+
+    def _stepper_init(self) -> None:
+        n = len(self.g)
+        self.A = np.zeros((n + 1, n + 1))
+        self._indices = np.arange(n)
+
+    def _fallback_step(self, alpha):
+        if self._fallback is None:
+            n = len(self.g)
+            H = ApproximateHessian(
+                n, 0, np.diag(self.eigenvalues), initialized=True
+            )
+            self._fallback = RationalFunctionOptimization(
+                self.g, H, order=n if self.upper else 0
+            )
+        return self._fallback.get_s(alpha)
+
+    def _secular_step(self, alpha, diagonal):
+        """Solve the extremal arrowhead eigenproblem as a scalar root."""
+        alpha2 = alpha * alpha
+        coupling2 = alpha2 * self.g ** 2
+        pole = (
+            max(0.0, np.max(diagonal))
+            if self.upper else min(0.0, np.min(diagonal))
+        )
+        scale = max(
+            1.0,
+            float(np.max(np.abs(diagonal))),
+            float(np.sum(np.abs(alpha * self.g))),
+        )
+        gap = 1e-12 * scale
+        inside = pole + gap if self.upper else pole - gap
+
+        def secular(theta):
+            return float(np.sum(coupling2 / (theta - diagonal)) - theta)
+
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            f_inside = secular(inside)
+            inside_ok = f_inside > 0 if self.upper else f_inside < 0
+            if not inside_ok or not np.isfinite(f_inside):
+                return None
+
+            outside = pole + scale if self.upper else pole - scale
+            f_outside = secular(outside)
+            for _ in range(60):
+                outside_ok = f_outside < 0 if self.upper else f_outside > 0
+                if outside_ok and np.isfinite(f_outside):
+                    break
+                scale *= 2
+                outside = pole + scale if self.upper else pole - scale
+                f_outside = secular(outside)
+            else:
+                return None
+
+            try:
+                theta = brentq(
+                    secular, inside, outside,
+                    xtol=5e-15, rtol=4 * np.finfo(float).eps,
+                )
+            except ValueError:
+                return None
+
+        differences = theta - diagonal
+        root_scale = max(abs(theta), np.max(np.abs(diagonal)), 1.0)
+        if np.any(np.abs(differences) < 1e-6 * root_scale):
+            return None
+
+        step = alpha2 * self.g / differences
+        weights = np.sum(self.g ** 2 / differences ** 2)
+        dtheta = 2 * alpha * theta * weights / (1 + alpha2 * weights)
+        derivative = (
+            2 * alpha * self.g / differences
+            - alpha2 * self.g
+            * (dtheta - 2 * alpha * self.eigenvalues)
+            / differences ** 2
+        )
+        return step, derivative
+
+    def get_s(self, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+        n = len(self.g)
+        if n == 0:
+            empty = np.empty(0)
+            return empty, empty.copy()
+        if not np.any(self.g):
+            zeros = np.zeros_like(self.g)
+            return zeros, zeros.copy()
+        if self.upper and n > 1:
+            # Higher-order PRFO applies special near-degeneracy selection to
+            # this partition in the full RFO implementation. Order-one PRFO
+            # has a one-dimensional maximization partition and needs no such
+            # fallback.
+            return self._fallback_step(alpha)
+
+        alpha2 = alpha * alpha
+        diagonal = alpha2 * self.eigenvalues
+        if n >= self._secular_min_dim:
+            result = self._secular_step(alpha, diagonal)
+            if result is not None:
+                return result
+            return self._fallback_step(alpha)
+
+        self.A[self._indices, self._indices] = diagonal
+        self.A[:-1, -1] = alpha * self.g
+        self.A[-1, :-1] = alpha * self.g
+
+        idx = n if self.upper else 0
+        try:
+            values, vectors = eigh(self.A, subset_by_index=(idx, idx))
+        except (TypeError, np.linalg.LinAlgError):
+            # SciPy < 1.5 used ``eigvals`` instead of ``subset_by_index``.
+            values, vectors = _eigh_symmetric(self.A)
+            values = values[idx:idx + 1]
+            vectors = vectors[:, idx:idx + 1]
+
+        theta = values[0]
+        vector = vectors[:, 0]
+        denom = vector[-1]
+        differences = theta - diagonal
+        scale = max(abs(theta), np.max(np.abs(diagonal)), 1.0)
+        if (abs(denom) < 1e-12
+                or np.any(np.abs(differences) < 1e-12 * scale)):
+            # An uncoupled or degenerate extremal root can have a zero final
+            # component, making the diagonal derivative formula singular.
+            return self._fallback_step(alpha)
+
+        step = alpha2 * self.g / differences
+        dtheta = (
+            2 * alpha * np.dot(self.eigenvalues, vector[:-1] ** 2)
+            + 2 * vector[-1] * np.dot(self.g, vector[:-1])
+        )
+        derivative = (
+            2 * alpha * self.g / differences
+            - alpha2 * self.g
+            * (dtheta - 2 * alpha * self.eigenvalues)
+            / differences ** 2
+        )
+        return step, derivative
+
+
 class PartitionedRationalFunctionOptimization(RationalFunctionOptimization):
     synonyms = ['prfo', 'p-rfo', 'partitioned rational function optimization']
 
     def _stepper_init(self) -> None:
-        self.Vmax = self.H.evecs[:, :self.order]
-        self.Vmin = self.H.evecs[:, self.order:]
+        eigenvalues = self.H.evals
+        eigenvectors = self.H.evecs
+        self.Vmax = eigenvectors[:, :self.order]
+        self.Vmin = eigenvectors[:, self.order:]
 
-        self.max = RationalFunctionOptimization(
+        self.max = _ExtremalDiagonalRationalFunctionOptimization(
             self.Vmax.T @ self.g,
-            self.H.project(self.Vmax),
-            order=self.Vmax.shape[1],
+            eigenvalues[:self.order],
+            upper=True,
         )
 
-        self.min = RationalFunctionOptimization(
+        self.min = _ExtremalDiagonalRationalFunctionOptimization(
             self.Vmin.T @ self.g,
-            self.H.project(self.Vmin),
-            order=0,
+            eigenvalues[self.order:],
+            upper=False,
         )
 
     def get_s(self, alpha: float) -> Tuple[np.ndarray, np.ndarray]:

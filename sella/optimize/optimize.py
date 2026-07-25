@@ -89,6 +89,11 @@ class Sella(Optimizer):
         ----------
         atoms : Atoms
             ASE Atoms object to optimize.
+        gamma : float, optional
+            Relative residual tolerance for the iterative Hessian eigensolver.
+            Values less than or equal to zero request an exact finite-difference
+            Hessian materialization, which requires one force evaluation per
+            free degree of freedom. Default is 0.1.
         optimize_cell : bool, optional
             If True, optimize unit cell parameters along with atomic positions.
             Requires order=0. Default is False.

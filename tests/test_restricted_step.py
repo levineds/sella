@@ -83,6 +83,60 @@ def test_partitioned_rfo_step_derivative():
     )
 
 
+def test_partitioned_rfo_matches_full_augmented_eigensolves():
+    rng = np.random.default_rng(12)
+    for size, order in ((12, 1), (80, 1), (120, 60)):
+        matrix = rng.normal(size=(size, size))
+        matrix = 0.5 * (matrix + matrix.T)
+        gradient = rng.normal(size=size)
+        H = ApproximateHessian(size, size, matrix)
+        prfo = PartitionedRationalFunctionOptimization(
+            gradient, H, order=order
+        )
+
+        eigenvalues = H.evals
+        eigenvectors = H.evecs
+        vmax = eigenvectors[:, :order]
+        vmin = eigenvectors[:, order:]
+        full_max = RationalFunctionOptimization(
+            vmax.T @ gradient,
+            ApproximateHessian(
+                order, 0, np.diag(eigenvalues[:order])
+            ),
+            order=order,
+        )
+        full_min = RationalFunctionOptimization(
+            vmin.T @ gradient,
+            ApproximateHessian(
+                size - order, 0, np.diag(eigenvalues[order:])
+            ),
+            order=0,
+        )
+
+        for alpha in (1.0, 0.4, 0.05):
+            smax, dsmax = full_max.get_s(alpha)
+            smin, dsmin = full_min.get_s(alpha)
+            expected = (
+                vmax @ smax + vmin @ smin,
+                vmax @ dsmax + vmin @ dsmin,
+            )
+            actual = prfo.get_s(alpha)
+            np.testing.assert_allclose(actual[0], expected[0], atol=1e-12)
+            np.testing.assert_allclose(actual[1], expected[1], atol=1e-11)
+
+
+def test_partitioned_rfo_handles_degenerate_stationary_hessian():
+    H = ApproximateHessian(3, 3, np.diag([0.0, 0.0, 1.0]))
+    prfo = PartitionedRationalFunctionOptimization(
+        np.zeros(3), H, order=1
+    )
+
+    step, derivative = prfo.get_s(0.4)
+
+    np.testing.assert_allclose(step, 0.0)
+    np.testing.assert_allclose(derivative, 0.0)
+
+
 def test_interior_rfo_reaches_trust_region_boundary():
     pes = _QuadraticPES(
         [0.3, -0.2, 0.4], np.diag([-2.0, -0.7, 1.3])
