@@ -95,6 +95,29 @@ def test_only_order_one_partitioned_rfo_is_newton_safe():
     ).newton_safe
 
 
+def test_newton_safe_restricted_step_periodically_bisects():
+    class StalledNewtonStepper:
+        alpha0 = 1.0
+        alphamin = 0.0
+        alphamax = 1.0
+        slope = 1.0
+        newton_safe = True
+
+    restricted = TrustRegion.__new__(TrustRegion)
+    restricted.delta = 0.25
+    restricted.tol = 1e-10
+    restricted.maxiter = 1000
+    restricted.stepper = StalledNewtonStepper()
+    restricted.eval = lambda alpha: (
+        np.array([alpha]), alpha, 1e12,
+    )
+
+    step, magnitude = restricted.get_s()
+
+    np.testing.assert_allclose(step, [0.25], atol=1e-10)
+    assert magnitude == restricted.delta
+
+
 def test_restricted_step_exposes_prfo_spectrum_and_basis():
     pes = _QuadraticPES(
         [0.3, -0.2, 0.4], np.diag([-2.0, -0.7, 1.3])
@@ -108,6 +131,41 @@ def test_restricted_step_exposes_prfo_spectrum_and_basis():
     np.testing.assert_allclose(
         restricted.projected_eigenvalues,
         [-2.0, -0.7, 1.3],
+    )
+
+
+def test_partitioned_rfo_weak_pole_matches_full_eigensolve():
+    hessian = ApproximateHessian(
+        3, 3, np.diag([-600.0, -560.0, 20.0])
+    )
+    gradient = np.array([4e-4, 4e-5, 5e-4])
+    prfo = PartitionedRationalFunctionOptimization(
+        gradient, hessian, order=1
+    )
+
+    vmax = hessian.evecs[:, :1]
+    vmin = hessian.evecs[:, 1:]
+    full_max = RationalFunctionOptimization(
+        vmax.T @ gradient, hessian.project(vmax), order=1
+    )
+    full_min = RationalFunctionOptimization(
+        vmin.T @ gradient, hessian.project(vmin), order=0
+    )
+
+    alpha = 0.03
+    expected_step = (
+        vmax @ full_max.get_s(alpha)[0]
+        + vmin @ full_min.get_s(alpha)[0]
+    )
+    expected_derivative = (
+        vmax @ full_max.get_s(alpha)[1]
+        + vmin @ full_min.get_s(alpha)[1]
+    )
+    step, derivative = prfo.get_s(alpha)
+
+    np.testing.assert_allclose(step, expected_step, rtol=1e-12)
+    np.testing.assert_allclose(
+        derivative, expected_derivative, rtol=1e-12, atol=1e-12
     )
 
 

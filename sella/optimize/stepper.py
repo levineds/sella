@@ -40,7 +40,7 @@ class BaseStepper:
     alphamax: Optional[float] = None
     # Whether the step size increases or decreases with increasing alpha
     slope: Optional[float] = None
-    # Whether get_s is smooth enough for Newton to converge reliably
+    # Whether get_s is smooth enough to prioritize safeguarded Newton steps
     newton_safe: bool = True
     synonyms: List[str] = []
 
@@ -254,6 +254,24 @@ class _ExtremalDiagonalRationalFunctionOptimization(BaseStepper):
             )
         return self._fallback.get_s(alpha)
 
+    def _derivative_from_step(self, alpha, step):
+        """Differentiate an extremal RFO step without Hessian-pole gaps."""
+        if alpha == 0:
+            return None
+
+        # For an extremal RFO root, (H - mu I) s = -g and
+        # mu = g.s / alpha**2. Differentiating the secular equation gives
+        # dmu/dalpha = -2 alpha mu / (alpha**2 + s.s). Using g_i / s_i
+        # for each pole gap avoids subtracting two nearly equal eigenvalues.
+        mu = np.dot(self.g, step) / alpha**2
+        dmu = -2 * alpha * mu / (alpha**2 + np.dot(step, step))
+        derivative = np.zeros_like(step)
+        active = self.g != 0
+        derivative[active] = (
+            -step[active] ** 2 * dmu / self.g[active]
+        )
+        return derivative
+
     def _secular_step(self, alpha, diagonal):
         """Solve the extremal arrowhead eigenproblem as a scalar root."""
         alpha2 = alpha * alpha
@@ -305,14 +323,7 @@ class _ExtremalDiagonalRationalFunctionOptimization(BaseStepper):
             return None
 
         step = alpha2 * self.g / differences
-        weights = np.sum(self.g ** 2 / differences ** 2)
-        dtheta = 2 * alpha * theta * weights / (1 + alpha2 * weights)
-        derivative = (
-            2 * alpha * self.g / differences
-            - alpha2 * self.g
-            * (dtheta - 2 * alpha * self.eigenvalues)
-            / differences ** 2
-        )
+        derivative = self._derivative_from_step(alpha, step)
         return step, derivative
 
     def get_s(self, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -344,35 +355,24 @@ class _ExtremalDiagonalRationalFunctionOptimization(BaseStepper):
 
         idx = n if self.upper else 0
         try:
-            values, vectors = eigh(self.A, subset_by_index=(idx, idx))
+            _, vectors = eigh(self.A, subset_by_index=(idx, idx))
         except (TypeError, np.linalg.LinAlgError):
             # SciPy < 1.5 used ``eigvals`` instead of ``subset_by_index``.
-            values, vectors = _eigh_symmetric(self.A)
-            values = values[idx:idx + 1]
+            _, vectors = _eigh_symmetric(self.A)
             vectors = vectors[:, idx:idx + 1]
 
-        theta = values[0]
         vector = vectors[:, 0]
         denom = vector[-1]
-        differences = theta - diagonal
-        scale = max(abs(theta), np.max(np.abs(diagonal)), 1.0)
-        if (abs(denom) < 1e-12
-                or np.any(np.abs(differences) < 1e-12 * scale)):
+        if abs(denom) < 1e-12:
             # An uncoupled or degenerate extremal root can have a zero final
             # component, making the diagonal derivative formula singular.
             return self._fallback_step(alpha)
 
-        step = alpha2 * self.g / differences
-        dtheta = (
-            2 * alpha * np.dot(self.eigenvalues, vector[:-1] ** 2)
-            + 2 * vector[-1] * np.dot(self.g, vector[:-1])
-        )
-        derivative = (
-            2 * alpha * self.g / differences
-            - alpha2 * self.g
-            * (dtheta - 2 * alpha * self.eigenvalues)
-            / differences ** 2
-        )
+        step = alpha * vector[:-1] / denom
+        step[self.g == 0] = 0
+        derivative = self._derivative_from_step(alpha, step)
+        if derivative is None or not np.all(np.isfinite(derivative)):
+            return self._fallback_step(alpha)
         return step, derivative
 
 
@@ -381,8 +381,9 @@ class PartitionedRationalFunctionOptimization(RationalFunctionOptimization):
 
     def _stepper_init(self) -> None:
         # With one ascent direction, both PRFO partitions follow smooth
-        # extremal eigenvalue branches. The restricted-step solver can use its
-        # Newton tolerance without the branch-switching risk of higher orders.
+        # extremal eigenvalue branches. The restricted-step solver can
+        # prioritize Newton without the branch-switching risk of higher orders;
+        # its periodic bisection still handles trust-metric kinks.
         self.newton_safe = self.order == 1
         eigenvalues = self.H.evals
         eigenvectors = self.H.evecs
