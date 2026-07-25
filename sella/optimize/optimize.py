@@ -246,6 +246,8 @@ class Sella(Optimizer):
         self._last_converged = None
         self.nsteps_since_diag = 0
         self.diag_every_n = np.inf if diag_every_n is None else diag_every_n
+        self._last_step_basis = None
+        self._last_step_eigenvalues = None
 
     def initialize_pes(
         self,
@@ -372,9 +374,13 @@ class Sella(Optimizer):
         return {}
 
     def _restricted_step(self, rs_kwargs):
-        return self.rs(
+        restricted = self.rs(
             self.pes, self.ord, self.delta, method=self.method, **rs_kwargs
-        ).get_s()
+        )
+        result = restricted.get_s()
+        self._last_step_basis = restricted.projection_basis
+        self._last_step_eigenvalues = restricted.projected_eigenvalues
+        return result
 
     def _valid_inequality_step(self, x0, rs_kwargs):
         """Retry restricted steps until inactive inequality constraints stay valid."""
@@ -406,11 +412,16 @@ class Sella(Optimizer):
             return True
         if not (self.eig and self.nsteps_since_diag >= self.nsteps_per_diag):
             return False
-        if self.pes.H.evals is None:
+        if self.pes.H.B is None and self.pes.H._B_gpu is None:
             return True
-
         Unred = self.pes.get_Unred()
-        evals = self.pes.get_HL_projected(Unred).evals[:self.ord]
+        if (self._last_step_basis is Unred
+                and self._last_step_eigenvalues is not None):
+            evals = self._last_step_eigenvalues[:self.ord]
+        else:
+            if self.pes.H.evals is None:
+                return True
+            evals = self.pes.get_HL_projected(Unred).evals[:self.ord]
         return bool((evals > 0).any())
 
     def _record_diagonalization(self, ev):

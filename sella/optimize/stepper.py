@@ -380,8 +380,13 @@ class PartitionedRationalFunctionOptimization(RationalFunctionOptimization):
     synonyms = ['prfo', 'p-rfo', 'partitioned rational function optimization']
 
     def _stepper_init(self) -> None:
+        # With one ascent direction, both PRFO partitions follow smooth
+        # extremal eigenvalue branches. The restricted-step solver can use its
+        # Newton tolerance without the branch-switching risk of higher orders.
+        self.newton_safe = self.order == 1
         eigenvalues = self.H.evals
         eigenvectors = self.H.evecs
+        self.projected_eigenvalues = eigenvalues
         self.Vmax = eigenvectors[:, :self.order]
         self.Vmin = eigenvectors[:, self.order:]
 

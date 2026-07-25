@@ -50,6 +50,8 @@ class BaseRestrictedStep:
         self.pes = pes
         self.delta = delta
         self.d1 = d1
+        self.projection_basis = None
+        self.projected_eigenvalues = None
         g0 = self.pes.get_g()
 
         # W defaults to the identity, in which case Ufree.T @ W == Ufree.T.
@@ -87,10 +89,12 @@ class BaseRestrictedStep:
                     self.P = projection
                 self.stepper = stepper(g_step, H_step, order, d1=None)
             else:
+                Ufree = self.pes.get_Ufree()
                 if self._W_is_identity:
-                    self.P = self.pes.get_Ufree().T
+                    self.P = Ufree.T
+                    self.projection_basis = Ufree
                 else:
-                    self.P = self.pes.get_Ufree().T @ W
+                    self.P = Ufree.T @ W
                 d1 = self.d1
                 if d1 is not None:
                     d1 = np.linalg.lstsq(
@@ -102,6 +106,11 @@ class BaseRestrictedStep:
                     order,
                     d1=d1,
                 )
+
+        if self.projection_basis is not None:
+            self.projected_eigenvalues = getattr(
+                self.stepper, 'projected_eigenvalues', None
+            )
 
         if tol is None:
             tol = 1e-10 if self.stepper.newton_safe else 1e-15

@@ -83,6 +83,34 @@ def test_partitioned_rfo_step_derivative():
     )
 
 
+def test_only_order_one_partitioned_rfo_is_newton_safe():
+    H = ApproximateHessian(4, 4, np.diag([-2.0, -0.7, 1.3, 2.8]))
+    g = np.array([0.3, -0.2, 0.4, 0.1])
+
+    assert PartitionedRationalFunctionOptimization(
+        g, H, order=1
+    ).newton_safe
+    assert not PartitionedRationalFunctionOptimization(
+        g, H, order=2
+    ).newton_safe
+
+
+def test_restricted_step_exposes_prfo_spectrum_and_basis():
+    pes = _QuadraticPES(
+        [0.3, -0.2, 0.4], np.diag([-2.0, -0.7, 1.3])
+    )
+    restricted = TrustRegion(
+        pes, order=1, delta=10.0,
+        method=PartitionedRationalFunctionOptimization,
+    )
+
+    assert restricted.projection_basis is not None
+    np.testing.assert_allclose(
+        restricted.projected_eigenvalues,
+        [-2.0, -0.7, 1.3],
+    )
+
+
 def test_partitioned_rfo_matches_full_augmented_eigensolves():
     rng = np.random.default_rng(12)
     for size, order in ((12, 1), (80, 1), (120, 60)):

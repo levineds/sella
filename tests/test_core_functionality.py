@@ -412,6 +412,42 @@ class TestNumericalHessian:
         np.testing.assert_allclose(H12, H21, rtol=1e-5)
 
 
+def test_sella_reuses_matching_restricted_step_spectrum():
+    basis = np.eye(3)
+
+    class FakeHessian:
+        B = np.eye(3)
+        _B_gpu = None
+        evals = np.array([-0.5, 1.0, 2.0])
+
+    class FakePES:
+        H = FakeHessian()
+
+        def get_Unred(self):
+            return basis
+
+        def get_HL_projected(self, _):
+            raise AssertionError("matching PRFO spectrum should be reused")
+
+    opt = object.__new__(Sella)
+    opt.pes = FakePES()
+    opt.eig = True
+    opt.ord = 1
+    opt.nsteps_since_diag = 3
+    opt.nsteps_per_diag = 3
+    opt.diag_every_n = np.inf
+    opt._last_step_basis = basis
+    opt._last_step_eigenvalues = np.array([-0.5, 1.0, 2.0])
+
+    assert not opt._should_diagonalize()
+    opt._last_step_eigenvalues[0] = 0.5
+    assert opt._should_diagonalize()
+
+    opt._last_step_basis = basis.copy()
+    with pytest.raises(AssertionError, match="should be reused"):
+        opt._should_diagonalize()
+
+
 class TestLinearMolecule:
     """Test that linear molecules (e.g. N2) don't produce NaN in rotation
     constraints.
