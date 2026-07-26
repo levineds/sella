@@ -1037,6 +1037,27 @@ class InternalPES(PES):
             return cached
 
         B = self.int.jacobian()
+        # Free molecular internals normally have exactly the six rigid-body
+        # Cartesian null modes.  The rigid-nullspace path fully factorizes B
+        # after dropping a well-conditioned gauge, so try it before doing a
+        # full QR that would only detect the expected rank deficiency and then
+        # factorize the reduced Jacobian a second time.  Its consistency and
+        # conditioning checks retain the general QR/SVD path as a fallback.
+        # Periodic systems and explicit fragment frames do not have the six
+        # global Cartesian rigid motions as their complete Jacobian nullspace.
+        # Skip the failed applicability work there and use the general path.
+        has_fragment_frames = bool(
+            getattr(self.int, 'fragment_atom_groups', None)
+        )
+        rigid_qr = None
+        if not np.any(self.atoms.pbc) and not has_fragment_frames:
+            rigid_qr = self._rigid_nullspace_qr(B)
+        if rigid_qr is not None:
+            Q, R, Binv = rigid_qr
+            self._pinv_cache.put(state_hash, Binv)
+            self._qr_cache.put(state_hash, (Q, R))
+            return Q, R
+
         qr_pinv = _gpu_qr_with_pinv(B)
         if qr_pinv is None:
             Q, R = _gpu_qr(B)
@@ -1061,24 +1082,18 @@ class InternalPES(PES):
             # range(B) = Q @ range(R) and pinv(B) = pinv(R) @ Q.T, so the
             # rank-revealing work shrinks to the small (k x n) R factor.
             # This is ~1.5x faster than SVD-of-B on large systems and matches
-            # it to machine precision. This branch is rare for cell optimization
-            # but common for free molecules (redundant internals + rigid-body
-            # null space), where it fires essentially every step.
-            rigid_qr = self._rigid_nullspace_qr(B)
-            if rigid_qr is not None:
-                Q, R, Binv = rigid_qr
-                self._pinv_cache.put(state_hash, Binv)
-            else:
-                Ur, Sr, VTr = _robust_svd(R, full_matrices=False)
-                nnred = _svd_rank(Sr)
+            # it to machine precision. Free molecules with only rigid-body
+            # null modes returned above; this handles other rank deficiencies.
+            Ur, Sr, VTr = _robust_svd(R, full_matrices=False)
+            nnred = _svd_rank(Sr)
 
-                # Binv = pinv(R) @ Q.T, computed before Q/R are reassigned below.
-                Binv = (VTr[:nnred].T / Sr[:nnred]) @ (Ur[:, :nnred].T @ Q.T)
-                self._pinv_cache.put(state_hash, Binv)
+            # Binv = pinv(R) @ Q.T, computed before Q/R are reassigned below.
+            Binv = (VTr[:nnred].T / Sr[:nnred]) @ (Ur[:, :nnred].T @ Q.T)
+            self._pinv_cache.put(state_hash, Binv)
 
-                Q = Q @ Ur[:, :nnred]  # orthonormal basis for range(B) = Unred
-                # (nnred, n) non-square -> signals deficiency
-                R = np.diag(Sr[:nnred]) @ VTr[:nnred]
+            Q = Q @ Ur[:, :nnred]  # orthonormal basis for range(B) = Unred
+            # (nnred, n) non-square -> signals deficiency
+            R = np.diag(Sr[:nnred]) @ VTr[:nnred]
 
         self._qr_cache.put(state_hash, (Q, R))
         return Q, R

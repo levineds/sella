@@ -407,17 +407,97 @@ def test_rank_deficient_jacobian_uses_rigid_nullspace(
     def fail_svd(*args, **kwargs):
         raise AssertionError("rigid-nullspace path should avoid SVD")
 
+    from sella import peswrapper
+    qr_shapes = []
+    original_qr_with_pinv = peswrapper._gpu_qr_with_pinv
+
+    def record_qr_shape(matrix):
+        qr_shapes.append(matrix.shape)
+        return original_qr_with_pinv(matrix)
+
     monkeypatch.setattr("sella.peswrapper._robust_svd", fail_svd)
+    monkeypatch.setattr(
+        "sella.peswrapper._gpu_qr_with_pinv", record_qr_shape
+    )
     B = dyn.pes.int.jacobian()
     Q, R = dyn.pes._get_jacobian_qr()
     Binv = dyn.pes._get_Binv()
 
+    assert B.shape not in qr_shapes
+    assert (B.shape[0], B.shape[1] - expected_nullity) in qr_shapes
     assert Q.shape[1] == B.shape[1] - expected_nullity
     assert R.shape == (Q.shape[1], B.shape[1])
     np.testing.assert_allclose(Q.T @ Q, np.eye(Q.shape[1]), atol=1e-10)
     np.testing.assert_allclose(Q @ R, B, atol=1e-10)
     np.testing.assert_allclose(B @ Binv @ B, B, atol=1e-10)
     np.testing.assert_allclose(Binv @ B @ Binv, Binv, atol=1e-10)
+
+
+def test_periodic_jacobian_skips_rigid_nullspace(monkeypatch):
+    """Periodic cell optimizations should go directly to the general QR."""
+    from ase import Atoms
+    from ase.calculators.lj import LennardJones
+    from sella import Sella
+
+    atoms = Atoms(
+        'OH2',
+        positions=[[0, 0, 0], [0.96, 0, 0], [0, 0.96, 0]],
+        cell=np.eye(3) * 8.0,
+        pbc=True,
+    )
+    atoms.calc = LennardJones()
+    dyn = Sella(
+        atoms, order=0, internal=True, optimize_cell=True,
+        allow_fragments=True, logfile=None,
+    )
+
+    def fail_rigid_qr(*args, **kwargs):
+        raise AssertionError("periodic systems should skip the rigid fast path")
+
+    monkeypatch.setattr(
+        "sella.peswrapper.InternalPES._rigid_nullspace_qr", fail_rigid_qr
+    )
+    Q, R = dyn.pes._get_jacobian_qr()
+    np.testing.assert_allclose(Q @ R, dyn.pes.int.jacobian(), atol=1e-10)
+
+
+def test_rigid_nullspace_failure_uses_general_qr(monkeypatch):
+    """An eligible but rejected rigid fast path must retain the fallback."""
+    from ase import Atoms
+    from ase.calculators.lj import LennardJones
+    from sella import Sella, peswrapper
+
+    atoms = Atoms(
+        'CH4',
+        positions=[
+            [0.00, 0.00, 0.00],
+            [0.63, 0.63, 0.63],
+            [-0.63, -0.63, 0.63],
+            [-0.63, 0.63, -0.63],
+            [0.63, -0.63, -0.63],
+        ],
+    )
+    atoms.calc = LennardJones()
+    dyn = Sella(
+        atoms, order=0, internal=True, allow_fragments=False, logfile=None,
+    )
+    B = dyn.pes.int.jacobian()
+    qr_shapes = []
+    original_qr_with_pinv = peswrapper._gpu_qr_with_pinv
+
+    def record_qr_shape(matrix):
+        qr_shapes.append(matrix.shape)
+        return original_qr_with_pinv(matrix)
+
+    monkeypatch.setattr(
+        "sella.peswrapper.InternalPES._rigid_nullspace_qr",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "sella.peswrapper._gpu_qr_with_pinv", record_qr_shape
+    )
+    dyn.pes._get_jacobian_qr()
+    assert B.shape in qr_shapes
 
 
 def test_copy_preserves_fragment_atom_groups():
