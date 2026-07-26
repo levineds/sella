@@ -81,6 +81,7 @@ class Sella(Optimizer):
         save_hessian: str = None,
         exact_geodesic: bool = None,
         max_cpu_threads: Optional[int] = None,
+        hessian_delta: float = 1e-4,
         **kwargs
     ):
         """Initialize Sella optimizer.
@@ -124,9 +125,14 @@ class Sella(Optimizer):
             - False or 0: No refinement (default)
             - -1: Forward differences for cell blocks (n_cell_dof force calls)
             - True or 1: Central differences for cell blocks (2 * n_cell_dof force calls)
-            - 2: Also refine translation/rotation blocks for molecular crystals
-              (adds 2 * n_tric force calls, where n_tric = n_fragments * 6)
-            - 3: Refine full internal Hessian (2 * n_internal force calls, expensive!)
+            - 2: Also refine internal-coordinate translation/rotation blocks
+              when TRICs are present (adds 2 * n_tric force calls)
+            - 3: Build the complete Cartesian Hessian (6N force calls) and,
+              when using internals, transform it to the internal basis
+            Levels 1 and 2 are no-ops when their coordinate types are absent.
+        hessian_delta : float, optional
+            Finite-difference displacement used for Hessian refinement.
+            Default is 1e-4.
         save_hessian : str, optional
             Path to save the initial Hessian as .npy file for analysis.
         max_cpu_threads : int, optional
@@ -157,6 +163,9 @@ class Sella(Optimizer):
         self.niggli = niggli
         self.exact_geodesic = exact_geodesic if exact_geodesic is not None else True
         self.smax = smax
+        self.refine_initial_hessian = refine_initial_hessian
+        self.hessian_delta = hessian_delta
+        self.save_hessian = save_hessian
         if optimize_cell:
             if order != 0:
                 raise ValueError(
@@ -197,6 +206,7 @@ class Sella(Optimizer):
             scalar_pressure=scalar_pressure,
             allow_fragments=allow_fragments,
             refine_initial_hessian=refine_initial_hessian,
+            hessian_delta=hessian_delta,
             save_hessian=save_hessian,
             exact_geodesic=self.exact_geodesic,
             **kwargs
@@ -267,6 +277,7 @@ class Sella(Optimizer):
         refine_initial_hessian: Union[bool, int] = False,
         save_hessian: str = None,
         exact_geodesic: bool = None,
+        hessian_delta: float = 1e-4,
         **kwargs
     ):
         if internal:
@@ -301,6 +312,7 @@ class Sella(Optimizer):
                     cell_mask=cell_mask,
                     scalar_pressure=scalar_pressure,
                     refine_initial_hessian=refine_initial_hessian,
+                    hessian_delta=hessian_delta,
                     save_hessian=save_hessian,
                     exact_geodesic=exact_geodesic,
                     **kwargs
@@ -315,6 +327,9 @@ class Sella(Optimizer):
                     auto_find_internals=auto_find_internals,
                     hessian_function=hessian_function,
                     exact_geodesic=exact_geodesic,
+                    refine_initial_hessian=refine_initial_hessian,
+                    hessian_delta=hessian_delta,
+                    save_hessian=save_hessian,
                     **kwargs
                 )
         else:
@@ -335,6 +350,7 @@ class Sella(Optimizer):
                     cell_mask=cell_mask,
                     scalar_pressure=scalar_pressure,
                     refine_initial_hessian=refine_initial_hessian,
+                    hessian_delta=hessian_delta,
                     save_hessian=save_hessian,
                     **kwargs
                 )
@@ -346,6 +362,9 @@ class Sella(Optimizer):
                     eta=eta,
                     v0=v0,
                     hessian_function=hessian_function,
+                    refine_initial_hessian=refine_initial_hessian,
+                    hessian_delta=hessian_delta,
+                    save_hessian=save_hessian,
                     **kwargs
                 )
         self.trajectory = self.pes.traj
@@ -354,6 +373,11 @@ class Sella(Optimizer):
         """Build or diagonalize the initial Hessian when eig mode is active."""
         if self.pes.hessian_function is not None:
             self.pes.calculate_hessian()
+        elif getattr(self.pes, 'initial_hessian_refinement_level', 0) >= 3:
+            # A complete finite-difference matrix is already installed. The
+            # restricted-step solver diagonalizes its projected form directly;
+            # do not launch an adaptive HVP eigensolve over the same geometry.
+            self.pes.first_diag = False
         else:
             self.pes.diag(**self.diagkwargs)
         self.nsteps_since_diag = -1

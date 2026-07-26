@@ -435,6 +435,9 @@ class PES:
         proj_trans: bool = None,
         proj_rot: bool = None,
         hessian_function: Callable[[Atoms], np.ndarray] = None,
+        refine_initial_hessian: Union[bool, int] = False,
+        hessian_delta: float = 1e-4,
+        save_hessian: str = None,
     ) -> None:
         self.atoms = atoms
         if constraints is None:
@@ -500,6 +503,18 @@ class PES:
 
         self._basis_cache = _LRU2()
 
+        refine_level = self._coerce_refine_level(refine_initial_hessian)
+        self.initial_hessian_refinement_level = refine_level
+        if refine_level >= 3:
+            self.set_H(
+                self._fd_cartesian_hessian(hessian_delta),
+                initialized=False,
+            )
+
+        if save_hessian is not None:
+            np.save(save_hessian, self.H.asarray())
+            logger.info("Initial Hessian saved to %s", save_hessian)
+
     apos = property(lambda self: self.atoms.positions.copy())
     dpos = property(lambda self: None)
 
@@ -550,6 +565,102 @@ class PES:
 
     def get_x(self):
         return self.apos.ravel().copy()
+
+    @staticmethod
+    def _coerce_refine_level(refine_initial_hessian) -> int:
+        if refine_initial_hessian is True:
+            return 1
+        if refine_initial_hessian is False:
+            return 0
+        return int(refine_initial_hessian)
+
+    def _fd_hessian_columns(self, delta, indices, n_rows, label="",
+                            forward=False):
+        """Finite-difference Hessian columns for coordinate indices."""
+        n_cols = len(indices)
+        H_cols = np.zeros((n_rows, n_cols))
+        x0 = self.get_x()
+        cell0 = self.atoms.get_cell().array.copy()
+        pos0 = self.atoms.positions.copy()
+        dpos0 = None if self.dummies is None else self.dummies.positions.copy()
+
+        suffix = " (forward)" if forward else ""
+        if forward:
+            _, g0 = self.eval()
+            n_evals = n_cols + 1
+            logger.info("Refining %s Hessian (forward): 1/%d force calls",
+                        label, n_evals)
+        else:
+            n_evals = 2 * n_cols
+            logger.info("Refining %s Hessian: 0/%d force calls",
+                        label, n_evals)
+
+        def _probe(idx, sign):
+            # Restore before every probe because curvilinear and cell updates
+            # are path-dependent.
+            self.atoms.positions = pos0.copy()
+            if dpos0 is not None:
+                self.dummies.positions = dpos0.copy()
+            self.atoms.set_cell(cell0, scale_atoms=False)
+            x_probe = x0.copy()
+            x_probe[idx] += sign * delta
+            self.set_x(x_probe)
+            return self.eval()[1]
+
+        for col, idx in enumerate(indices):
+            g_plus = _probe(idx, +1)
+            if forward:
+                H_cols[:, col] = (g_plus[:n_rows] - g0[:n_rows]) / delta
+            else:
+                g_minus = _probe(idx, -1)
+                H_cols[:, col] = (
+                    (g_plus[:n_rows] - g_minus[:n_rows]) / (2 * delta)
+                )
+
+            if (col + 1) % max(n_cols // 10, 1) == 0 or col == n_cols - 1:
+                count = (col + 2) if forward else 2 * (col + 1)
+                logger.info("Refining %s Hessian%s: %d/%d force calls",
+                            label, suffix, count, n_evals)
+
+        self.atoms.positions = pos0
+        if dpos0 is not None:
+            self.dummies.positions = dpos0
+        self.atoms.set_cell(cell0, scale_atoms=False)
+        self.curr['x'] = None
+        self.curr['f'] = None
+        self.curr['g'] = None
+        return H_cols
+
+    def _fd_cartesian_hessian(self, delta: float) -> np.ndarray:
+        """Build the Cartesian Hessian by central force differences."""
+        positions = self.atoms.positions.copy()
+        ncart = positions.size
+        H_cols = np.empty((ncart, ncart))
+        logger.info("Refining Cartesian Hessian: 0/%d force calls", 2 * ncart)
+
+        for column in range(ncart):
+            displaced = positions.copy().reshape(-1)
+            displaced[column] += delta
+            self.atoms.positions = displaced.reshape((-1, 3))
+            _, g_plus = PES.eval(self)
+
+            displaced[column] -= 2 * delta
+            self.atoms.positions = displaced.reshape((-1, 3))
+            _, g_minus = PES.eval(self)
+            H_cols[:, column] = (g_plus - g_minus) / (2 * delta)
+
+            if ((column + 1) % max(ncart // 10, 1) == 0
+                    or column == ncart - 1):
+                logger.info(
+                    "Refining Cartesian Hessian: %d/%d force calls",
+                    2 * (column + 1), 2 * ncart,
+                )
+
+        self.atoms.positions = positions
+        self.curr['x'] = None
+        self.curr['f'] = None
+        self.curr['g'] = None
+        return (H_cols + H_cols.T) / 2
 
     # Hessian getter/setter
     def get_H(self):
@@ -880,6 +991,9 @@ class InternalPES(PES):
         iterative_stepper: int = 0,
         auto_find_internals: bool = True,
         exact_geodesic: bool = False,
+        refine_initial_hessian: Union[bool, int] = False,
+        hessian_delta: float = 1e-4,
+        save_hessian: str = None,
         **kwargs
     ):
         new_int = internals.copy()
@@ -903,6 +1017,7 @@ class InternalPES(PES):
         self.int = new_int
         self.dummies = self.int.dummies
         self.dim = len(self.get_x())
+        self.n_internal = self.dim
         self.ncart = self.int.ndof
         if H0 is None:
             # Construct guess hessian and zero out components in
@@ -922,6 +1037,31 @@ class InternalPES(PES):
         self._pinv_cache = _LRU2()
         self._qr_cache = _LRU2()
         self._Hc_cache = _LRU2()
+
+        refine_level = self._coerce_refine_level(refine_initial_hessian)
+        self.initial_hessian_refinement_level = refine_level
+        refined = False
+        H_refined = self.H.asarray().copy()
+        if refine_level >= 3:
+            H_cart = self._fd_cartesian_hessian(hessian_delta)
+            H_refined = self._convert_cartesian_hessian_to_internal(H_cart)
+            refined = True
+        elif refine_level >= 2:
+            tric_indices = self._get_tric_indices()
+            if len(tric_indices):
+                H_tric_cols = self._compute_tric_hessian_columns(
+                    hessian_delta
+                )
+                for col, idx in enumerate(tric_indices):
+                    H_refined[:, idx] = H_tric_cols[:, col]
+                    H_refined[idx, :] = H_tric_cols[:, col]
+                refined = True
+
+        if refined:
+            self.set_H(H_refined, initialized=False)
+        if save_hessian is not None:
+            np.save(save_hessian, self.H.asarray())
+            logger.info("Initial Hessian saved to %s", save_hessian)
 
     dpos = property(lambda self: self.dummies.positions.copy())
 
@@ -1141,6 +1281,34 @@ class InternalPES(PES):
         self._pinv_cache.put(state_hash, Binv)
         return Binv
 
+    def _get_tric_indices(self) -> np.ndarray:
+        """Indices of translation and rotation internal coordinates."""
+        n_trans = len(self.int.internals['translations'])
+        n_bonds = len(self.int.internals['bonds'])
+        n_angles = len(self.int.internals['angles'])
+        n_dihedrals = len(self.int.internals['dihedrals'])
+        n_other = len(self.int.internals['other'])
+        n_rot = len(self.int.internals['rotations'])
+
+        trans_indices = list(range(n_trans))
+        rot_start = n_trans + n_bonds + n_angles + n_dihedrals + n_other
+        rot_indices = list(range(rot_start, rot_start + n_rot))
+        return np.array(trans_indices + rot_indices, dtype=int)
+
+    def _compute_tric_hessian_columns(self, delta: float) -> np.ndarray:
+        """Compute Hessian columns for translation/rotation coordinates."""
+        tric_indices = self._get_tric_indices()
+        return self._fd_hessian_columns(
+            delta, tric_indices, self.dim, "TRIC"
+        )
+
+    def _compute_internal_hessian_columns(self, delta: float) -> np.ndarray:
+        """Compute the complete internal-coordinate Hessian by FD."""
+        indices = list(range(self.n_internal))
+        return self._fd_hessian_columns(
+            delta, indices, self.n_internal, "internal"
+        )
+
     # =========================================================================
     # Iterative stepper with improved convergence checking
     # =========================================================================
@@ -1270,9 +1438,12 @@ class InternalPES(PES):
         self._ode_Binv_gpu = (
             _gpu_left_factor(Binv) if not self.exact_geodesic else None
         )
+        g_current = self.curr.get('g')
+        if g_current is None:
+            g_current = np.zeros_like(dx)
         y0 = np.hstack((self.apos.ravel(), self.dpos.ravel(),
                         Binv @ dx,
-                        Binv @ self.curr.get('g', np.zeros_like(dx))))
+                        Binv @ g_current))
         ode = LSODA(self._q_ode, t0, y0, t_bound=1., atol=1e-6)
 
         while ode.status == 'running':
@@ -2167,81 +2338,6 @@ class _CellPESMixin:
             delta_u, indices, self.dim, "cell", forward=forward
         )
 
-    def _fd_hessian_columns(self, delta, indices, n_rows, label="",
-                            forward=False):
-        """Finite-difference Hessian columns for arbitrary coordinate indices.
-
-        Central differences (2 * n_cols evals) by default; forward differences
-        (n_cols + 1 evals, using the current gradient as the baseline) when
-        ``forward=True``.
-
-        Parameters
-        ----------
-        delta : float
-            Finite difference step size.
-        indices : list of int
-            Which DOF indices in get_x() to perturb.
-        n_rows : int
-            Number of gradient components to store per column.
-        label : str
-            Label for log messages.
-        forward : bool
-            Use forward instead of central differences.
-        """
-        n_cols = len(indices)
-        H_cols = np.zeros((n_rows, n_cols))
-        x0 = self.get_x()
-        cell0 = self.atoms.get_cell().array.copy()
-        pos0 = self.atoms.positions.copy()
-        # CellCartesianPES has no dummy atoms (self.dummies is None).
-        dpos0 = None if self.dummies is None else self.dummies.positions.copy()
-
-        suffix = " (forward)" if forward else ""
-        if forward:
-            _, g0 = self.eval()
-            n_evals = n_cols + 1
-            logger.info("Refining %s Hessian (forward): 1/%d force calls",
-                        label, n_evals)
-        else:
-            n_evals = 2 * n_cols
-            logger.info("Refining %s Hessian: 0/%d force calls",
-                        label, n_evals)
-
-        def _probe(idx, sign):
-            # Restore state before each probe: cell scaling is path-dependent.
-            self.atoms.positions = pos0.copy()
-            if dpos0 is not None:
-                self.dummies.positions = dpos0.copy()
-            self.atoms.set_cell(cell0, scale_atoms=False)
-            x_probe = x0.copy()
-            x_probe[idx] += sign * delta
-            self.set_x(x_probe)
-            return self.eval()[1]
-
-        for col, idx in enumerate(indices):
-            g_plus = _probe(idx, +1)
-            if forward:
-                H_cols[:, col] = (g_plus[:n_rows] - g0[:n_rows]) / delta
-            else:
-                g_minus = _probe(idx, -1)
-                H_cols[:, col] = (
-                    (g_plus[:n_rows] - g_minus[:n_rows]) / (2 * delta)
-                )
-
-            if (col + 1) % max(n_cols // 10, 1) == 0 or col == n_cols - 1:
-                count = (col + 2) if forward else 2 * (col + 1)
-                logger.info("Refining %s Hessian%s: %d/%d force calls",
-                            label, suffix, count, n_evals)
-
-        self.atoms.positions = pos0
-        if dpos0 is not None:
-            self.dummies.positions = dpos0
-        self.atoms.set_cell(cell0, scale_atoms=False)
-        self.curr['x'] = None
-        self.curr['f'] = None
-        self.curr['g'] = None
-        return H_cols
-
     def maybe_niggli_reduce(self, angle_threshold=30.0):
         """Apply Niggli reduction if cell angles deviate too far from 90 deg.
 
@@ -2295,12 +2391,7 @@ class _CellPESMixin:
         else:
             H0_full[:n, :n] = H_coords_default
 
-        if refine_initial_hessian is True:
-            refine_level = 1
-        elif refine_initial_hessian is False:
-            refine_level = 0
-        else:
-            refine_level = int(refine_initial_hessian)
+        refine_level = self._coerce_refine_level(refine_initial_hessian)
 
         if refine_level == 0:
             H0_full[n:, n:] = np.eye(self.n_cell_dof)
@@ -2579,6 +2670,7 @@ class CellInternalPES(_CellPESMixin, InternalPES):
             H_old, refine_initial_hessian, hessian_delta,
             save_hessian, H_coords_default,
         )
+        self.initial_hessian_refinement_level = refine_level
 
         if refine_level >= 2:
             H_tric_cols = self._compute_tric_hessian_columns(hessian_delta)
@@ -2644,36 +2736,6 @@ class CellInternalPES(_CellPESMixin, InternalPES):
             H[:self.n_internal, :self.n_internal] = (H_int_cols + H_int_cols.T) / 2
         self.set_H(H, initialized=True)
         logger.info("Hessian re-refined at level %d", refine_level)
-
-    def _get_tric_indices(self) -> np.ndarray:
-        """Get indices of translation and rotation coordinates in internal space."""
-        n_trans = len(self.int.internals['translations'])
-        n_bonds = len(self.int.internals['bonds'])
-        n_angles = len(self.int.internals['angles'])
-        n_dihedrals = len(self.int.internals['dihedrals'])
-        n_rot = len(self.int.internals['rotations'])
-
-        # Internal coord order: translations, bonds, angles, dihedrals, other, rotations
-        trans_indices = list(range(n_trans))
-        rot_start = n_trans + n_bonds + n_angles + n_dihedrals + len(self.int.internals['other'])
-        rot_indices = list(range(rot_start, rot_start + n_rot))
-
-        return np.array(trans_indices + rot_indices)
-
-    def _compute_tric_hessian_columns(self, delta: float) -> np.ndarray:
-        """Compute Hessian columns for translation/rotation DOF via FD."""
-        tric_indices = self._get_tric_indices()
-        return self._fd_hessian_columns(delta, tric_indices, self.dim, "TRIC")
-
-    def _compute_internal_hessian_columns(self, delta: float) -> np.ndarray:
-        """Compute full internal-internal Hessian block via FD.
-
-        Expensive: requires 2 * n_internal force evaluations.
-        """
-        indices = list(range(self.n_internal))
-        return self._fd_hessian_columns(
-            delta, indices, self.n_internal, "internal"
-        )
 
     def get_x(self) -> np.ndarray:
         """Return combined internal coordinates + cell parameters.
@@ -3425,6 +3487,7 @@ class CellCartesianPES(_CellPESMixin, PES):
             H_old, refine_initial_hessian, hessian_delta,
             save_hessian, H_coords_default,
         )
+        self.initial_hessian_refinement_level = refine_level
         self.set_H(H0_full, initialized=(refine_level == 0))
 
     @property
