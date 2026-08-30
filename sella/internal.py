@@ -116,6 +116,9 @@ def _aot_code_hash():
 _AOT_CODE_HASH = _aot_code_hash()
 _AOT_TORCH_TAG = f'{torch.__version__}:{torch.version.git_version}'
 _AOT_PY_TAG = sys.implementation.cache_tag or 'py'
+_AOT_DISABLED_REASON = None
+_AOT_WARNED = False
+_AOT_STATE_LOCK = threading.Lock()
 
 
 def _aot_cache_dir():
@@ -164,6 +167,41 @@ def _aot_signature(args, kwargs):
     return sig
 
 
+class _TorchCompileFallback:
+    """Use ``torch.compile`` when available, falling back to eager Torch."""
+
+    def __init__(self, func):
+        self.eager = func
+        self.compiled = None
+        self.disabled = not hasattr(torch, 'compile')
+        if not self.disabled:
+            try:
+                self.compiled = torch.compile(
+                    func, fullgraph=True, dynamic=False
+                )
+            except Exception as exc:
+                self.disabled = True
+                warnings.warn(
+                    'torch.compile setup failed; using eager Torch: '
+                    f'{str(exc).splitlines()[0]}',
+                    RuntimeWarning,
+                )
+
+    def __call__(self, *args, **kwargs):
+        if self.disabled or self.compiled is None:
+            return self.eager(*args, **kwargs)
+        try:
+            return self.compiled(*args, **kwargs)
+        except Exception as exc:
+            self.disabled = True
+            warnings.warn(
+                'torch.compile execution failed; using eager Torch: '
+                f'{str(exc).splitlines()[0]}',
+                RuntimeWarning,
+            )
+            return self.eager(*args, **kwargs)
+
+
 class _TorchAOTFunction:
     """Persistent AOT-compiled coordinate root.
 
@@ -181,6 +219,8 @@ class _TorchAOTFunction:
         self.cache_name = cache_name
         self._by_sig = {}
         self._lock = threading.Lock()
+        self._aot_disabled = False
+        self._compile_fallback = None
 
     def __call__(self, *args, **kwargs):
         if not self.enabled:
@@ -189,23 +229,72 @@ class _TorchAOTFunction:
         compiled = self._by_sig.get(sig)
         if compiled is None:
             compiled = self._resolve(sig, args, kwargs)
-        return compiled(*args, **kwargs)
+        try:
+            return compiled(*args, **kwargs)
+        except Exception as exc:
+            if self._aot_disabled:
+                raise
+            self._disable_aot(exc)
+            compiled = self._get_compile_fallback()
+            self._by_sig.clear()
+            self._by_sig[sig] = compiled
+            return compiled(*args, **kwargs)
 
     def _resolve(self, sig, args, kwargs):
         with self._lock:
+            if _AOT_DISABLED_REASON is not None:
+                self._aot_disabled = True
             compiled = self._by_sig.get(sig)
             if compiled is not None:
                 return compiled
-            path = os.path.join(
-                _aot_cache_dir(),
-                f'{self.cache_name}-{self._file_key(sig)}.pt',
-            )
-            if os.path.exists(path):
-                compiled = self._load(path)
+            path = None
+            if not self._aot_disabled:
+                try:
+                    path = os.path.join(
+                        _aot_cache_dir(),
+                        f'{self.cache_name}-{self._file_key(sig)}.pt',
+                    )
+                    if os.path.exists(path):
+                        compiled = self._load(path)
+                    else:
+                        compiled = self._compile_and_save(path, args, kwargs)
+                except Exception as exc:
+                    self._discard_artifact(path)
+                    self._disable_aot(exc)
+                    compiled = self._get_compile_fallback()
             else:
-                compiled = self._compile_and_save(path, args, kwargs)
+                compiled = self._get_compile_fallback()
             self._by_sig[sig] = compiled
             return compiled
+
+    def _disable_aot(self, exc):
+        global _AOT_DISABLED_REASON, _AOT_WARNED
+        self._aot_disabled = True
+        reason = str(exc).splitlines()[0]
+        with _AOT_STATE_LOCK:
+            if _AOT_DISABLED_REASON is None:
+                _AOT_DISABLED_REASON = reason
+            if not _AOT_WARNED:
+                warnings.warn(
+                    f'Torch AOT cache unavailable for {self.cache_name}; '
+                    f'falling back to torch.compile: {reason}',
+                    RuntimeWarning,
+                )
+                _AOT_WARNED = True
+
+    @staticmethod
+    def _discard_artifact(path):
+        if path is None:
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _get_compile_fallback(self):
+        if self._compile_fallback is None:
+            self._compile_fallback = _TorchCompileFallback(self.eager)
+        return self._compile_fallback
 
     def _file_key(self, sig):
         payload = '|'.join((
