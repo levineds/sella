@@ -4,7 +4,10 @@ from typing import (
 )
 from itertools import product, combinations, permutations
 from functools import partialmethod
+import hashlib
 import os
+import sys
+import threading
 import warnings
 
 from scipy import sparse
@@ -79,41 +82,150 @@ def _torch_function(func):
     return wrapped
 
 
-class _TorchCompileFallback:
-    def __init__(self, func, enabled):
+# Persistent AOT cache keying. The static parts (source hash, torch build tag,
+# python tag) are computed once at import; only the per-signature disk key is
+# hashed, and only on an in-memory miss, never on the hot call path.
+_AOT_SCHEMA = 1
+
+
+def _aot_code_hash():
+    digest = hashlib.sha256()
+    try:
+        with open(__file__, 'rb') as source:
+            for chunk in iter(lambda: source.read(1 << 20), b''):
+                digest.update(chunk)
+    except OSError:
+        digest.update(__name__.encode('utf-8'))
+    return digest.hexdigest()
+
+
+_AOT_CODE_HASH = _aot_code_hash()
+_AOT_TORCH_TAG = f'{torch.__version__}:{torch.version.git_version}'
+_AOT_PY_TAG = sys.implementation.cache_tag or 'py'
+
+
+def _aot_cache_dir():
+    override = os.environ.get('SELLA_TORCH_AOT_CACHE_DIR')
+    if override:
+        base = os.path.expanduser(override)
+    else:
+        cache_home = (
+            os.environ.get('XDG_CACHE_HOME')
+            or os.path.expanduser('~/.cache')
+        )
+        base = os.path.join(cache_home, 'sella', 'torch-aot')
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _aot_guard_filter(entries):
+    """Keep only local, serializable guards so the artifact can be pickled.
+
+    Shape/dtype specialization is captured by our own cache key, so dropping
+    the global and non-serializable guards here is safe for these pure
+    coordinate-math roots.
+    """
+    from torch._dynamo.guards import CheckFunctionManager
+    unsupported = set(CheckFunctionManager.UNSUPPORTED_SERIALIZATION_GUARD_TYPES)
+    return [
+        (not entry.is_global)
+        and entry.guard_type not in unsupported
+        and not unsupported.intersection(entry.derived_guard_types or ())
+        for entry in entries
+    ]
+
+
+def _aot_signature(args, kwargs):
+    sig = tuple(
+        (tuple(arg.shape), arg.dtype) if torch.is_tensor(arg)
+        else ('const', repr(arg))
+        for arg in args
+    )
+    if kwargs:
+        sig = sig + tuple(
+            (key, tuple(val.shape), val.dtype) if torch.is_tensor(val)
+            else (key, 'const', repr(val))
+            for key, val in sorted(kwargs.items())
+        )
+    return sig
+
+
+class _TorchAOTFunction:
+    """Persistent AOT-compiled coordinate root.
+
+    The root is compiled once per input signature and the compiled callable is
+    serialized to disk, so later processes reload it without any Dynamo
+    tracing. The hot path is a shape-keyed in-memory dict lookup; the sha256
+    disk key and filesystem access occur only on an in-memory miss (first time
+    a signature is seen in a process). When compilation is disabled the eager
+    function runs directly.
+    """
+
+    def __init__(self, func, enabled, cache_name):
         self.eager = func
-        self.compiled = None
-        self.disabled = not enabled
-        if not self.disabled and hasattr(torch, 'compile'):
-            try:
-                self.compiled = torch.compile(
-                    func, fullgraph=True, dynamic=False
-                )
-            except Exception as exc:
-                self.disabled = True
-                warnings.warn(
-                    'torch.compile setup failed; using eager torch: '
-                    f'{str(exc).splitlines()[0]}',
-                    RuntimeWarning,
-                )
+        self.enabled = enabled
+        self.cache_name = cache_name
+        self._by_sig = {}
+        self._lock = threading.Lock()
 
     def __call__(self, *args, **kwargs):
-        if self.disabled or self.compiled is None:
+        if not self.enabled:
             return self.eager(*args, **kwargs)
-        try:
-            return self.compiled(*args, **kwargs)
-        except Exception as exc:
-            self.disabled = True
-            warnings.warn(
-                'torch.compile failed; using eager torch: '
-                f'{str(exc).splitlines()[0]}',
-                RuntimeWarning,
+        sig = _aot_signature(args, kwargs)
+        compiled = self._by_sig.get(sig)
+        if compiled is None:
+            compiled = self._resolve(sig, args, kwargs)
+        return compiled(*args, **kwargs)
+
+    def _resolve(self, sig, args, kwargs):
+        with self._lock:
+            compiled = self._by_sig.get(sig)
+            if compiled is not None:
+                return compiled
+            path = os.path.join(
+                _aot_cache_dir(),
+                f'{self.cache_name}-{self._file_key(sig)}.pt',
             )
-            return self.eager(*args, **kwargs)
+            if os.path.exists(path):
+                compiled = self._load(path)
+            else:
+                compiled = self._compile_and_save(path, args, kwargs)
+            self._by_sig[sig] = compiled
+            return compiled
+
+    def _file_key(self, sig):
+        payload = '|'.join((
+            str(_AOT_SCHEMA), _AOT_TORCH_TAG, _AOT_PY_TAG,
+            _AOT_CODE_HASH, self.cache_name, repr(sig),
+        ))
+        return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+    def _load(self, path):
+        with open(path, 'rb') as handle:
+            return torch.compiler.load_compiled_function(
+                handle, f_globals=self.eager.__globals__
+            )
+
+    def _compile_and_save(self, path, args, kwargs):
+        compiled = torch.compile(
+            self.eager, fullgraph=True, dynamic=False,
+            options={'guard_filter_fn': _aot_guard_filter},
+        )
+        artifact = compiled.aot_compile((args, kwargs))
+        tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
+        try:
+            artifact.save_compiled_function(tmp)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        return self._load(path)
 
 
-def _compiled_torch_function(func, enabled):
-    return _torch_function(_TorchCompileFallback(func, enabled=enabled))
+def _compiled_torch_function(func, enabled, cache_name):
+    return _torch_function(
+        _TorchAOTFunction(func, enabled=enabled, cache_name=cache_name)
+    )
 
 
 def _to_numpy(value):
@@ -260,10 +372,12 @@ def _batched_gradients_torch(
 
 
 _batched_values = _compiled_torch_function(
-    _batched_values_torch, enabled=_TORCH_COMPILE_ALL
+    _batched_values_torch, enabled=_TORCH_COMPILE_ALL,
+    cache_name='batched-values',
 )
 _batched_gradients = _compiled_torch_function(
-    _batched_gradients_torch, enabled=_TORCH_COMPILE_ALL
+    _batched_gradients_torch, enabled=_TORCH_COMPILE_ALL,
+    cache_name='batched-gradients',
 )
 
 # Batched hessian functions: output shapes (n_coords, n_atoms, 3, n_atoms, 3)
@@ -355,6 +469,7 @@ def _batched_hvps_torch(
 _batched_hvps = _compiled_torch_function(
     _batched_hvps_torch,
     enabled=_TORCH_COMPILE_ALL,
+    cache_name='batched-hvps',
 )
 
 
@@ -446,7 +561,8 @@ def _batched_cell_gradients_torch(
 
 
 _batched_cell_gradients = _compiled_torch_function(
-    _batched_cell_gradients_torch, enabled=_TORCH_COMPILE_ALL
+    _batched_cell_gradients_torch, enabled=_TORCH_COMPILE_ALL,
+    cache_name='batched-cell-gradients',
 )
 
 

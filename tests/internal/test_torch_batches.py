@@ -206,29 +206,38 @@ def test_bad_angle_check_uses_consolidated_value_batch():
     assert internals._bad_angles() == []
 
 
-def test_torch_compile_constructs_four_coordinate_regions():
+def test_aot_compilation_caches_four_coordinate_regions(tmp_path):
+    """The four consolidated roots each persist exactly one AOT artifact.
+
+    Compilation is lazy (per input signature, on first call), so this drives
+    each root once with a zero-batch signature and checks the four expected
+    cache-name prefixes appear in an isolated cache directory.
+    """
     root = Path(__file__).resolve().parents[2]
     code = """
-import json
 import os
 
 os.environ['SELLA_TORCH_COMPILE'] = 'all'
 import torch
+import sella.internal as m
 
-regions = []
-def fake_compile(func, **kwargs):
-    regions.append([func.__name__, kwargs])
-    return func
-
-torch.compile = fake_compile
-import sella.internal
-print('SELLA_REGIONS=' + json.dumps(regions, sort_keys=True))
+empty_pos = [torch.empty((0, n, 3), dtype=torch.float64) for n in (2, 3, 4)]
+empty_tvec = [torch.empty((0, n, 3), dtype=torch.float64) for n in (1, 2, 3)]
+value_args = [v for pair in zip(empty_pos, empty_tvec) for v in pair]
+hvp_args = [v for pos, tvec in zip(empty_pos, empty_tvec)
+            for v in (pos, tvec, torch.empty_like(pos))]
+cell = torch.eye(3, dtype=torch.float64)
+m._batched_values(*value_args)
+m._batched_gradients(*value_args)
+m._batched_hvps(*hvp_args)
+m._batched_cell_gradients(*value_args, cell)
 """
     env = os.environ.copy()
     env['PYTHONPATH'] = os.pathsep.join(
         [str(root), env.get('PYTHONPATH', '')]
     ).rstrip(os.pathsep)
-    completed = subprocess.run(
+    env['SELLA_TORCH_AOT_CACHE_DIR'] = str(tmp_path)
+    subprocess.run(
         [sys.executable, '-c', code],
         cwd=root,
         env=env,
@@ -236,19 +245,12 @@ print('SELLA_REGIONS=' + json.dumps(regions, sort_keys=True))
         capture_output=True,
         text=True,
     )
-    line = next(
-        line for line in completed.stdout.splitlines()
-        if line.startswith('SELLA_REGIONS=')
+    prefixes = sorted(
+        {path.name.rsplit('-', 1)[0] for path in tmp_path.glob('*.pt')}
     )
-    regions = json.loads(line.removeprefix('SELLA_REGIONS='))
-
-    assert [name for name, _ in regions] == [
-        '_batched_values_torch',
-        '_batched_gradients_torch',
-        '_batched_hvps_torch',
-        '_batched_cell_gradients_torch',
+    assert prefixes == [
+        'batched-cell-gradients',
+        'batched-gradients',
+        'batched-hvps',
+        'batched-values',
     ]
-    assert all(
-        options == {'dynamic': False, 'fullgraph': True}
-        for _, options in regions
-    )
