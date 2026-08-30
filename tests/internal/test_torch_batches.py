@@ -254,3 +254,30 @@ m._batched_cell_gradients(*value_args, cell)
         'batched-hvps',
         'batched-values',
     ]
+
+
+def test_torch_compile_respects_coordinate_thread_cap():
+    root = Path(__file__).resolve().parents[2]
+    code = """
+import os
+
+os.environ['SELLA_TORCH_COMPILE'] = 'all'
+os.environ['SELLA_TORCH_COORD_THREADS'] = '7'
+import sella.internal  # noqa: F401
+import torch._inductor.config as config
+
+print(config.cpp.threads)
+"""
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join(
+        [str(root), env.get('PYTHONPATH', '')]
+    ).rstrip(os.pathsep)
+    completed = subprocess.run(
+        [sys.executable, '-c', code],
+        cwd=root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.stdout.strip() == '7'

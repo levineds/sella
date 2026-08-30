@@ -56,6 +56,20 @@ if _TORCH_COMPILE_ALL:
         )
     except Exception:
         pass
+    # Cap the OMP threads used by the compiled coordinate kernels. Inductor
+    # parallelizes these small per-coordinate kernels above ~2048 coords, and at
+    # the full core count that OMP region oversubscribes and contends, slowing
+    # large batches by ~100x (JAX's XLA-CPU does not). A small cap removes that
+    # cliff while leaving the numpy/BLAS threads the restricted-step solver and
+    # LSODA rely on untouched. Set before compiling so the cap is baked into the
+    # generated kernels (and the AOT artifacts).
+    try:
+        import torch._inductor.config as _torch_inductor_config
+        _coord_threads = int(os.environ.get('SELLA_TORCH_COORD_THREADS', '4'))
+        if _coord_threads > 0:
+            _torch_inductor_config.cpp.threads = _coord_threads
+    except Exception:
+        pass
 
 
 def _as_torch(value):
