@@ -257,7 +257,9 @@ m._batched_cell_gradients(*value_args, cell)
 
 
 def test_aot_failure_falls_back_to_torch_compile(tmp_path, monkeypatch):
-    monkeypatch.setenv('SELLA_TORCH_AOT_CACHE_DIR', str(tmp_path))
+    monkeypatch.setattr(
+        internal_module, '_TORCH_AOT_CACHE_DIR', str(tmp_path)
+    )
     monkeypatch.setattr(internal_module, '_AOT_DISABLED_REASON', None)
     monkeypatch.setattr(internal_module, '_AOT_WARNED', False)
     compile_calls = []
@@ -283,6 +285,77 @@ def test_aot_failure_falls_back_to_torch_compile(tmp_path, monkeypatch):
     torch.testing.assert_close(result, torch.tensor([3.0], dtype=torch.float64))
     assert wrapped._aot_disabled is True
     assert compile_calls == [{'fullgraph': True, 'dynamic': False}]
+    assert len(list(tmp_path.glob('*.failed'))) == 1
+
+    # Simulate a fresh process: the persistent failure marker must bypass AOT
+    # instead of paying for the same incompatible compile/load again.
+    monkeypatch.setattr(internal_module, '_AOT_DISABLED_REASON', None)
+    monkeypatch.setattr(internal_module, '_AOT_WARNED', False)
+    wrapped_again = internal_module._TorchAOTFunction(
+        lambda value: value + 1.0,
+        enabled=True,
+        cache_name='fallback-test',
+    )
+
+    def unexpected_aot(*args, **kwargs):
+        raise AssertionError('failure marker should skip AOT')
+
+    monkeypatch.setattr(wrapped_again, '_compile_and_save', unexpected_aot)
+    with pytest.warns(RuntimeWarning, match='previous AOT failure'):
+        result = wrapped_again(torch.tensor([4.0], dtype=torch.float64))
+
+    torch.testing.assert_close(result, torch.tensor([5.0], dtype=torch.float64))
+    assert len(compile_calls) == 2
+
+
+def test_torch_compile_is_enabled_by_default():
+    root = Path(__file__).resolve().parents[2]
+    code = """
+import sella.internal as internal
+print(internal._TORCH_COMPILE_ALL)
+"""
+    env = os.environ.copy()
+    env.pop('SELLA_TORCH_COMPILE', None)
+    env['PYTHONPATH'] = os.pathsep.join(
+        [str(root), env.get('PYTHONPATH', '')]
+    ).rstrip(os.pathsep)
+    completed = subprocess.run(
+        [sys.executable, '-c', code],
+        cwd=root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.stdout.strip() == 'True'
+
+
+def test_default_aot_cache_is_created_under_home(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    code = """
+import os
+import sella.internal as internal
+
+print(internal._TORCH_AOT_CACHE_DIR)
+print(os.path.isdir(internal._TORCH_AOT_CACHE_DIR))
+"""
+    env = os.environ.copy()
+    env['HOME'] = str(tmp_path)
+    env.pop('SELLA_TORCH_AOT_CACHE_DIR', None)
+    env['PYTHONPATH'] = os.pathsep.join(
+        [str(root), env.get('PYTHONPATH', '')]
+    ).rstrip(os.pathsep)
+    completed = subprocess.run(
+        [sys.executable, '-c', code],
+        cwd=root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    cache_dir, exists = completed.stdout.splitlines()
+    assert cache_dir == str(tmp_path / '.cache' / 'sella' / 'torch-aot')
+    assert exists == 'True'
 
 
 def test_torch_compile_respects_coordinate_thread_cap():

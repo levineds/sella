@@ -38,9 +38,11 @@ from sella.linalg import (
 
 _TORCH_DTYPE = torch.float64
 _TORCH_DEVICE = torch.device('cpu')
-# torch.compile improves repeated batched autodiff kernels, but its per-process
-# startup cost dominates typical short optimizer runs. Keep it opt-in.
-_TORCH_COMPILE_MODE = os.environ.get('SELLA_TORCH_COMPILE', '0').lower()
+# Compile and persist the batched coordinate kernels by default, matching the
+# previous JAX backend's always-on JIT and persistent compilation cache. Set
+# SELLA_TORCH_COMPILE=0 (or false/no/off/eager) before importing Sella to opt
+# out and use eager Torch.
+_TORCH_COMPILE_MODE = os.environ.get('SELLA_TORCH_COMPILE', 'all').lower()
 _TORCH_COMPILE_ALL = _TORCH_COMPILE_MODE in {'1', 'true', 'yes', 'on', 'all'}
 if _TORCH_COMPILE_ALL:
     try:
@@ -102,6 +104,19 @@ def _torch_function(func):
 _AOT_SCHEMA = 1
 
 
+def _initialize_aot_cache_dir():
+    cache_dir = os.environ.setdefault(
+        'SELLA_TORCH_AOT_CACHE_DIR',
+        os.path.expanduser('~/.cache/sella/torch-aot'),
+    )
+    cache_dir = os.path.expanduser(cache_dir)
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError:
+        return None
+    return cache_dir
+
+
 def _aot_code_hash():
     digest = hashlib.sha256()
     try:
@@ -116,23 +131,16 @@ def _aot_code_hash():
 _AOT_CODE_HASH = _aot_code_hash()
 _AOT_TORCH_TAG = f'{torch.__version__}:{torch.version.git_version}'
 _AOT_PY_TAG = sys.implementation.cache_tag or 'py'
+_TORCH_AOT_CACHE_DIR = _initialize_aot_cache_dir()
 _AOT_DISABLED_REASON = None
 _AOT_WARNED = False
 _AOT_STATE_LOCK = threading.Lock()
 
 
 def _aot_cache_dir():
-    override = os.environ.get('SELLA_TORCH_AOT_CACHE_DIR')
-    if override:
-        base = os.path.expanduser(override)
-    else:
-        cache_home = (
-            os.environ.get('XDG_CACHE_HOME')
-            or os.path.expanduser('~/.cache')
-        )
-        base = os.path.join(cache_home, 'sella', 'torch-aot')
-    os.makedirs(base, exist_ok=True)
-    return base
+    if _TORCH_AOT_CACHE_DIR is None:
+        raise OSError('Torch AOT cache directory is not writable')
+    return _TORCH_AOT_CACHE_DIR
 
 
 def _aot_guard_filter(entries):
@@ -254,12 +262,18 @@ class _TorchAOTFunction:
                         _aot_cache_dir(),
                         f'{self.cache_name}-{self._file_key(sig)}.pt',
                     )
+                    failure = self._read_failure_marker(path)
+                    if failure is not None:
+                        raise RuntimeError(
+                            f'previous AOT failure for this signature: {failure}'
+                        )
                     if os.path.exists(path):
                         compiled = self._load(path)
                     else:
                         compiled = self._compile_and_save(path, args, kwargs)
                 except Exception as exc:
                     self._discard_artifact(path)
+                    self._write_failure_marker(path, exc)
                     self._disable_aot(exc)
                     compiled = self._get_compile_fallback()
             else:
@@ -291,6 +305,39 @@ class _TorchAOTFunction:
         except OSError:
             pass
 
+    @staticmethod
+    def _failure_marker(path):
+        return None if path is None else f'{path}.failed'
+
+    @classmethod
+    def _read_failure_marker(cls, path):
+        marker = cls._failure_marker(path)
+        if marker is None:
+            return None
+        try:
+            with open(marker) as handle:
+                return handle.read().strip() or 'unknown error'
+        except OSError:
+            return None
+
+    @classmethod
+    def _write_failure_marker(cls, path, exc):
+        marker = cls._failure_marker(path)
+        if marker is None:
+            return
+        tmp = f'{marker}.{os.getpid()}.{threading.get_ident()}.tmp'
+        try:
+            with open(tmp, 'w') as handle:
+                handle.write(str(exc).splitlines()[0])
+            os.replace(tmp, marker)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
     def _get_compile_fallback(self):
         if self._compile_fallback is None:
             self._compile_fallback = _TorchCompileFallback(self.eager)
@@ -319,6 +366,7 @@ class _TorchAOTFunction:
         try:
             artifact.save_compiled_function(tmp)
             os.replace(tmp, path)
+            self._discard_artifact(self._failure_marker(path))
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)

@@ -43,18 +43,18 @@ If you are using Sella or you wish to use Sella, let me know!
 ## Torch coordinate backend
 
 Sella uses PyTorch automatic differentiation for batched internal-coordinate
-values, gradients, Hessian-vector products, and cell derivatives. Eager Torch
-is the default. Set `SELLA_TORCH_COMPILE=all` before importing Sella to compile
-the four consolidated coordinate kernels and persist compatible AOT artifacts
-across processes.
+values, gradients, Hessian-vector products, and cell derivatives. The four
+consolidated coordinate kernels are compiled by default and compatible AOT
+artifacts are persisted across processes. Set `SELLA_TORCH_COMPILE=0` before
+importing Sella to use eager Torch instead.
 
 - `SELLA_TORCH_AOT_CACHE_DIR` overrides the default
   `~/.cache/sella/torch-aot` cache directory.
 - `SELLA_TORCH_COORD_THREADS` controls TorchInductor's coordinate-kernel thread
   count (default `4`; set `0` to leave it unchanged).
 - If persistent AOT compilation or loading is unsupported by the installed
-  Torch build, Sella warns once and falls back to ordinary `torch.compile`,
-  then to eager Torch if compilation itself fails.
+  Torch build, Sella records the failed signature, warns once, and falls back
+  to ordinary `torch.compile`, then to eager Torch if compilation itself fails.
 
 ## Documentation
 
