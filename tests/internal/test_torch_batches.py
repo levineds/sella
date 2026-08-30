@@ -256,19 +256,12 @@ m._batched_cell_gradients(*value_args, cell)
     ]
 
 
-def test_aot_failure_falls_back_to_torch_compile(tmp_path, monkeypatch):
+def test_aot_failure_falls_back_to_eager_torch(tmp_path, monkeypatch):
     monkeypatch.setattr(
         internal_module, '_TORCH_AOT_CACHE_DIR', str(tmp_path)
     )
     monkeypatch.setattr(internal_module, '_AOT_DISABLED_REASON', None)
     monkeypatch.setattr(internal_module, '_AOT_WARNED', False)
-    compile_calls = []
-
-    def fake_compile(func, **kwargs):
-        compile_calls.append(kwargs)
-        return func
-
-    monkeypatch.setattr(torch, 'compile', fake_compile)
     wrapped = internal_module._TorchAOTFunction(
         lambda value: value + 1.0,
         enabled=True,
@@ -279,12 +272,11 @@ def test_aot_failure_falls_back_to_torch_compile(tmp_path, monkeypatch):
         raise RuntimeError('unsupported AOT artifact')
 
     monkeypatch.setattr(wrapped, '_compile_and_save', fail_aot)
-    with pytest.warns(RuntimeWarning, match='falling back to torch.compile'):
+    with pytest.warns(RuntimeWarning, match='falling back to eager Torch'):
         result = wrapped(torch.tensor([2.0], dtype=torch.float64))
 
     torch.testing.assert_close(result, torch.tensor([3.0], dtype=torch.float64))
     assert wrapped._aot_disabled is True
-    assert compile_calls == [{'fullgraph': True, 'dynamic': False}]
     assert len(list(tmp_path.glob('*.failed'))) == 1
 
     # Simulate a fresh process: the persistent failure marker must bypass AOT
@@ -305,7 +297,6 @@ def test_aot_failure_falls_back_to_torch_compile(tmp_path, monkeypatch):
         result = wrapped_again(torch.tensor([4.0], dtype=torch.float64))
 
     torch.testing.assert_close(result, torch.tensor([5.0], dtype=torch.float64))
-    assert len(compile_calls) == 2
 
 
 def test_torch_compile_is_enabled_by_default():

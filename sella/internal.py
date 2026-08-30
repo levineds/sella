@@ -175,41 +175,6 @@ def _aot_signature(args, kwargs):
     return sig
 
 
-class _TorchCompileFallback:
-    """Use ``torch.compile`` when available, falling back to eager Torch."""
-
-    def __init__(self, func):
-        self.eager = func
-        self.compiled = None
-        self.disabled = not hasattr(torch, 'compile')
-        if not self.disabled:
-            try:
-                self.compiled = torch.compile(
-                    func, fullgraph=True, dynamic=False
-                )
-            except Exception as exc:
-                self.disabled = True
-                warnings.warn(
-                    'torch.compile setup failed; using eager Torch: '
-                    f'{str(exc).splitlines()[0]}',
-                    RuntimeWarning,
-                )
-
-    def __call__(self, *args, **kwargs):
-        if self.disabled or self.compiled is None:
-            return self.eager(*args, **kwargs)
-        try:
-            return self.compiled(*args, **kwargs)
-        except Exception as exc:
-            self.disabled = True
-            warnings.warn(
-                'torch.compile execution failed; using eager Torch: '
-                f'{str(exc).splitlines()[0]}',
-                RuntimeWarning,
-            )
-            return self.eager(*args, **kwargs)
-
-
 class _TorchAOTFunction:
     """Persistent AOT-compiled coordinate root.
 
@@ -228,7 +193,6 @@ class _TorchAOTFunction:
         self._by_sig = {}
         self._lock = threading.Lock()
         self._aot_disabled = False
-        self._compile_fallback = None
 
     def __call__(self, *args, **kwargs):
         if not self.enabled:
@@ -243,10 +207,9 @@ class _TorchAOTFunction:
             if self._aot_disabled:
                 raise
             self._disable_aot(exc)
-            compiled = self._get_compile_fallback()
             self._by_sig.clear()
-            self._by_sig[sig] = compiled
-            return compiled(*args, **kwargs)
+            self._by_sig[sig] = self.eager
+            return self.eager(*args, **kwargs)
 
     def _resolve(self, sig, args, kwargs):
         with self._lock:
@@ -275,9 +238,9 @@ class _TorchAOTFunction:
                     self._discard_artifact(path)
                     self._write_failure_marker(path, exc)
                     self._disable_aot(exc)
-                    compiled = self._get_compile_fallback()
+                    compiled = self.eager
             else:
-                compiled = self._get_compile_fallback()
+                compiled = self.eager
             self._by_sig[sig] = compiled
             return compiled
 
@@ -291,7 +254,7 @@ class _TorchAOTFunction:
             if not _AOT_WARNED:
                 warnings.warn(
                     f'Torch AOT cache unavailable for {self.cache_name}; '
-                    f'falling back to torch.compile: {reason}',
+                    f'falling back to eager Torch: {reason}',
                     RuntimeWarning,
                 )
                 _AOT_WARNED = True
@@ -337,11 +300,6 @@ class _TorchAOTFunction:
                 os.remove(tmp)
             except OSError:
                 pass
-
-    def _get_compile_fallback(self):
-        if self._compile_fallback is None:
-            self._compile_fallback = _TorchCompileFallback(self.eager)
-        return self._compile_fallback
 
     def _file_key(self, sig):
         payload = '|'.join((

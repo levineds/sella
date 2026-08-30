@@ -54,7 +54,7 @@ importing Sella to use eager Torch instead.
   count (default `4`; set `0` to leave it unchanged).
 - If persistent AOT compilation or loading is unsupported by the installed
   Torch build, Sella records the failed signature, warns once, and falls back
-  to ordinary `torch.compile`, then to eager Torch if compilation itself fails.
+  directly to eager Torch.
 
 ## Documentation
 
