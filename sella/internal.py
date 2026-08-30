@@ -199,33 +199,71 @@ def _dihedral_value(pos: torch.Tensor, tvec: torch.Tensor) -> torch.Tensor:
     return torch.atan2(numer, denom)
 
 
-# Batched gradient functions: input shapes (n_coords, n_atoms, 3), (n_coords, n_vecs, 3)
-# Output shapes: (n_coords, n_atoms, 3)
-_bond_grad_batched = _compiled_torch_function(
-    torch_vmap(torch_grad(_bond_value, argnums=0), in_dims=(0, 0)),
-    enabled=_TORCH_COMPILE_ALL,
+# Keep the family-specific transforms eager. The four functions named
+# ``_batched_*_torch`` below are the only torch.compile entry points for these
+# coordinates, which avoids paying compilation setup once per family.
+_bond_value_vmap = torch_vmap(_bond_value, in_dims=(0, 0))
+_angle_value_vmap = torch_vmap(_angle_value, in_dims=(0, 0))
+_dihedral_value_vmap = torch_vmap(_dihedral_value, in_dims=(0, 0))
+
+_bond_grad_vmap = torch_vmap(
+    torch_grad(_bond_value, argnums=0), in_dims=(0, 0)
 )
-_angle_grad_batched = _compiled_torch_function(
-    torch_vmap(torch_grad(_angle_value, argnums=0), in_dims=(0, 0)),
-    enabled=_TORCH_COMPILE_ALL,
+_angle_grad_vmap = torch_vmap(
+    torch_grad(_angle_value, argnums=0), in_dims=(0, 0)
 )
-_dihedral_grad_batched = _compiled_torch_function(
-    torch_vmap(torch_grad(_dihedral_value, argnums=0), in_dims=(0, 0)),
-    enabled=_TORCH_COMPILE_ALL,
+_dihedral_grad_vmap = torch_vmap(
+    torch_grad(_dihedral_value, argnums=0), in_dims=(0, 0)
 )
 
-# Batched value functions
-_bond_value_batched = _compiled_torch_function(
-    torch_vmap(_bond_value, in_dims=(0, 0)),
-    enabled=_TORCH_COMPILE_ALL,
+
+def _batched_values_torch(
+    bond_pos, bond_tvec,
+    angle_pos, angle_tvec,
+    dihedral_pos, dihedral_tvec,
+):
+    """Evaluate all three fixed-width coordinate families in one region."""
+    bond = (
+        _bond_value_vmap(bond_pos, bond_tvec)
+        if bond_pos.shape[0] else bond_pos.new_empty((0,))
+    )
+    angle = (
+        _angle_value_vmap(angle_pos, angle_tvec)
+        if angle_pos.shape[0] else angle_pos.new_empty((0,))
+    )
+    dihedral = (
+        _dihedral_value_vmap(dihedral_pos, dihedral_tvec)
+        if dihedral_pos.shape[0] else dihedral_pos.new_empty((0,))
+    )
+    return bond, angle, dihedral
+
+
+def _batched_gradients_torch(
+    bond_pos, bond_tvec,
+    angle_pos, angle_tvec,
+    dihedral_pos, dihedral_tvec,
+):
+    """Differentiate all three fixed-width coordinate families in one region."""
+    bond = (
+        _bond_grad_vmap(bond_pos, bond_tvec)
+        if bond_pos.shape[0] else torch.empty_like(bond_pos)
+    )
+    angle = (
+        _angle_grad_vmap(angle_pos, angle_tvec)
+        if angle_pos.shape[0] else torch.empty_like(angle_pos)
+    )
+    dihedral = (
+        _dihedral_grad_vmap(dihedral_pos, dihedral_tvec)
+        if dihedral_pos.shape[0] else torch.empty_like(dihedral_pos)
+    )
+    return bond, angle, dihedral
+
+
+_batched_values = _compiled_torch_function(
+    _batched_values_torch, enabled=_TORCH_COMPILE_ALL
 )
-_angle_value_batched = _compiled_torch_function(
-    torch_vmap(_angle_value, in_dims=(0, 0)),
-    enabled=_TORCH_COMPILE_ALL,
-)
-_dihedral_value_batched = _compiled_torch_function(
-    torch_vmap(_dihedral_value, in_dims=(0, 0)),
-    enabled=_TORCH_COMPILE_ALL,
+_batched_gradients = _compiled_torch_function(
+    _batched_gradients_torch, enabled=_TORCH_COMPILE_ALL
 )
 
 # Batched hessian functions: output shapes (n_coords, n_atoms, 3, n_atoms, 3)
@@ -285,19 +323,37 @@ def _dihedral_hvp_single(
     return hvp_result
 
 
-# Batched HVP functions: compute H @ v for all coords at once
-# Input shapes: pos (n_coords, n_atoms, 3), tvec (n_coords, n_vecs, 3), tangent (n_coords, n_atoms, 3)
-# Output shapes: (n_coords, n_atoms, 3)
-_bond_hvp_batched = _compiled_torch_function(
-    torch_vmap(_bond_hvp_single, in_dims=(0, 0, 0)),
-    enabled=_TORCH_COMPILE_ALL,
+# Batched HVP functions: compute H @ v for all coords at once.
+_bond_hvp_vmap = torch_vmap(_bond_hvp_single, in_dims=(0, 0, 0))
+_angle_hvp_vmap = torch_vmap(_angle_hvp_single, in_dims=(0, 0, 0))
+_dihedral_hvp_vmap = torch_vmap(
+    _dihedral_hvp_single, in_dims=(0, 0, 0)
 )
-_angle_hvp_batched = _compiled_torch_function(
-    torch_vmap(_angle_hvp_single, in_dims=(0, 0, 0)),
-    enabled=_TORCH_COMPILE_ALL,
-)
-_dihedral_hvp_batched = _compiled_torch_function(
-    torch_vmap(_dihedral_hvp_single, in_dims=(0, 0, 0)),
+
+
+def _batched_hvps_torch(
+    bond_pos, bond_tvec, bond_tangent,
+    angle_pos, angle_tvec, angle_tangent,
+    dihedral_pos, dihedral_tvec, dihedral_tangent,
+):
+    """Evaluate the three direct HVP batches in one compiled region."""
+    bond = (
+        _bond_hvp_vmap(bond_pos, bond_tvec, bond_tangent)
+        if bond_pos.shape[0] else torch.empty_like(bond_pos)
+    )
+    angle = (
+        _angle_hvp_vmap(angle_pos, angle_tvec, angle_tangent)
+        if angle_pos.shape[0] else torch.empty_like(angle_pos)
+    )
+    dihedral = (
+        _dihedral_hvp_vmap(dihedral_pos, dihedral_tvec, dihedral_tangent)
+        if dihedral_pos.shape[0] else torch.empty_like(dihedral_pos)
+    )
+    return bond, angle, dihedral
+
+
+_batched_hvps = _compiled_torch_function(
+    _batched_hvps_torch,
     enabled=_TORCH_COMPILE_ALL,
 )
 
@@ -355,20 +411,42 @@ _bond_cell_grad_single = _torch_function(_bond_cell_grad_single_torch)
 _angle_cell_grad_single = _torch_function(_angle_cell_grad_single_torch)
 _dihedral_cell_grad_single = _torch_function(_dihedral_cell_grad_single_torch)
 
-# Batched cell gradients: input (n_coords, n_atoms, 3), (n_coords, n_vecs, 3), (3, 3)
-# Output: (n_coords, 3, 3)
-# Note: cell is NOT batched (same cell for all coords), so in_axes=(0, 0, None)
-_bond_cell_grad_batched = _compiled_torch_function(
-    torch_vmap(_bond_cell_grad_single_torch, in_dims=(0, 0, None)),
-    enabled=_TORCH_COMPILE_ALL,
+# Cell is shared by a family batch, so its vmap dimension is None.
+_bond_cell_grad_vmap = torch_vmap(
+    _bond_cell_grad_single_torch, in_dims=(0, 0, None)
 )
-_angle_cell_grad_batched = _compiled_torch_function(
-    torch_vmap(_angle_cell_grad_single_torch, in_dims=(0, 0, None)),
-    enabled=_TORCH_COMPILE_ALL,
+_angle_cell_grad_vmap = torch_vmap(
+    _angle_cell_grad_single_torch, in_dims=(0, 0, None)
 )
-_dihedral_cell_grad_batched = _compiled_torch_function(
-    torch_vmap(_dihedral_cell_grad_single_torch, in_dims=(0, 0, None)),
-    enabled=_TORCH_COMPILE_ALL,
+_dihedral_cell_grad_vmap = torch_vmap(
+    _dihedral_cell_grad_single_torch, in_dims=(0, 0, None)
+)
+
+
+def _batched_cell_gradients_torch(
+    bond_pos, bond_ncvec,
+    angle_pos, angle_ncvec,
+    dihedral_pos, dihedral_ncvec,
+    cell,
+):
+    """Differentiate all periodic coordinate families in one region."""
+    bond = (
+        _bond_cell_grad_vmap(bond_pos, bond_ncvec, cell)
+        if bond_pos.shape[0] else bond_pos.new_empty((0, 3, 3))
+    )
+    angle = (
+        _angle_cell_grad_vmap(angle_pos, angle_ncvec, cell)
+        if angle_pos.shape[0] else angle_pos.new_empty((0, 3, 3))
+    )
+    dihedral = (
+        _dihedral_cell_grad_vmap(dihedral_pos, dihedral_ncvec, cell)
+        if dihedral_pos.shape[0] else dihedral_pos.new_empty((0, 3, 3))
+    )
+    return bond, angle, dihedral
+
+
+_batched_cell_gradients = _compiled_torch_function(
+    _batched_cell_gradients_torch, enabled=_TORCH_COMPILE_ALL
 )
 
 
@@ -392,11 +470,7 @@ class _BatchedCoordFamily(NamedTuple):
     n_atoms: int
     n_tvecs: int
     width: int
-    value_fn: Callable
-    grad_fn: Callable
     hess_fn: Callable
-    hvp_fn: Callable
-    cell_grad_fn: Callable
 
 
 class _BatchedCoordArrays(NamedTuple):
@@ -415,33 +489,21 @@ _BATCHED_COORD_FAMILIES: Tuple[_BatchedCoordFamily, ...] = (
         n_atoms=2,
         n_tvecs=1,
         width=6,
-        value_fn=_bond_value_batched,
-        grad_fn=_bond_grad_batched,
         hess_fn=_bond_hess_batched,
-        hvp_fn=_bond_hvp_batched,
-        cell_grad_fn=_bond_cell_grad_batched,
     ),
     _BatchedCoordFamily(
         key='angles',
         n_atoms=3,
         n_tvecs=2,
         width=9,
-        value_fn=_angle_value_batched,
-        grad_fn=_angle_grad_batched,
         hess_fn=_angle_hess_batched,
-        hvp_fn=_angle_hvp_batched,
-        cell_grad_fn=_angle_cell_grad_batched,
     ),
     _BatchedCoordFamily(
         key='dihedrals',
         n_atoms=4,
         n_tvecs=3,
         width=12,
-        value_fn=_dihedral_value_batched,
-        grad_fn=_dihedral_grad_batched,
         hess_fn=_dihedral_hess_batched,
-        hvp_fn=_dihedral_hvp_batched,
-        cell_grad_fn=_dihedral_cell_grad_batched,
     ),
 )
 
@@ -2270,16 +2332,6 @@ class BaseInternals:
         """Invalidate batched arrays (call when internals change)."""
         self._invalidate_structure()
 
-    def _compute_batched_value_family(self, spec: _BatchedCoordFamily,
-                                      family: _BatchedCoordArrays,
-                                      positions, tvecs):
-        """Compute values for one batched family, then slice off padding."""
-        if family.n_actual == 0:
-            return np.empty(0)
-        pos = positions[family.indices_padded]
-        values = spec.value_fn(pos, tvecs[f"{spec.key}_padded"])
-        return _to_numpy(values)[:family.n_actual]
-
     def _compute_batched_tensor_family(self, spec: _BatchedCoordFamily,
                                        family: _BatchedCoordArrays,
                                        positions, tvecs, fn, empty_tail):
@@ -2298,11 +2350,20 @@ class BaseInternals:
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
         families = self._batched_family_arrays
+        if not any(family.n_actual for family in families.values()):
+            return {spec.key: np.empty(0) for spec in _BATCHED_COORD_FAMILIES}
+
+        args = []
+        for spec in _BATCHED_COORD_FAMILIES:
+            family = families[spec.key]
+            args.extend((
+                positions[family.indices_padded],
+                tvecs[f'{spec.key}_padded'],
+            ))
+        values = _batched_values(*args)
         return {
-            spec.key: self._compute_batched_value_family(
-                spec, families[spec.key], positions, tvecs
-            )
-            for spec in _BATCHED_COORD_FAMILIES
+            spec.key: _to_numpy(value)[:families[spec.key].n_actual]
+            for spec, value in zip(_BATCHED_COORD_FAMILIES, values)
         }
 
     def _compute_batched_gradients(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
@@ -2314,12 +2375,29 @@ class BaseInternals:
         self._build_batched_arrays()
         tvecs = self._get_cached_tvecs(cell)
         families = self._batched_family_arrays
+        if not any(family.n_actual for family in families.values()):
+            return {
+                spec.key: (
+                    families[spec.key].indices,
+                    np.empty((0, spec.n_atoms, 3)),
+                )
+                for spec in _BATCHED_COORD_FAMILIES
+            }
+
+        args = []
+        for spec in _BATCHED_COORD_FAMILIES:
+            family = families[spec.key]
+            args.extend((
+                positions[family.indices_padded],
+                tvecs[f'{spec.key}_padded'],
+            ))
+        gradients = _batched_gradients(*args)
         return {
-            spec.key: self._compute_batched_tensor_family(
-                spec, families[spec.key], positions, tvecs, spec.grad_fn,
-                (spec.n_atoms, 3),
+            spec.key: (
+                families[spec.key].indices,
+                _to_numpy(gradient)[:families[spec.key].n_actual],
             )
-            for spec in _BATCHED_COORD_FAMILIES
+            for spec, gradient in zip(_BATCHED_COORD_FAMILIES, gradients)
         }
 
     def _compute_batched_hessians(self, positions: np.ndarray, cell: np.ndarray) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
@@ -2347,35 +2425,38 @@ class BaseInternals:
         non-periodic batches stay on the fast zero-return path.
         """
         self._build_batched_arrays()
-        cell_torch = None
-        result = {}
         families = self._batched_family_arrays
+        periodic = {
+            spec.key: bool(np.any(families[spec.key].ncvecs))
+            for spec in _BATCHED_COORD_FAMILIES
+        }
+        if not any(periodic.values()):
+            return {
+                spec.key: np.zeros((families[spec.key].n_actual, 3, 3))
+                for spec in _BATCHED_COORD_FAMILIES
+            }
 
+        args = []
         for spec in _BATCHED_COORD_FAMILIES:
-            key = spec.key
-            family = families[key]
-            n_actual = family.n_actual
-            ncvecs = family.ncvecs
-            if n_actual == 0:
-                result[key] = np.empty((0, 3, 3))
-                continue
-            if not np.any(ncvecs):
-                result[key] = np.zeros((n_actual, 3, 3))
-                continue
+            family = families[spec.key]
+            if periodic[spec.key]:
+                pos = positions[family.indices_padded]
+                ncvecs = family.ncvecs_padded
+            else:
+                pos = np.empty((0, spec.n_atoms, 3), dtype=np.float64)
+                ncvecs = np.empty((0, spec.n_tvecs, 3), dtype=np.float64)
+            args.extend((pos, ncvecs))
 
-            if cell_torch is None:
-                cell_torch = _as_torch(np.asarray(cell, dtype=np.float64))
-            pos = np.asarray(
-                positions[family.indices_padded],
-                dtype=np.float64,
-            )
-            ncvecs_padded = np.asarray(
-                family.ncvecs_padded,
-                dtype=np.float64,
-            )
-            grads = spec.cell_grad_fn(pos, ncvecs_padded, cell_torch)
-            result[key] = _to_numpy(grads)[:n_actual]
-
+        gradients = _batched_cell_gradients(
+            *args, np.asarray(cell, dtype=np.float64)
+        )
+        result = {}
+        for spec, gradient in zip(_BATCHED_COORD_FAMILIES, gradients):
+            family = families[spec.key]
+            if periodic[spec.key]:
+                result[spec.key] = _to_numpy(gradient)[:family.n_actual]
+            else:
+                result[spec.key] = np.zeros((family.n_actual, 3, 3))
         return result
 
     def copy(self) -> 'BaseInternals':
@@ -2939,10 +3020,10 @@ class BaseInternals:
     def _active_array(active):
         return np.asarray(active, dtype=bool)
 
-    def _launch_batched_hvp_family(self, spec: _BatchedCoordFamily,
-                                   family: _BatchedCoordArrays,
-                                   positions, tvecs, v_atoms, active):
-        """Launch one batched HVP kernel for active coordinates.
+    def _prepare_batched_hvp_family(self, spec: _BatchedCoordFamily,
+                                    family: _BatchedCoordArrays,
+                                    positions, tvecs, v_atoms, active):
+        """Prepare one family for the consolidated HVP kernel.
 
         If every coordinate in the family is active, use padded arrays to keep the
         compiled shape stable. If inequality constraints deactivate some rows,
@@ -2963,7 +3044,37 @@ class BaseInternals:
             pos = positions[indices]
             tvec = tvecs[spec.key][active]
             v_sub = v_atoms[indices]
-        return spec.hvp_fn(pos, tvec, v_sub)
+        return pos, tvec, v_sub
+
+    def _launch_batched_hvps(self, positions, tvecs, v_atoms,
+                             batched_active):
+        """Launch one HVP region and retain None for inactive families."""
+        families = self._batched_family_arrays
+        prepared = [
+            self._prepare_batched_hvp_family(
+                spec, families[spec.key], positions, tvecs, v_atoms, active
+            )
+            for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active)
+        ]
+        if not any(item is not None for item in prepared):
+            return {spec.key: None for spec in _BATCHED_COORD_FAMILIES}
+
+        args = []
+        for spec, item in zip(_BATCHED_COORD_FAMILIES, prepared):
+            if item is None:
+                item = (
+                    np.empty((0, spec.n_atoms, 3), dtype=np.float64),
+                    np.empty((0, spec.n_tvecs, 3), dtype=np.float64),
+                    np.empty((0, spec.n_atoms, 3), dtype=np.float64),
+                )
+            args.extend(item)
+        results = _batched_hvps(*args)
+        return {
+            spec.key: result if item is not None else None
+            for spec, item, result in zip(
+                _BATCHED_COORD_FAMILIES, prepared, results
+            )
+        }
 
     def _scatter_batched_jacobian_family(self, B, row, indices, grads,
                                          active):
@@ -3078,12 +3189,9 @@ class BaseInternals:
 
         batched_active = (bonds_active, angles_active, dihedrals_active)
         families = self._batched_family_arrays
-        batched_hvp = {
-            spec.key: self._launch_batched_hvp_family(
-                spec, families[spec.key], positions, tvecs, v_atoms, active
-            )
-            for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active)
-        }
+        batched_hvp = self._launch_batched_hvps(
+            positions, tvecs, v_atoms, batched_active
+        )
 
         rot_closed_results = []
         rot_batched_slots = None
@@ -3234,12 +3342,9 @@ class BaseInternals:
 
         batched_active = (bonds_active, angles_active, dihedrals_active)
         families = self._batched_family_arrays
-        batched_hvp = {
-            spec.key: self._launch_batched_hvp_family(
-                spec, families[spec.key], positions, tvecs, v_atoms, active
-            )
-            for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active)
-        }
+        batched_hvp = self._launch_batched_hvps(
+            positions, tvecs, v_atoms, batched_active
+        )
 
         # Compute rotation HVPs using closed-form Hessian (handles
         # degenerate eigenvalues for linear/near-linear fragments).
@@ -5067,12 +5172,9 @@ class Internals(BaseInternals):
         angles = self._batched_family_arrays['angles']
         if angles.n_actual == 0:
             return []
-        tvecs = self._get_cached_tvecs(self.atoms.cell.array)
-        angle_pos = self.all_positions[angles.indices_padded]
-        angle_vals_padded = _to_numpy(
-            _angle_value_batched(angle_pos, tvecs['angles_padded'])
-        )
-        angle_vals = angle_vals_padded[:angles.n_actual]
+        angle_vals = self._compute_batched_values(
+            self.all_positions, self.atoms.cell.array
+        )['angles']
         bad_mask = ~((self.atol < angle_vals)
                      & (angle_vals < np.pi - self.atol))
         return [self.internals['angles'][idx] for idx in np.where(bad_mask)[0]]
