@@ -454,7 +454,7 @@ class TestLinearMolecule:
 
     Linear molecules have degenerate eigenvalues in the quaternion-based
     rotation parameterization, which previously caused NaN in second
-    derivatives and zeroed Jacobians due to jnp.sign(0)==0.
+    derivatives and zeroed Jacobians due to autodiff through sign(0).
     """
 
     def test_n2_cartesian(self):

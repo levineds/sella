@@ -8,7 +8,6 @@ dependencies:
   - numpy >= 1.14.0
   - scipy >= 1.1.0
   - ase >= 3.22.0
-  - jax >= 0.4.20
-  - jaxlib >= 0.4.20
+  - pytorch >= 2.0
   - setuptools >= 74.1.0, < 82
   - setuptools-scm >= 8.0
