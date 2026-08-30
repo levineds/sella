@@ -39,10 +39,7 @@ _TORCH_DEVICE = torch.device('cpu')
 # startup cost dominates typical short optimizer runs. Keep it opt-in.
 _TORCH_COMPILE_MODE = os.environ.get('SELLA_TORCH_COMPILE', '0').lower()
 _TORCH_COMPILE_ALL = _TORCH_COMPILE_MODE in {'1', 'true', 'yes', 'on', 'all'}
-_TORCH_COMPILE_HVP = (
-    _TORCH_COMPILE_ALL or _TORCH_COMPILE_MODE in {'hvp', 'hvp-only'}
-)
-if _TORCH_COMPILE_ALL or _TORCH_COMPILE_HVP:
+if _TORCH_COMPILE_ALL:
     try:
         import torch._dynamo as _torch_dynamo
         _torch_compile_cache_size = int(
@@ -293,15 +290,15 @@ def _dihedral_hvp_single(
 # Output shapes: (n_coords, n_atoms, 3)
 _bond_hvp_batched = _compiled_torch_function(
     torch_vmap(_bond_hvp_single, in_dims=(0, 0, 0)),
-    enabled=_TORCH_COMPILE_HVP,
+    enabled=_TORCH_COMPILE_ALL,
 )
 _angle_hvp_batched = _compiled_torch_function(
     torch_vmap(_angle_hvp_single, in_dims=(0, 0, 0)),
-    enabled=_TORCH_COMPILE_HVP,
+    enabled=_TORCH_COMPILE_ALL,
 )
 _dihedral_hvp_batched = _compiled_torch_function(
     torch_vmap(_dihedral_hvp_single, in_dims=(0, 0, 0)),
-    enabled=_TORCH_COMPILE_HVP,
+    enabled=_TORCH_COMPILE_ALL,
 )
 
 
