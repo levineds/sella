@@ -748,6 +748,31 @@ class TestInternalEquality:
         assert len(cons.internals['bonds']) == 1
 
 
+def test_bad_angle_check_has_hysteresis():
+    """An angle built just inside the linear window is not flagged at once.
+
+    Angles become ordinary bends below 165 deg but are flagged as bad only
+    beyond 170 deg; with a single threshold an angle sitting at the boundary
+    toggled between bend and linear treatment on every rebuild.
+    """
+    def water(degrees):
+        theta = np.radians(degrees)
+        return [[0, 0, 0], [0.96, 0, 0],
+                [0.96 * np.cos(theta), 0.96 * np.sin(theta), 0]]
+
+    atoms = Atoms('OH2', positions=water(160.))
+    ints = Internals(atoms)
+    ints.find_all_bonds()
+    ints.find_all_angles()
+    assert len(ints.internals['angles']) == 1
+
+    ints.atoms.positions[:] = water(167.)
+    assert ints.check_for_bad_internals() is None
+
+    ints.atoms.positions[:] = water(172.)
+    assert ints.check_for_bad_internals() is not None
+
+
 class TestForbid:
     """Regression tests for forbid_* keeping parallel lists in sync.
 

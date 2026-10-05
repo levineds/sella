@@ -3746,6 +3746,12 @@ class Internals(BaseInternals):
     ) -> None:
         BaseInternals.__init__(self, atoms, dummies, dinds)
         self.atol = atol * np.pi / 180.
+        # Angles are built as ordinary bends only inside (atol, pi - atol) but
+        # flagged as bad (forcing a rebuild) only outside the wider window
+        # (bad_atol, pi - bad_atol). Without this hysteresis an angle sitting
+        # at the threshold, e.g. at a saddle point, toggles between bend and
+        # linear treatment on every rebuild and the optimizer limit-cycles.
+        self.bad_atol = max(atol - 5., 0.) * np.pi / 180.
         # Fragment-welding redundancy (see _mst_welding_bonds). Augmentation is
         # ON by default: it closes fragment rings, symmetrizes extended contact
         # interfaces, and makes welding permutation-invariant, at the cost of
@@ -4902,8 +4908,8 @@ class Internals(BaseInternals):
             _angle_value_batched(angle_pos, tvecs['angles_padded'])
         )
         angle_vals = angle_vals_padded[:angles.n_actual]
-        bad_mask = ~((self.atol < angle_vals)
-                     & (angle_vals < np.pi - self.atol))
+        bad_mask = ~((self.bad_atol < angle_vals)
+                     & (angle_vals < np.pi - self.bad_atol))
         return [self.internals['angles'][idx] for idx in np.where(bad_mask)[0]]
 
     def _bad_rotation_from_cached_eigh(self, rotations, cached_eigh):
