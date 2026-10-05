@@ -17,7 +17,7 @@ from ase.calculators.emt import EMT
 from sella import Sella
 from sella.linalg import ApproximateHessian, NumericalHessian, SparseInternalHessians
 from sella.internal import Constraints, Dihedral, Internals
-from sella.peswrapper import PES, InternalPES
+from sella.peswrapper import PES, InternalPES, GeometryUpdateError
 from sella.eigensolvers import exact, rayleigh_ritz
 from sella.optimize import stepper as stepper_module
 
@@ -446,6 +446,48 @@ def test_sella_reuses_matching_restricted_step_spectrum():
     opt._last_step_basis = basis.copy()
     with pytest.raises(AssertionError, match="should be reused"):
         opt._should_diagonalize()
+
+
+class TestGeometryUpdateRecovery:
+    """A failed geodesic update restores the geometry and rebuilds internals."""
+
+    @staticmethod
+    def _make_opt():
+        atoms = molecule('C2H6')
+        atoms.rattle(0.05, seed=3)
+        atoms.calc = EMT()
+        return atoms, Sella(atoms, internal=True, logfile=None)
+
+    def test_failed_update_restores_geometry_and_rebuilds(self, monkeypatch):
+        atoms, opt = self._make_opt()
+        opt.run(fmax=1e-3, steps=2)
+        pes_before = opt.pes
+        positions = atoms.positions.copy()
+        delta = opt.delta
+
+        def failing_kick(*args, **kwargs):
+            atoms.positions += 0.3  # partially integrated, garbage geometry
+            raise GeometryUpdateError("Geometry update ODE failed to converge!")
+
+        monkeypatch.setattr(pes_before, 'kick', failing_kick)
+        opt.step()
+
+        np.testing.assert_array_equal(atoms.positions, positions)
+        assert opt.pes is not pes_before
+        assert opt.delta == pytest.approx(max(0.5 * delta, opt.delta_min))
+        assert opt.run(fmax=0.05, steps=200)
+
+    def test_repeated_failures_raise(self, monkeypatch):
+        _, opt = self._make_opt()
+
+        def failing_kick(*args, **kwargs):
+            raise GeometryUpdateError("Geometry update ODE failed to converge!")
+
+        monkeypatch.setattr(InternalPES, 'kick', failing_kick)
+        for _ in range(opt.max_geometry_update_failures):
+            opt.step()
+        with pytest.raises(GeometryUpdateError):
+            opt.step()
 
 
 class TestLinearMolecule:

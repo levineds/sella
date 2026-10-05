@@ -28,6 +28,11 @@ from sella._constants import _LSTSQ_RCOND
 
 _LINEAR_DUMMY_PROJECTION_TOL = 1e-7
 
+
+class GeometryUpdateError(RuntimeError):
+    """The internal-to-Cartesian geodesic update failed to converge."""
+
+
 # Budgets for one geodesic ODE integration (one set_x call).
 _ODE_MAX_RHS_EVALS = 1000
 _ODE_MAX_JACOBIANS = 25
@@ -1504,11 +1509,11 @@ class InternalPES(PES):
             if self.bad_int is not None:
                 break
             if _ode_budget_exceeded(ode):
-                raise RuntimeError("Geometry update ODE is taking too long "
-                                   "to converge!")
+                raise GeometryUpdateError("Geometry update ODE is taking too "
+                                          "long to converge!")
 
         if ode.status == 'failed':
-            raise RuntimeError("Geometry update ODE failed to converge!")
+            raise GeometryUpdateError("Geometry update ODE failed to converge!")
 
         nxa = 3 * len(self.atoms)
         nxd = 3 * len(self.dummies)
@@ -3108,10 +3113,10 @@ class CellInternalPES(_CellPESMixin, InternalPES):
             if self.bad_int is not None:
                 break
             if _ode_budget_exceeded(ode):
-                raise RuntimeError("Geometry update ODE is taking too long!")
+                raise GeometryUpdateError("Geometry update ODE is taking too long!")
 
         if ode.status == 'failed':
-            raise RuntimeError("Geometry update ODE failed to converge!")
+            raise GeometryUpdateError("Geometry update ODE failed to converge!")
 
         nxa = 3 * len(self.atoms)
         nxd = 3 * len(self.dummies)

@@ -13,7 +13,8 @@ from ase.io.trajectory import Trajectory
 
 from .restricted_step import get_restricted_step, MaxInternalStep, \
     RestrictedAtomicStep
-from sella.peswrapper import PES, InternalPES, CellInternalPES, CellCartesianPES
+from sella.peswrapper import (PES, InternalPES, CellInternalPES, CellCartesianPES,
+                              GeometryUpdateError)
 from sella.internal import Internals, Constraints
 from sella._threads import configure_compute
 from sella._ase_compat import disable_logfile_if_none, flush_logfile
@@ -251,6 +252,9 @@ class Sella(Optimizer):
                       if hessian_progress else None),
         )
         self.rho = 1.
+        # Consecutive failed geometry updates tolerated before giving up.
+        self.max_geometry_update_failures = 5
+        self._n_geometry_update_failures = 0
 
         if self.ord != 0 and not self.eig:
             warnings.warn("Saddle point optimizations with eig=False will "
@@ -596,11 +600,39 @@ class Sella(Optimizer):
             self.initialized = False
             self.rho = 1.
 
+    def _recover_from_failed_geometry_update(self, positions, cell, err):
+        """Restore the pre-step geometry and regenerate internal coordinates.
+
+        A geodesic update that cannot be integrated usually means the
+        internal coordinates built for an earlier geometry have become
+        ill-conditioned, so rebuild them at the last good geometry and retry
+        with a smaller trust radius.
+        """
+        self._n_geometry_update_failures += 1
+        if self._n_geometry_update_failures > self.max_geometry_update_failures:
+            raise err
+        logger.warning("%s Restoring previous geometry, rebuilding internal "
+                       "coordinates, and reducing the trust radius.", err)
+        self.pes.atoms.positions = positions
+        self.pes.atoms.cell = cell
+        self._rebuild_after_bad_internals()
+        self.delta = max(self.delta * 0.5, self.delta_min)
+        self.delta_cell = max(self.delta_cell * 0.5, self.delta_min)
+
     def step(self):
         s, smag = self._predict_step()
         ev = self._should_diagonalize()
         self._record_diagonalization(ev)
-        rho = self.pes.kick(s, ev, **self.diagkwargs)
+        positions = self.pes.atoms.positions.copy()
+        cell = self.pes.atoms.cell.copy()
+        try:
+            rho = self.pes.kick(s, ev, **self.diagkwargs)
+        except GeometryUpdateError as err:
+            if not self.internal:
+                raise
+            self._recover_from_failed_geometry_update(positions, cell, err)
+            return
+        self._n_geometry_update_failures = 0
 
         if self._maybe_rebuild_bad_internals():
             return
