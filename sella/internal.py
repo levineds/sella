@@ -4222,25 +4222,12 @@ class Internals(BaseInternals):
         if self._weld_augment:
             tol = self._weld_tol
             gate = self._weld_gate
-            # Connection scale: the largest edge in a minimum spanning tree over
-            # the raw components -- the smallest possible "max contact distance"
-            # that connects everything, i.e. exactly where the old flooding
-            # welding stopped inflating its cutoff. Augmenting up to this scale
-            # (and never beyond) restores flooding's redundant-but-bounded
-            # contact set: it can never add a contact LONGER than the
-            # unavoidable minimal weld, yet it recovers the extra near-min
-            # contacts a bare tree drops. This is geometry-adaptive, so it
-            # handles weakly-bonded / large-vdW fragments (e.g. noble-gas
-            # clusters) whose real contacts sit far outside a covalent-radius
-            # gate, without loosening that gate for tightly-bonded organics.
-            raw_set = _DisjointSet(next_label, n_components)
-            dmst_max = 0.0
-            for k in order:
-                if raw_set.n_active == 1:
-                    break
-                if raw_set.union(int(comp[ii[k]]), int(comp[jj[k]])):
-                    if best_dist[k] > dmst_max:
-                        dmst_max = best_dist[k]
+            # Contacts are admitted only within the covalent gate. Admitting
+            # anything up to the MST connection scale (the longest MST edge)
+            # welds nearly every contact in condensed clusters -- single atoms
+            # collected tens of welds and dihedral counts reached ~1e5 -- and
+            # adds soft H...H / F...H welds in metal complexes that make the
+            # geodesic update stiff.
 
             # Shortest contact per component-pair (order is sorted, so the first
             # time a pair is seen is its minimum).
@@ -4256,12 +4243,10 @@ class Internals(BaseInternals):
                 rcov_sum = (covalent_radii[self.atoms.numbers[a]]
                             + covalent_radii[self.atoms.numbers[b]])
                 # Near this interface's own minimum (never a transannular
-                # contact within a tight interface) AND within either the
-                # covalent gate or the geometry-adaptive connection scale.
-                if best_dist[k] <= dmin * (1. + tol) and (
-                    best_dist[k] <= gate * rcov_sum
-                    or best_dist[k] <= dmst_max * (1. + tol)
-                ):
+                # contact within a tight interface) AND within the covalent
+                # gate.
+                if (best_dist[k] <= dmin * (1. + tol)
+                        and best_dist[k] <= gate * rcov_sum):
                     self._record_link(links, have, a, b, best_ts[k])
                     weld_set.union(int(comp[a]), int(comp[b]))
 

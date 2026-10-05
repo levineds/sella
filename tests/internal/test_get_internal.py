@@ -513,6 +513,22 @@ class TestTRICs:
 
         assert np.isfinite(ints.jacobian()).all()
 
+    def test_weld_augmentation_respects_covalent_gate(self):
+        """Contacts beyond the covalent gate get only minimal MST welds.
+
+        Every contact in an Ar13 icosahedron is far outside the gate but
+        within the MST connection scale; admitting those welded 42 pairs
+        (the centre atom to all 12 shell atoms), and in condensed molecular
+        clusters the angle/dihedral count grew combinatorially.
+        """
+        from ase.cluster import Icosahedron
+
+        atoms = Icosahedron('Ar', 2)
+        ints = Internals(atoms, allow_fragments=False)
+        ints.find_all_bonds()
+
+        assert len(ints.internals['bonds']) == len(atoms) - 1
+
     def test_validate_basis_with_trics(self):
         """Test that validate_basis correctly calculates DOF with TRICs."""
         # Two water molecules far apart - use explicit element list for clarity
