@@ -28,6 +28,23 @@ from sella._constants import _LSTSQ_RCOND
 
 _LINEAR_DUMMY_PROJECTION_TOL = 1e-7
 
+# Budgets for one geodesic ODE integration (one set_x call).
+_ODE_MAX_RHS_EVALS = 1000
+_ODE_MAX_JACOBIANS = 25
+
+
+def _ode_budget_exceeded(ode):
+    """Whether an LSODA geodesic integration has used up its budget.
+
+    When LSODA switches to its stiff method it builds a finite-difference
+    Jacobian, adding len(y) = 9 * natoms evaluations to ``nfev`` per
+    Jacobian. Counting those against the RHS budget makes it size dependent
+    (large systems abort after one or two Jacobians), so integration steps
+    and Jacobians are budgeted separately.
+    """
+    return (ode.nfev - ode.njev * ode.n > _ODE_MAX_RHS_EVALS
+            or ode.njev > _ODE_MAX_JACOBIANS)
+
 
 def _hessian_matvec(H, v):
     if hasattr(H, 'matvec'):
@@ -1486,7 +1503,7 @@ class InternalPES(PES):
             self.bad_int = self.int.check_for_bad_internals()
             if self.bad_int is not None:
                 break
-            if ode.nfev > 1000:
+            if _ode_budget_exceeded(ode):
                 raise RuntimeError("Geometry update ODE is taking too long "
                                    "to converge!")
 
@@ -3090,7 +3107,7 @@ class CellInternalPES(_CellPESMixin, InternalPES):
             self.bad_int = self.int.check_for_bad_internals()
             if self.bad_int is not None:
                 break
-            if ode.nfev > 1000:
+            if _ode_budget_exceeded(ode):
                 raise RuntimeError("Geometry update ODE is taking too long!")
 
         if ode.status == 'failed':

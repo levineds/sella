@@ -6,7 +6,8 @@ from ase.build import molecule
 from ase.calculators.emt import EMT
 
 from sella.peswrapper import PES, InternalPES, CellInternalPES, \
-    _range_space_projector, _rigid_motion_nullspace
+    _range_space_projector, _rigid_motion_nullspace, _ode_budget_exceeded, \
+    _ODE_MAX_RHS_EVALS, _ODE_MAX_JACOBIANS
 from sella.internal import Internals
 
 @pytest.mark.parametrize("name,traj,cons",
@@ -93,6 +94,26 @@ def test_range_space_projector_exercises_rank_deficient_input():
     S = np.linalg.svd(B, compute_uv=False)
     rank = int(np.sum(S > 1e-6 * S[0]))
     assert rank < min(B.shape)
+
+
+def test_ode_budget_excludes_jacobian_differencing():
+    """Finite-difference Jacobians must not exhaust the geodesic RHS budget.
+
+    Each LSODA Jacobian adds len(y) = 9 * natoms evaluations to nfev, so
+    counting them aborted large systems after one or two Jacobians.
+    """
+    from types import SimpleNamespace
+
+    n = 9 * 200
+    ode = SimpleNamespace(n=n, njev=2, nfev=2 * n + 100)
+    assert not _ode_budget_exceeded(ode)
+
+    ode = SimpleNamespace(n=n, njev=0, nfev=_ODE_MAX_RHS_EVALS + 1)
+    assert _ode_budget_exceeded(ode)
+
+    njev = _ODE_MAX_JACOBIANS + 1
+    ode = SimpleNamespace(n=n, njev=njev, nfev=njev * n + 10)
+    assert _ode_budget_exceeded(ode)
 
 
 @pytest.mark.parametrize("axis", range(3))
